@@ -449,3 +449,44 @@ The 2026 World Cup zone includes schedule, standings, champion prediction, group
 ## Production Safety
 
 Before any real launch or paid trial, complete local legal compliance review, risk controls, wallet reconciliation, payment callback hardening, withdrawal review procedures, API key/token handling review, and operational incident playbooks. Never print Telegram tokens, API keys, GMPay secrets, or database passwords in logs.
+
+## M11 FSM User Flows
+
+Telegram user input flows now use aiogram FSM state:
+
+- Recharge: `/wallet` -> `充值 USDT` -> choose network -> choose fixed or custom amount -> confirm -> create GMPay order.
+- Custom recharge amounts are validated as numeric, 2 decimal places max, and within `MIN_RECHARGE_AMOUNT` / `MAX_RECHARGE_AMOUNT`.
+- Bet amount changes support fixed amounts and custom stake input. The confirmation page recalculates potential payout before submission.
+- Withdrawal: `/wallet` -> withdrawal request -> amount -> network -> address -> confirmation. Withdrawals still require admin review and never auto-pay.
+- Rebate requests collect a user note, create `rebate_requests status=pending`, and notify the upstream agent or super admin.
+- Agent applications show progress against configured thresholds, then collect a note and create `agent_applications status=pending`.
+- Super admin manual balance adjustments can run command-style or step-by-step FSM, and still write `wallet_ledger` plus `admin_audit_logs`.
+
+Every FSM flow has a cancel action that clears state and returns to the related menu.
+
+## GMPay Callback Diagnostics
+
+`/webhooks/gmpay` logs callback diagnostics without printing secrets:
+
+- `order_id`
+- `trade_id`
+- callback status
+- `actual_amount`
+- signature validity
+- matched order flag
+- deposit status before and after processing
+
+Unknown orders log `gmpay callback order not found`. Duplicate paid callbacks return `ok` and log `duplicate callback ignored`.
+
+Admin recharge diagnostics:
+
+- `/admin_deposits` shows the latest 20 deposit orders.
+- `/admin_deposit <order_id>` shows order amount, status, trade id, network, payment URL, raw create response, raw callback payload, and timestamps.
+
+Before deploying a server, run:
+
+```bash
+python -m football_score_bot.tools.deployment_check
+```
+
+The check reports only `ok` or `missing` for key configuration, database, Redis, API health, GMPay notify URL, and super admin setup. It does not print sensitive values.

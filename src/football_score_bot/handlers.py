@@ -11,6 +11,7 @@ from typing import Any
 import asyncpg
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
+from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from football_score_bot.api_football import ApiFootballClient
@@ -48,6 +49,14 @@ from football_score_bot.payments.order_ids import generate_gmpay_order_id
 from football_score_bot.services.wallet_service import WalletService
 from football_score_bot.services.permission_service import PermissionService
 from football_score_bot.services.settlement_service import SettlementService
+from football_score_bot.states import (
+    AdminAdjustStates,
+    AgentApplicationStates,
+    BetStates,
+    RebateStates,
+    RechargeStates,
+    WithdrawStates,
+)
 from football_score_bot.keyboards import (
     bet_amount_keyboard,
     bet_created_keyboard,
@@ -107,6 +116,20 @@ def build_router(
         default_payment_type=settings.gmpay_default_payment_type,
         order_expire_minutes=settings.gmpay_order_expire_minutes,
     )
+
+    @router.callback_query(F.data.startswith("fsm_cancel:"))
+    async def fsm_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        target = callback.data.split(":", 1)[1]
+        await state.clear()
+        if target == "wallet":
+            await callback.message.answer("已取消。", reply_markup=_wallet_keyboard())
+        elif target == "referrals":
+            await callback.message.answer("已取消。", reply_markup=_referral_keyboard())
+        elif target == "admin":
+            await callback.message.answer("已取消管理员操作。")
+        else:
+            await callback.message.answer("已取消。")
 
     @router.message(Command("start"))
     async def start(message: Message, command: CommandObject) -> None:
@@ -536,7 +559,7 @@ def build_router(
         )
 
     @router.callback_query(F.data.startswith("bet_amount_set:"))
-    async def bet_amount_set(callback: CallbackQuery) -> None:
+    async def bet_amount_set(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
         parts = callback.data.split(":")
         fixture_id = int(parts[1])
@@ -545,16 +568,35 @@ def build_router(
         outcome_index = int(parts[4])
         amount = parts[5]
         if amount == "custom":
-            await callback.message.answer("自定义金额暂未开放，请先选择固定金额。")
+            await state.clear()
+            await state.update_data(fixture_id=fixture_id, market_key=market_key, page=page, outcome_index=outcome_index)
+            await state.set_state(BetStates.waiting_custom_stake)
+            await callback.message.answer(
+                f"请输入投注金额，最低 {_money(settings.min_bet_amount)} USDT。",
+                reply_markup=_cancel_keyboard("bets"),
+            )
             return
-        await callback.message.answer(
-            f"金额已改为 {amount} USDT，请确认下注。",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="确认下注", callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:{amount}")],
-                    [InlineKeyboardButton(text="返回赔率", callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page}")],
-                ]
-            ),
+        await _send_bet_confirm_for_amount(callback.message, fixture_id, market_key, page, outcome_index, amount, cache, api_client, settings)
+
+    @router.message(BetStates.waiting_custom_stake)
+    async def bet_custom_stake_input(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        try:
+            amount = _validated_amount(message.text or "", settings.min_bet_amount, settings.max_bet_amount)
+        except ValueError as exc:
+            await message.answer(f"{exc}\n请重新输入投注金额，或点击取消。", reply_markup=_cancel_keyboard("bets"))
+            return
+        await state.clear()
+        await _send_bet_confirm_for_amount(
+            message,
+            int(data["fixture_id"]),
+            str(data["market_key"]),
+            int(data["page"]),
+            int(data["outcome_index"]),
+            str(amount),
+            cache,
+            api_client,
+            settings,
         )
 
     @router.callback_query(F.data == "bet_placeholder")
@@ -634,20 +676,80 @@ def build_router(
         await callback.message.answer(_format_wallet(wallet_row, settings.wallet_currency), reply_markup=_wallet_keyboard())
 
     @router.callback_query(F.data == "wallet:recharge")
-    async def wallet_recharge(callback: CallbackQuery) -> None:
+    async def wallet_recharge(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
-        await callback.message.answer("选择充值金额：", reply_markup=_recharge_amount_keyboard())
+        await state.clear()
+        await state.set_state(RechargeStates.choosing_network)
+        await callback.message.answer("请选择充值网络：", reply_markup=_network_keyboard("recharge_network"))
+
+    @router.callback_query(F.data.startswith("recharge_network:"))
+    async def recharge_network(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        network = callback.data.split(":", 1)[1]
+        if network == "cancel":
+            await state.clear()
+            await callback.message.answer("已取消充值。", reply_markup=_wallet_keyboard())
+            return
+        await state.update_data(network=network)
+        await state.set_state(RechargeStates.choosing_amount)
+        await callback.message.answer("请选择充值金额：", reply_markup=_recharge_amount_keyboard())
 
     @router.callback_query(F.data.startswith("wallet:amount:"))
-    async def wallet_recharge_amount(callback: CallbackQuery) -> None:
+    async def wallet_recharge_amount(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
         if not callback.from_user:
             return
         raw_amount = callback.data.rsplit(":", 1)[1]
         if raw_amount == "custom":
-            await callback.message.answer("请发送 /recharge <金额> 创建自定义充值订单，例如：/recharge 25")
+            await state.set_state(RechargeStates.waiting_custom_amount)
+            await callback.message.answer(
+                f"请输入充值金额，最低 {_money(settings.min_recharge_amount)} USDT，最高 {_money(settings.max_recharge_amount)} USDT。",
+                reply_markup=_cancel_keyboard("wallet"),
+            )
             return
-        await _create_recharge_order(callback.message, callback.from_user.id, Decimal(raw_amount), database, settings, gmpay_client)
+        await state.update_data(amount=str(_validated_amount(raw_amount, settings.min_recharge_amount, settings.max_recharge_amount)))
+        await state.set_state(RechargeStates.confirming_recharge)
+        await callback.message.answer(_format_recharge_confirm(await state.get_data(), settings), reply_markup=_recharge_confirm_keyboard())
+
+    @router.message(RechargeStates.waiting_custom_amount)
+    async def recharge_custom_amount_input(message: Message, state: FSMContext) -> None:
+        try:
+            amount = _validated_amount(message.text or "", settings.min_recharge_amount, settings.max_recharge_amount)
+        except ValueError as exc:
+            await message.answer(f"{exc}\n请重新输入充值金额，或点击取消。", reply_markup=_cancel_keyboard("wallet"))
+            return
+        await state.update_data(amount=str(amount))
+        await state.set_state(RechargeStates.confirming_recharge)
+        await message.answer(_format_recharge_confirm(await state.get_data(), settings), reply_markup=_recharge_confirm_keyboard())
+
+    @router.callback_query(F.data == "recharge:confirm")
+    async def recharge_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        data = await state.get_data()
+        try:
+            amount = _validated_amount(str(data.get("amount") or ""), settings.min_recharge_amount, settings.max_recharge_amount)
+        except ValueError:
+            await state.clear()
+            await callback.message.answer("充值金额已失效，请重新选择。", reply_markup=_wallet_keyboard())
+            return
+        await _create_recharge_order(
+            callback.message,
+            callback.from_user.id,
+            amount,
+            database,
+            settings,
+            gmpay_client,
+            network=str(data.get("network") or settings.gmpay_default_network),
+        )
+        await state.clear()
+
+    @router.callback_query(F.data == "recharge:amounts")
+    async def recharge_reselect_amount(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        await state.set_state(RechargeStates.choosing_amount)
+        await callback.message.answer("请选择充值金额：", reply_markup=_recharge_amount_keyboard())
 
     @router.message(Command("recharge"))
     async def recharge_custom(message: Message, command: CommandObject) -> None:
@@ -674,12 +776,69 @@ def build_router(
         await callback.message.answer(_format_ledger(rows), reply_markup=_wallet_keyboard())
 
     @router.callback_query(F.data == "wallet:withdraw_prompt")
-    async def wallet_withdraw_prompt(callback: CallbackQuery) -> None:
+    async def wallet_withdraw_prompt(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
         if not settings.withdraw_enabled:
             await callback.message.answer("提现申请功能暂未开放。")
             return
-        await callback.message.answer("请发送：/withdraw <金额> <USDT-TRC20地址>\n第一版仅支持 TRC20，提交后等待管理员人工审核。")
+        await state.clear()
+        await state.set_state(WithdrawStates.waiting_amount)
+        await callback.message.answer(
+            f"请输入提现金额，最低 {_money(settings.min_withdraw_amount)} {settings.wallet_currency}。",
+            reply_markup=_cancel_keyboard("wallet"),
+        )
+
+    @router.message(WithdrawStates.waiting_amount)
+    async def withdraw_amount_input(message: Message, state: FSMContext) -> None:
+        try:
+            amount = _validated_amount(message.text or "", settings.min_withdraw_amount, Decimal("999999999"))
+        except ValueError as exc:
+            await message.answer(f"{exc}\n请重新输入提现金额，或点击取消。", reply_markup=_cancel_keyboard("wallet"))
+            return
+        await state.update_data(amount=str(amount))
+        await state.set_state(WithdrawStates.waiting_network)
+        await message.answer("请选择提现网络：", reply_markup=_network_keyboard("withdraw_network"))
+
+    @router.callback_query(F.data.startswith("withdraw_network:"))
+    async def withdraw_network(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        network = callback.data.split(":", 1)[1]
+        if network == "cancel":
+            await state.clear()
+            await callback.message.answer("已取消提现申请。", reply_markup=_wallet_keyboard())
+            return
+        await state.update_data(network=network)
+        await state.set_state(WithdrawStates.waiting_address)
+        await callback.message.answer("请输入提现地址：", reply_markup=_cancel_keyboard("wallet"))
+
+    @router.message(WithdrawStates.waiting_address)
+    async def withdraw_address_input(message: Message, state: FSMContext) -> None:
+        address = (message.text or "").strip()
+        if len(address) < 10:
+            await message.answer("地址格式看起来不完整，请重新输入。", reply_markup=_cancel_keyboard("wallet"))
+            return
+        await state.update_data(address=address)
+        await state.set_state(WithdrawStates.confirming_withdraw)
+        await message.answer(_format_withdraw_confirm(await state.get_data(), settings.wallet_currency), reply_markup=_withdraw_confirm_keyboard())
+
+    @router.callback_query(F.data == "withdraw:confirm")
+    async def withdraw_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        data = await state.get_data()
+        request = await wallet_service.create_withdraw_request(
+            callback.from_user.id,
+            Decimal(str(data.get("amount"))),
+            str(data.get("address") or ""),
+            str(data.get("network") or ""),
+        )
+        await state.clear()
+        if not request:
+            await callback.message.answer("余额不足，无法提交提现申请。", reply_markup=_wallet_keyboard())
+            return
+        await _notify_admins(callback.bot, settings, f"新的提现申请 #{request['id']}，请进入后台审核。")
+        await callback.message.answer(f"提现申请已提交，等待管理员审核。\n申请号：{request['id']}", reply_markup=_wallet_keyboard())
 
     @router.callback_query(F.data == "wallet:withdraw")
     async def wallet_withdraw(callback: CallbackQuery) -> None:
@@ -835,6 +994,94 @@ def build_router(
         rows = await database.list_rebate_records(callback.from_user.id, 20)
         await callback.message.answer(_format_rebates(rows), reply_markup=_referral_keyboard())
 
+    @router.callback_query(F.data == "referrals:rebate_apply")
+    async def rebate_apply(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        if not settings.rebate_request_enabled:
+            await callback.message.answer("返水申请暂未开放。", reply_markup=_referral_keyboard())
+            return
+        await state.clear()
+        await state.set_state(RebateStates.waiting_note)
+        await callback.message.answer(
+            "请输入你的返水申请说明，例如：\n本周投注较多，希望申请返水。",
+            reply_markup=_cancel_keyboard("referrals"),
+        )
+
+    @router.message(RebateStates.waiting_note)
+    async def rebate_note_input(message: Message, state: FSMContext) -> None:
+        if not message.from_user:
+            return
+        note = (message.text or "").strip()
+        if len(note) < 2:
+            await message.answer("申请说明太短，请重新输入。", reply_markup=_cancel_keyboard("referrals"))
+            return
+        summary = await database.get_referral_summary(message.from_user.id)
+        await state.update_data(note=note, turnover=str(summary.get("total_turnover") or "0"), active_referrals=int(summary.get("active_count") or 0))
+        await state.set_state(RebateStates.confirming_request)
+        await message.answer(_format_rebate_confirm(await state.get_data()), reply_markup=_rebate_confirm_keyboard())
+
+    @router.callback_query(F.data == "rebate:confirm")
+    async def rebate_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        data = await state.get_data()
+        parent = await database.pool.fetchval("SELECT parent_user_id FROM referral_relations WHERE user_id = $1", callback.from_user.id)
+        requested_to = int(parent) if parent else (next(iter(settings.super_admin_user_ids), None))
+        row = await database.create_rebate_request(
+            callback.from_user.id,
+            requested_to,
+            Decimal(str(data.get("turnover") or "0")),
+            int(data.get("active_referrals") or 0),
+            Decimal("0"),
+            str(data.get("note") or ""),
+        )
+        await state.clear()
+        if requested_to:
+            await _notify_user(callback.bot, requested_to, f"新的返水申请 #{row['id']}，请审核。")
+        await callback.message.answer(f"返水申请已提交，状态：pending。\n申请号：{row['id']}", reply_markup=_referral_keyboard())
+
+    @router.callback_query(F.data == "referrals:agent_apply")
+    async def agent_apply(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        metrics = await database.get_agent_application_metrics(callback.from_user.id)
+        ok = (
+            Decimal(str(metrics.get("total_deposit") or 0)) >= settings.agent_min_total_deposit
+            and Decimal(str(metrics.get("total_turnover") or 0)) >= settings.agent_min_total_turnover
+            and int(metrics.get("valid_referrals") or 0) >= settings.agent_min_valid_referrals
+        )
+        if not ok:
+            await callback.message.answer(_format_agent_progress(metrics, settings), reply_markup=_referral_keyboard())
+            return
+        await state.clear()
+        await state.update_data(metrics=metrics)
+        await state.set_state(AgentApplicationStates.waiting_note)
+        await callback.message.answer("请输入代理申请说明。", reply_markup=_cancel_keyboard("referrals"))
+
+    @router.message(AgentApplicationStates.waiting_note)
+    async def agent_note_input(message: Message, state: FSMContext) -> None:
+        if not message.from_user:
+            return
+        note = (message.text or "").strip()
+        if len(note) < 2:
+            await message.answer("申请说明太短，请重新输入。", reply_markup=_cancel_keyboard("referrals"))
+            return
+        metrics = await database.get_agent_application_metrics(message.from_user.id)
+        row = await database.create_agent_application(
+            message.from_user.id,
+            Decimal(str(metrics.get("total_deposit") or "0")),
+            Decimal(str(metrics.get("total_turnover") or "0")),
+            int(metrics.get("valid_referrals") or 0),
+            note,
+        )
+        await state.clear()
+        await _notify_admins(message.bot, settings, f"新的代理申请 #{row['id']}，请超级管理员审核。")
+        await message.answer(f"代理申请已提交，状态：pending。\n申请号：{row['id']}", reply_markup=_referral_keyboard())
+
     @router.callback_query(F.data == "referrals:copy")
     async def referral_copy(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
@@ -976,15 +1223,22 @@ def build_router(
             await message.answer("用法：/admin_deposit <order_id>")
             return
         order = await database.get_deposit_order(order_id)
-        await message.answer(_format_deposit_order(order, settings.wallet_currency) if order else "订单不存在。")
+        await message.answer(_format_admin_deposit_order(order) if order else "订单不存在。")
 
     @router.message(Command("admin_adjust_balance"))
-    async def admin_adjust_balance(message: Message, command: CommandObject) -> None:
+    async def admin_adjust_balance(message: Message, command: CommandObject, state: FSMContext) -> None:
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
+        if not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可以调账。")
+            return
         parts = (command.args or "").strip().split(maxsplit=2)
         if len(parts) < 3:
+            await state.clear()
+            await state.set_state(AdminAdjustStates.waiting_user)
+            await message.answer("请输入要调账的用户 Telegram ID：", reply_markup=_cancel_keyboard("admin"))
+            return
             await message.answer("用法：/admin_adjust_balance <telegram_user_id> <amount> <reason>")
             return
         try:
@@ -1002,6 +1256,63 @@ def build_router(
             {"amount": str(amount), "reason": parts[2], "ledger_id": ledger["id"]},
         )
         await message.answer(f"调整完成，ledger_id={ledger['id']}")
+
+    @router.message(AdminAdjustStates.waiting_user)
+    async def admin_adjust_user_input(message: Message, state: FSMContext) -> None:
+        if not message.from_user or not await permission_service.is_super_admin(message.from_user.id):
+            return
+        try:
+            target_user_id = int((message.text or "").strip())
+        except ValueError:
+            await message.answer("请输入数字 Telegram ID。", reply_markup=_cancel_keyboard("admin"))
+            return
+        await state.update_data(target_user_id=target_user_id)
+        await state.set_state(AdminAdjustStates.waiting_amount)
+        await message.answer("请输入调整金额，正数加钱，负数扣钱：", reply_markup=_cancel_keyboard("admin"))
+
+    @router.message(AdminAdjustStates.waiting_amount)
+    async def admin_adjust_amount_input(message: Message, state: FSMContext) -> None:
+        try:
+            amount = Decimal((message.text or "").strip())
+        except Exception:
+            await message.answer("金额格式不正确，请重新输入。", reply_markup=_cancel_keyboard("admin"))
+            return
+        if amount == 0:
+            await message.answer("调账金额不能为 0。", reply_markup=_cancel_keyboard("admin"))
+            return
+        await state.update_data(amount=str(amount))
+        await state.set_state(AdminAdjustStates.waiting_reason)
+        await message.answer("请输入调账原因：", reply_markup=_cancel_keyboard("admin"))
+
+    @router.message(AdminAdjustStates.waiting_reason)
+    async def admin_adjust_reason_input(message: Message, state: FSMContext) -> None:
+        reason = (message.text or "").strip()
+        if len(reason) < 3:
+            await message.answer("必须填写明确调账原因。", reply_markup=_cancel_keyboard("admin"))
+            return
+        await state.update_data(reason=reason)
+        await state.set_state(AdminAdjustStates.confirming_adjustment)
+        await message.answer(_format_admin_adjust_confirm(await state.get_data()), reply_markup=_admin_adjust_confirm_keyboard())
+
+    @router.callback_query(F.data == "admin_adjust:confirm")
+    async def admin_adjust_confirm(callback: CallbackQuery, state: FSMContext) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user or not await permission_service.is_super_admin(callback.from_user.id):
+            return
+        data = await state.get_data()
+        target_user_id = int(data["target_user_id"])
+        amount = Decimal(str(data["amount"]))
+        reason = str(data["reason"])
+        ledger = await wallet_service.manual_adjust(target_user_id, amount, reason, callback.from_user.id)
+        await database.add_admin_audit_log(
+            callback.from_user.id,
+            "admin_adjust_balance",
+            "wallet",
+            str(target_user_id),
+            {"amount": str(amount), "reason": reason, "ledger_id": ledger["id"]},
+        )
+        await state.clear()
+        await callback.message.answer(f"调账完成，ledger_id={ledger['id']}")
 
     @router.message(Command("admin_commissions"))
     async def admin_commissions(message: Message) -> None:
@@ -1809,9 +2120,10 @@ async def _create_recharge_order(
     database: Database,
     settings: Settings,
     gmpay_client: GMPayClient,
+    network: str | None = None,
 ) -> None:
-    if amount < settings.gmpay_min_recharge_usdt:
-        await message.answer(f"最低充值金额：{_money(settings.gmpay_min_recharge_usdt)} {settings.wallet_currency}")
+    if amount < settings.min_recharge_amount:
+        await message.answer(f"最低充值金额：{_money(settings.min_recharge_amount)} {settings.wallet_currency}")
         return
     if amount > settings.max_recharge_amount:
         await message.answer(f"充值金额不能超过：{_money(settings.max_recharge_amount)} {settings.wallet_currency}")
@@ -1824,7 +2136,7 @@ async def _create_recharge_order(
                 order_id,
                 amount,
                 settings.wallet_currency,
-                settings.gmpay_default_network,
+                network or settings.gmpay_default_network,
             )
             break
         except asyncpg.UniqueViolationError:
@@ -1838,7 +2150,7 @@ async def _create_recharge_order(
         order_id,
         len(order_id),
         amount,
-        settings.gmpay_default_network,
+        network or settings.gmpay_default_network,
     )
     try:
         transaction = await gmpay_client.create_transaction(
@@ -1847,6 +2159,7 @@ async def _create_recharge_order(
             user_id=user_id,
             notify_url=settings.gmpay_notify_url,
             redirect_url=settings.gmpay_redirect_url,
+            network=network,
         )
     except Exception as exc:
         raw_response = _gmpay_create_failure_response(exc)
@@ -1892,6 +2205,60 @@ def _wallet_keyboard() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="提现申请", callback_data="wallet:withdraw_prompt")],
             [InlineKeyboardButton(text="返回首页", callback_data="home")],
+        ]
+    )
+
+
+def _network_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    networks = [
+        ("TRON / TRC20", "tron"),
+        ("Polygon", "polygon"),
+        ("BSC", "bsc"),
+        ("Arbitrum", "arbitrum"),
+        ("Ethereum", "ethereum"),
+    ]
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"{prefix}:{value}")] for label, value in networks]
+    rows.append([InlineKeyboardButton(text="取消", callback_data=f"{prefix}:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _cancel_keyboard(target: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="取消", callback_data=f"fsm_cancel:{target}")]])
+
+
+def _recharge_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="确认创建订单", callback_data="recharge:confirm")],
+            [InlineKeyboardButton(text="重新选择金额", callback_data="recharge:amounts")],
+            [InlineKeyboardButton(text="取消", callback_data="fsm_cancel:wallet")],
+        ]
+    )
+
+
+def _withdraw_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="提交申请", callback_data="withdraw:confirm")],
+            [InlineKeyboardButton(text="取消", callback_data="fsm_cancel:wallet")],
+        ]
+    )
+
+
+def _rebate_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="提交申请", callback_data="rebate:confirm")],
+            [InlineKeyboardButton(text="取消", callback_data="fsm_cancel:referrals")],
+        ]
+    )
+
+
+def _admin_adjust_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="确认调账", callback_data="admin_adjust:confirm")],
+            [InlineKeyboardButton(text="取消", callback_data="fsm_cancel:admin")],
         ]
     )
 
@@ -1951,6 +2318,10 @@ def _referral_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="下级管理", callback_data="referrals:children"),
                 InlineKeyboardButton(text="返佣记录", callback_data="referrals:commissions"),
             ],
+            [
+                InlineKeyboardButton(text="申请返水", callback_data="referrals:rebate_apply"),
+                InlineKeyboardButton(text="申请成为代理", callback_data="referrals:agent_apply"),
+            ],
             [InlineKeyboardButton(text="复制邀请链接", callback_data="referrals:copy")],
             [InlineKeyboardButton(text="返回首页", callback_data="home")],
         ]
@@ -1966,6 +2337,64 @@ def _format_wallet(wallet: dict, currency: str) -> str:
     )
 
 
+def _format_recharge_confirm(data: dict[str, Any], settings: Settings) -> str:
+    network = _network_label(str(data.get("network") or settings.gmpay_default_network))
+    return (
+        "确认充值\n\n"
+        f"金额：{_money(data.get('amount'))} {settings.wallet_currency}\n"
+        f"网络：{network}\n"
+        "到账方式：GMPay\n"
+        f"有效期：{settings.gmpay_order_expire_minutes} 分钟"
+    )
+
+
+def _format_withdraw_confirm(data: dict[str, Any], currency: str) -> str:
+    return (
+        "🏧 确认提现申请\n\n"
+        f"金额：{_money(data.get('amount'))} {currency}\n"
+        f"网络：{_network_label(str(data.get('network') or ''))}\n"
+        f"地址：{data.get('address') or '-'}\n\n"
+        "提现需要管理员审核，不会自动出款。"
+    )
+
+
+def _format_rebate_confirm(data: dict[str, Any]) -> str:
+    return (
+        "🎁 返水申请\n\n"
+        f"当前累计投注：{_money(data.get('turnover'))}\n"
+        f"有效下级：{data.get('active_referrals') or 0}\n"
+        f"申请说明：{data.get('note') or '-'}"
+    )
+
+
+def _format_agent_progress(metrics: dict[str, Any], settings: Settings) -> str:
+    return (
+        "当前还未达到代理申请条件：\n\n"
+        f"累计充值：{_money(metrics.get('total_deposit'))} / {_money(settings.agent_min_total_deposit)}\n"
+        f"累计投注：{_money(metrics.get('total_turnover'))} / {_money(settings.agent_min_total_turnover)}\n"
+        f"有效下级：{metrics.get('valid_referrals') or 0} / {settings.agent_min_valid_referrals}"
+    )
+
+
+def _format_admin_adjust_confirm(data: dict[str, Any]) -> str:
+    return (
+        "确认调账\n\n"
+        f"用户：{data.get('target_user_id')}\n"
+        f"金额：{data.get('amount')}\n"
+        f"原因：{data.get('reason')}"
+    )
+
+
+def _network_label(network: str) -> str:
+    return {
+        "tron": "TRON / TRC20",
+        "polygon": "Polygon",
+        "bsc": "BSC",
+        "arbitrum": "Arbitrum",
+        "ethereum": "Ethereum",
+    }.get(network, network or "-")
+
+
 def _format_deposit_order(order: dict, currency: str) -> str:
     return (
         "充值订单已创建\n\n"
@@ -1978,6 +2407,34 @@ def _format_deposit_order(order: dict, currency: str) -> str:
         "请点击下方按钮打开收银台完成支付。\n"
         "到账后系统会自动入账。"
     )
+
+
+def _format_admin_deposit_order(order: dict | None) -> str:
+    if not order:
+        return "订单不存在。"
+    return (
+        "充值订单详情\n\n"
+        f"order_id={order.get('order_id')}\n"
+        f"user_id={order.get('user_id')}\n"
+        f"amount_requested={_money(order.get('amount_requested'))}\n"
+        f"actual_amount={_money(order.get('actual_amount'))}\n"
+        f"status={order.get('status')}\n"
+        f"trade_id={order.get('trade_id') or '-'}\n"
+        f"network={order.get('network') or '-'}\n"
+        f"payment_url={order.get('payment_url') or '-'}\n"
+        f"raw_response_json={_short_json(order.get('raw_response_json'))}\n"
+        f"raw_callback_json={_short_json(order.get('raw_callback_json'))}\n"
+        f"created_at={order.get('created_at')}\n"
+        f"paid_at={order.get('paid_at') or '-'}"
+    )
+
+
+def _short_json(value: Any) -> str:
+    try:
+        text = json.dumps(value or {}, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(value or {})
+    return text if len(text) <= 1200 else text[:1200] + "...(truncated)"
 
 
 def _format_deposit_records(rows: list[dict]) -> str:
@@ -2237,6 +2694,57 @@ async def _send_bets_page(message: Message, user_id: int, status_group: str, pag
             has_next=(page + 1) * per_page < total,
         ),
     )
+
+
+async def _send_bet_confirm_for_amount(
+    message: Message,
+    fixture_id: int,
+    market_key: str,
+    page: int,
+    outcome_index: int,
+    amount: str,
+    cache: RedisCache,
+    api_client: ApiFootballClient,
+    settings: Settings,
+) -> None:
+    fixture = await _find_cached_fixture(cache, api_client, settings, fixture_id)
+    normalized_odds = await _get_fixture_odds(cache, api_client, fixture_id)
+    market = _market_for(normalized_odds, market_key)
+    outcomes = market.outcomes[page * 20 : (page + 1) * 20] if market else []
+    outcome = outcomes[outcome_index] if outcome_index < len(outcomes) else None
+    if not fixture or not outcome:
+        await message.answer("该赔率当前不可用，请返回赛事重新选择。")
+        return
+    await message.answer(
+        format_bet_confirm(
+            fixture,
+            getattr(market, "title", market_key),
+            _outcome_button_label(outcome),
+            outcome.odds,
+            stake=amount,
+        ),
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="确认下注", callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:{amount}")],
+                [InlineKeyboardButton(text="修改金额", callback_data=f"bet_amount:{fixture_id}:{market_key}:{page}:{outcome_index}")],
+                [InlineKeyboardButton(text="取消", callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page}")],
+            ]
+        ),
+    )
+
+
+async def _notify_admins(bot: Any, settings: Settings, text: str) -> None:
+    for user_id in settings.super_admin_user_ids | settings.admin_user_ids:
+        await _notify_user(bot, user_id, text)
+
+
+async def _notify_user(bot: Any, user_id: int | None, text: str) -> None:
+    if not user_id:
+        return
+    try:
+        await bot.send_message(int(user_id), text)
+    except Exception:
+        logger.info("failed to send notification user_id=%s", user_id, exc_info=True)
 
 
 def _format_bets_page(rows: list[dict], pending_count: int, settled_count: int, status_group: str) -> str:

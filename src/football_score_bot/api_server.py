@@ -63,23 +63,63 @@ async def gmpay_webhook(request: Request) -> Response:
     wallets: WalletService = request.app.state.wallets
     bot: Bot = request.app.state.bot
 
-    if not payload or not gmpay.verify_signature(payload):
-        logger.warning("gmpay webhook signature rejected fields=%s", sorted(payload.keys()) if payload else [])
-        raise HTTPException(status_code=401, detail="invalid signature")
-
+    signature_valid = bool(payload and gmpay.verify_signature(payload))
     normalized = _normalize_callback(payload)
     order_id = normalized["order_id"]
+    order = await database.get_deposit_order(order_id) if order_id else None
+    status_before = str(order.get("status")) if order else None
+    if not payload or not signature_valid:
+        logger.warning(
+            "gmpay callback received order_id=%s trade_id=%s status=%s actual_amount=%s signature_valid=%s matched_order=%s deposit_status_before=%s deposit_status_after=%s",
+            order_id,
+            normalized["trade_id"],
+            normalized["status"],
+            normalized["actual_amount"],
+            signature_valid,
+            bool(order),
+            status_before,
+            status_before,
+        )
+        raise HTTPException(status_code=401, detail="invalid signature")
+
     if not order_id:
         raise HTTPException(status_code=400, detail="missing order_id")
-    order = await database.get_deposit_order(order_id)
     if not order:
-        logger.warning("gmpay webhook order not found order_id=%s", order_id)
-        raise HTTPException(status_code=404, detail="order not found")
+        logger.warning(
+            "gmpay callback order not found order_id=%s trade_id=%s status=%s actual_amount=%s signature_valid=%s matched_order=false deposit_status_before=%s deposit_status_after=%s",
+            order_id,
+            normalized["trade_id"],
+            normalized["status"],
+            normalized["actual_amount"],
+            signature_valid,
+            None,
+            None,
+        )
+        return Response("ok", media_type="text/plain")
 
     if order.get("status") == "paid":
+        logger.info(
+            "duplicate callback ignored order_id=%s trade_id=%s status=%s actual_amount=%s signature_valid=%s matched_order=true deposit_status_before=%s deposit_status_after=%s",
+            order_id,
+            normalized["trade_id"],
+            normalized["status"],
+            normalized["actual_amount"],
+            signature_valid,
+            status_before,
+            order.get("status"),
+        )
         return Response("ok", media_type="text/plain")
     if not _is_success_status(normalized["status"]):
-        logger.info("gmpay webhook ignored non-paid order_id=%s status=%s", order_id, normalized["status"])
+        logger.info(
+            "gmpay callback ignored non-paid order_id=%s trade_id=%s status=%s actual_amount=%s signature_valid=%s matched_order=true deposit_status_before=%s deposit_status_after=%s",
+            order_id,
+            normalized["trade_id"],
+            normalized["status"],
+            normalized["actual_amount"],
+            signature_valid,
+            status_before,
+            status_before,
+        )
         return Response("ok", media_type="text/plain")
 
     if normalized["trade_id"] and order.get("trade_id") and normalized["trade_id"] != str(order["trade_id"]):
@@ -97,6 +137,19 @@ async def gmpay_webhook(request: Request) -> Response:
         "chain_tx_id": normalized["chain_tx_id"],
     }
     paid = await wallets.credit_deposit(int(order["user_id"]), order, callback_payload)
+    updated_order = await database.get_deposit_order(order_id)
+    status_after = str(updated_order.get("status")) if updated_order else status_before
+    logger.info(
+        "gmpay callback processed order_id=%s trade_id=%s status=%s actual_amount=%s signature_valid=%s matched_order=true deposit_status_before=%s deposit_status_after=%s credited=%s",
+        order_id,
+        normalized["trade_id"],
+        normalized["status"],
+        normalized["actual_amount"],
+        signature_valid,
+        status_before,
+        status_after,
+        paid,
+    )
     if paid:
         try:
             await bot.send_message(

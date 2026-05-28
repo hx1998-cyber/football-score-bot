@@ -102,6 +102,7 @@ class GMPayClient:
         user_id: int,
         notify_url: str,
         redirect_url: str | None = None,
+        network: str | None = None,
     ) -> GMPayTransaction:
         if not self._pid or not self._base_url or not self._secret:
             raise RuntimeError("GMPAY_PID, GMPAY_BASE_URL and GMPAY_SECRET are required")
@@ -110,7 +111,7 @@ class GMPayClient:
             "order_id": order_id,
             "currency": self._default_currency,
             "token": self._default_token,
-            "network": self._default_network,
+            "network": network or self._default_network,
             "amount": _json_amount(amount),
             "notify_url": notify_url,
         }

@@ -1326,6 +1326,35 @@ class Database:
         )
         return dict(row)
 
+    async def get_agent_application_metrics(self, user_id: int) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            SELECT
+                COALESCE((SELECT total_deposit FROM wallets WHERE user_id = $1 AND currency = 'USDT'), 0) AS total_deposit,
+                COALESCE((
+                    SELECT SUM(stake)
+                    FROM bets
+                    WHERE COALESCE(user_id, telegram_user_id) = $1
+                      AND status IN ('pending', 'manual_required', 'won', 'lost')
+                ), 0) AS total_turnover,
+                COALESCE((
+                    SELECT COUNT(*)
+                    FROM referral_relations r
+                    WHERE r.parent_user_id = $1
+                      AND (
+                        EXISTS (SELECT 1 FROM deposit_orders d WHERE d.user_id = r.user_id AND d.status = 'paid')
+                        OR EXISTS (
+                            SELECT 1 FROM bets b
+                            WHERE COALESCE(b.user_id, b.telegram_user_id) = r.user_id
+                              AND b.status IN ('pending', 'manual_required', 'won', 'lost')
+                        )
+                      )
+                ), 0) AS valid_referrals
+            """,
+            user_id,
+        )
+        return dict(row)
+
     async def list_agent_applications(self, status: str = "pending", limit: int = 50) -> list[dict]:
         rows = await self._pool.fetch(
             """
