@@ -1,0 +1,1 @@
+"""Telegram football score bot."""

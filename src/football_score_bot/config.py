@@ -1,0 +1,162 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from decimal import Decimal
+
+from dotenv import load_dotenv
+
+
+@dataclass(frozen=True)
+class Settings:
+    telegram_bot_token: str
+    api_football_key: str
+    api_football_base_url: str
+    database_url: str
+    redis_url: str
+    featured_league_ids: set[int]
+    featured_countries: list[str]
+    featured_keywords: list[str]
+    max_featured_matches: int
+    live_refresh_seconds: int
+    today_refresh_seconds: int
+    odds_refresh_seconds: int
+    bet_cutoff_minutes: int
+    enable_live_betting: bool
+    show_only_bettable_matches: bool
+    show_tomorrow_matches: bool
+    bettable_days_ahead: int
+    max_bettable_matches: int
+    admin_user_ids: set[int]
+    default_language: str
+    payment_provider: str
+    gmpay_pid: str
+    gmpay_base_url: str
+    gmpay_create_order_path: str
+    gmpay_secret: str
+    gmpay_sign_type: str
+    gmpay_notify_url: str
+    gmpay_redirect_url: str | None
+    gmpay_default_currency: str
+    gmpay_default_token: str
+    gmpay_default_network: str
+    gmpay_default_payment_type: str | None
+    gmpay_min_recharge_usdt: Decimal
+    gmpay_order_expire_minutes: int
+    epusdt_base_url: str
+    epusdt_api_secret: str
+    epusdt_notify_url: str
+    epusdt_redirect_url: str | None
+    epusdt_min_recharge_usdt: Decimal
+    epusdt_order_expire_minutes: int
+    app_public_base_url: str
+    referral_deposit_commission_rate: Decimal
+    referral_agent_enabled: bool
+    max_referral_level: int
+    wallet_currency: str
+    withdraw_enabled: bool
+    real_betting_enabled: bool
+    log_level: str = "INFO"
+
+
+def load_settings() -> Settings:
+    load_dotenv()
+    return Settings(
+        telegram_bot_token=_required_env("TELEGRAM_BOT_TOKEN"),
+        api_football_key=_required_env("API_FOOTBALL_KEY"),
+        api_football_base_url=os.getenv(
+            "API_FOOTBALL_BASE_URL", "https://v3.football.api-sports.io"
+        ),
+        database_url=os.getenv(
+            "DATABASE_URL",
+            "postgresql://football:football_password@postgres:5432/football_score_bot",
+        ),
+        redis_url=os.getenv("REDIS_URL", "redis://redis:6379/0"),
+        featured_league_ids=_parse_int_set(os.getenv("FEATURED_LEAGUE_IDS", "")),
+        featured_countries=_parse_csv(
+            os.getenv(
+                "FEATURED_COUNTRIES",
+                "World,Europe,England,Spain,Italy,Germany,France,Portugal,Netherlands,"
+                "Saudi-Arabia,USA,Japan,Korea-Republic,China",
+            )
+        ),
+        featured_keywords=_parse_csv(
+            os.getenv(
+                "FEATURED_KEYWORDS",
+                "World Cup,UEFA Champions League,Europa League,Premier League,La Liga,"
+                "Serie A,Bundesliga,Ligue 1,AFC Champions League,Copa America,"
+                "European Championship",
+            )
+        ),
+        max_featured_matches=int(os.getenv("MAX_FEATURED_MATCHES", "20")),
+        live_refresh_seconds=int(os.getenv("LIVE_REFRESH_SECONDS", "60")),
+        today_refresh_seconds=int(os.getenv("TODAY_REFRESH_SECONDS", "300")),
+        odds_refresh_seconds=int(os.getenv("ODDS_REFRESH_SECONDS", "120")),
+        bet_cutoff_minutes=int(os.getenv("BET_CUTOFF_MINUTES", "5")),
+        enable_live_betting=_parse_bool(os.getenv("ENABLE_LIVE_BETTING", "false")),
+        show_only_bettable_matches=_parse_bool(os.getenv("SHOW_ONLY_BETTABLE_MATCHES", "true")),
+        show_tomorrow_matches=_parse_bool(os.getenv("SHOW_TOMORROW_MATCHES", "true")),
+        bettable_days_ahead=max(1, int(os.getenv("BETTABLE_DAYS_AHEAD", "2"))),
+        max_bettable_matches=int(os.getenv("MAX_BETTABLE_MATCHES", "30")),
+        admin_user_ids=_parse_int_set(os.getenv("ADMIN_USER_IDS", "")),
+        default_language=os.getenv("DEFAULT_LANGUAGE", "zh-CN"),
+        payment_provider=os.getenv("PAYMENT_PROVIDER", "gmpay"),
+        gmpay_pid=os.getenv("GMPAY_PID", ""),
+        gmpay_base_url=os.getenv("GMPAY_BASE_URL", "https://hosea.cc.cd").rstrip("/"),
+        gmpay_create_order_path=os.getenv(
+            "GMPAY_CREATE_ORDER_PATH",
+            "/payments/gmpay/v1/order/create-transaction",
+        ),
+        gmpay_secret=os.getenv("GMPAY_SECRET", ""),
+        gmpay_sign_type=os.getenv("GMPAY_SIGN_TYPE", "md5").lower(),
+        gmpay_notify_url=os.getenv("GMPAY_NOTIFY_URL", ""),
+        gmpay_redirect_url=os.getenv("GMPAY_REDIRECT_URL") or None,
+        gmpay_default_currency=os.getenv("GMPAY_DEFAULT_CURRENCY", "cny"),
+        gmpay_default_token=os.getenv("GMPAY_DEFAULT_TOKEN", "usdt"),
+        gmpay_default_network=os.getenv("GMPAY_DEFAULT_NETWORK", "tron"),
+        gmpay_default_payment_type=os.getenv("GMPAY_DEFAULT_PAYMENT_TYPE") or None,
+        gmpay_min_recharge_usdt=Decimal(os.getenv("GMPAY_MIN_RECHARGE_USDT", "10")),
+        gmpay_order_expire_minutes=int(os.getenv("GMPAY_ORDER_EXPIRE_MINUTES", "30")),
+        epusdt_base_url=os.getenv("EPUSDT_BASE_URL", "").rstrip("/"),
+        epusdt_api_secret=os.getenv("EPUSDT_API_SECRET", ""),
+        epusdt_notify_url=os.getenv("EPUSDT_NOTIFY_URL", ""),
+        epusdt_redirect_url=os.getenv("EPUSDT_REDIRECT_URL") or None,
+        epusdt_min_recharge_usdt=Decimal(os.getenv("EPUSDT_MIN_RECHARGE_USDT", "10")),
+        epusdt_order_expire_minutes=int(os.getenv("EPUSDT_ORDER_EXPIRE_MINUTES", "30")),
+        app_public_base_url=os.getenv("APP_PUBLIC_BASE_URL", ""),
+        referral_deposit_commission_rate=Decimal(os.getenv("REFERRAL_DEPOSIT_COMMISSION_RATE", "0.00")),
+        referral_agent_enabled=_parse_bool(os.getenv("REFERRAL_AGENT_ENABLED", "true")),
+        max_referral_level=max(1, int(os.getenv("MAX_REFERRAL_LEVEL", "1"))),
+        wallet_currency=os.getenv("WALLET_CURRENCY", "USDT"),
+        withdraw_enabled=_parse_bool(os.getenv("WITHDRAW_ENABLED", "false")),
+        real_betting_enabled=_parse_bool(os.getenv("REAL_BETTING_ENABLED", "false")),
+        log_level=os.getenv("LOG_LEVEL", "INFO"),
+    )
+
+
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _parse_csv(value: str) -> list[str]:
+    return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_int_set(value: str) -> set[int]:
+    result: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.add(int(item))
+        except ValueError:
+            continue
+    return result
+
+
+def _parse_bool(value: str) -> bool:
+    return value.strip().lower() in {"1", "true", "yes", "on"}

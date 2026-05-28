@@ -1,0 +1,1 @@
+"""Poster generation placeholders."""

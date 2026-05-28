@@ -1,0 +1,124 @@
+services:
+  bot:
+    build: .
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      API_FOOTBALL_KEY: ${API_FOOTBALL_KEY:?Set API_FOOTBALL_KEY in .env}
+      API_FOOTBALL_BASE_URL: ${API_FOOTBALL_BASE_URL:-https://v3.football.api-sports.io}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://football:football_password@postgres:5432/football_score_bot}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      FEATURED_LEAGUE_IDS: ${FEATURED_LEAGUE_IDS:-}
+      FEATURED_COUNTRIES: ${FEATURED_COUNTRIES:-World,Europe,England,Spain,Italy,Germany,France,Portugal,Netherlands,Saudi-Arabia,USA,Japan,Korea-Republic,China}
+      FEATURED_KEYWORDS: ${FEATURED_KEYWORDS:-World Cup,UEFA Champions League,Europa League,Premier League,La Liga,Serie A,Bundesliga,Ligue 1,AFC Champions League,Copa America,European Championship}
+      MAX_FEATURED_MATCHES: ${MAX_FEATURED_MATCHES:-20}
+      LIVE_REFRESH_SECONDS: ${LIVE_REFRESH_SECONDS:-60}
+      TODAY_REFRESH_SECONDS: ${TODAY_REFRESH_SECONDS:-300}
+      ODDS_REFRESH_SECONDS: ${ODDS_REFRESH_SECONDS:-120}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-zh-CN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-gmpay}
+      GMPAY_PID: ${GMPAY_PID:-}
+      GMPAY_BASE_URL: ${GMPAY_BASE_URL:-https://hosea.cc.cd}
+      GMPAY_CREATE_ORDER_PATH: ${GMPAY_CREATE_ORDER_PATH:-/payments/gmpay/v1/order/create-transaction}
+      GMPAY_SECRET: ${GMPAY_SECRET:-}
+      GMPAY_SIGN_TYPE: ${GMPAY_SIGN_TYPE:-md5}
+      GMPAY_NOTIFY_URL: ${GMPAY_NOTIFY_URL:-}
+      GMPAY_REDIRECT_URL: ${GMPAY_REDIRECT_URL:-}
+      GMPAY_DEFAULT_CURRENCY: ${GMPAY_DEFAULT_CURRENCY:-cny}
+      GMPAY_DEFAULT_TOKEN: ${GMPAY_DEFAULT_TOKEN:-usdt}
+      GMPAY_DEFAULT_NETWORK: ${GMPAY_DEFAULT_NETWORK:-tron}
+      GMPAY_DEFAULT_PAYMENT_TYPE: ${GMPAY_DEFAULT_PAYMENT_TYPE:-}
+      GMPAY_MIN_RECHARGE_USDT: ${GMPAY_MIN_RECHARGE_USDT:-10}
+      GMPAY_ORDER_EXPIRE_MINUTES: ${GMPAY_ORDER_EXPIRE_MINUTES:-30}
+      APP_PUBLIC_BASE_URL: ${APP_PUBLIC_BASE_URL:-}
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
+      REFERRAL_DEPOSIT_COMMISSION_RATE: ${REFERRAL_DEPOSIT_COMMISSION_RATE:-0.00}
+      REFERRAL_AGENT_ENABLED: ${REFERRAL_AGENT_ENABLED:-true}
+      MAX_REFERRAL_LEVEL: ${MAX_REFERRAL_LEVEL:-1}
+      WALLET_CURRENCY: ${WALLET_CURRENCY:-USDT}
+      WITHDRAW_ENABLED: ${WITHDRAW_ENABLED:-false}
+      REAL_BETTING_ENABLED: ${REAL_BETTING_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  api:
+    build: .
+    command: python -m football_score_bot.api_server
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?Set TELEGRAM_BOT_TOKEN in .env}
+      API_FOOTBALL_KEY: ${API_FOOTBALL_KEY:?Set API_FOOTBALL_KEY in .env}
+      API_FOOTBALL_BASE_URL: ${API_FOOTBALL_BASE_URL:-https://v3.football.api-sports.io}
+      DATABASE_URL: ${DATABASE_URL:-postgresql://football:football_password@postgres:5432/football_score_bot}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      DEFAULT_LANGUAGE: ${DEFAULT_LANGUAGE:-zh-CN}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      PAYMENT_PROVIDER: ${PAYMENT_PROVIDER:-gmpay}
+      GMPAY_PID: ${GMPAY_PID:-}
+      GMPAY_BASE_URL: ${GMPAY_BASE_URL:-https://hosea.cc.cd}
+      GMPAY_CREATE_ORDER_PATH: ${GMPAY_CREATE_ORDER_PATH:-/payments/gmpay/v1/order/create-transaction}
+      GMPAY_SECRET: ${GMPAY_SECRET:-}
+      GMPAY_SIGN_TYPE: ${GMPAY_SIGN_TYPE:-md5}
+      GMPAY_NOTIFY_URL: ${GMPAY_NOTIFY_URL:-}
+      GMPAY_REDIRECT_URL: ${GMPAY_REDIRECT_URL:-}
+      GMPAY_DEFAULT_CURRENCY: ${GMPAY_DEFAULT_CURRENCY:-cny}
+      GMPAY_DEFAULT_TOKEN: ${GMPAY_DEFAULT_TOKEN:-usdt}
+      GMPAY_DEFAULT_NETWORK: ${GMPAY_DEFAULT_NETWORK:-tron}
+      GMPAY_DEFAULT_PAYMENT_TYPE: ${GMPAY_DEFAULT_PAYMENT_TYPE:-}
+      GMPAY_MIN_RECHARGE_USDT: ${GMPAY_MIN_RECHARGE_USDT:-10}
+      GMPAY_ORDER_EXPIRE_MINUTES: ${GMPAY_ORDER_EXPIRE_MINUTES:-30}
+      APP_PUBLIC_BASE_URL: ${APP_PUBLIC_BASE_URL:-}
+      ADMIN_USER_IDS: ${ADMIN_USER_IDS:-}
+      REFERRAL_DEPOSIT_COMMISSION_RATE: ${REFERRAL_DEPOSIT_COMMISSION_RATE:-0.00}
+      REFERRAL_AGENT_ENABLED: ${REFERRAL_AGENT_ENABLED:-true}
+      MAX_REFERRAL_LEVEL: ${MAX_REFERRAL_LEVEL:-1}
+      WALLET_CURRENCY: ${WALLET_CURRENCY:-USDT}
+      WITHDRAW_ENABLED: ${WITHDRAW_ENABLED:-false}
+      REAL_BETTING_ENABLED: ${REAL_BETTING_ENABLED:-false}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-football_score_bot}
+      POSTGRES_USER: ${POSTGRES_USER:-football}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-football_password}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-football} -d ${POSTGRES_DB:-football_score_bot}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  redis_data:
