@@ -451,27 +451,40 @@ def build_router(
         if not bet_status.is_bettable:
             await callback.message.answer(f"当前不可投注：{reason_label(bet_status.reason)}")
             return
-        stake = "10"
+        stake_decimal = Decimal("10")
+        if stake_decimal < settings.min_bet_amount or stake_decimal > settings.max_bet_amount:
+            await callback.message.answer(
+                f"下注金额超出限制：{_money(settings.min_bet_amount)}-{_money(settings.max_bet_amount)} {settings.wallet_currency}"
+            )
+            return
+        stake = str(stake_decimal)
         odds = str(outcome.odds)
         try:
-            potential_payout = f"{float(stake) * float(odds):.2f}"
-        except ValueError:
-            potential_payout = "0.00"
+            potential_payout_decimal = (stake_decimal * Decimal(odds)).quantize(Decimal("0.01"))
+        except Exception:
+            potential_payout_decimal = Decimal("0.00")
         teams = fixture.get("teams", {})
         fixture_label = f"{teams.get('home', {}).get('name', '主队')} vs {teams.get('away', {}).get('name', '客队')}"
-        bet_id = await database.create_bet(
-            telegram_user_id=callback.from_user.id,
+        bet_id = await wallet_service.submit_bet(
+            user_id=callback.from_user.id,
             fixture_id=fixture_id,
             fixture_label=fixture_label,
             market_key=market_key,
             market_title=getattr(market, "title", market_key),
             selection=_outcome_button_label(outcome),
             odds=odds,
-            stake=stake,
-            potential_payout=potential_payout,
+            stake=stake_decimal,
+            potential_payout=potential_payout_decimal,
             bettable_status_at_submit=bet_status.reason,
+            real_betting_enabled=settings.real_betting_enabled,
         )
-        await callback.message.answer(format_bet_saved(bet_id), reply_markup=my_bets_keyboard())
+        if bet_id is None:
+            await callback.message.answer("余额不足，无法提交真实下注。")
+            return
+        if settings.real_betting_enabled:
+            await callback.message.answer(f"下注成功，等待管理员结算。\n注单号：{bet_id}", reply_markup=my_bets_keyboard())
+        else:
+            await callback.message.answer(format_bet_saved(bet_id), reply_markup=my_bets_keyboard())
 
     @router.callback_query(F.data == "bet_amount_placeholder")
     async def bet_amount_placeholder(callback: CallbackQuery) -> None:
@@ -594,10 +607,44 @@ def build_router(
         rows = await database.list_user_ledger(callback.from_user.id, 10)
         await callback.message.answer(_format_ledger(rows), reply_markup=_wallet_keyboard())
 
+    @router.callback_query(F.data == "wallet:withdraw_prompt")
+    async def wallet_withdraw_prompt(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not settings.withdraw_enabled:
+            await callback.message.answer("提现申请功能暂未开放。")
+            return
+        await callback.message.answer("请发送：/withdraw <金额> <USDT-TRC20地址>\n第一版仅支持 TRC20，提交后等待管理员人工审核。")
+
     @router.callback_query(F.data == "wallet:withdraw")
     async def wallet_withdraw(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
         await callback.message.answer("提现功能暂未自动开放。\n如需提现，请联系客服或等待管理员审核系统上线。")
+
+    @router.message(Command("withdraw"))
+    async def withdraw_request(message: Message, command: CommandObject) -> None:
+        await _remember_user_and_lang(message, database, settings)
+        if not message.from_user:
+            return
+        if not settings.withdraw_enabled:
+            await message.answer("提现申请功能暂未开放。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/withdraw <金额> <USDT-TRC20地址>")
+            return
+        try:
+            amount = Decimal(parts[0])
+        except Exception:
+            await message.answer("提现金额格式不正确。")
+            return
+        if amount < settings.min_withdraw_amount:
+            await message.answer(f"最低提现金额：{_money(settings.min_withdraw_amount)} {settings.wallet_currency}")
+            return
+        request = await wallet_service.create_withdraw_request(message.from_user.id, amount, parts[1].strip(), "TRC20")
+        if not request:
+            await message.answer("余额不足，无法提交提现申请。")
+            return
+        await message.answer(f"提现申请已提交，等待管理员审核。\n申请号：{request['id']}")
 
     @router.callback_query(F.data.startswith("deposit:refresh:"))
     async def deposit_refresh(callback: CallbackQuery) -> None:
@@ -653,6 +700,12 @@ def build_router(
         rows = await database.list_commissions(callback.from_user.id, 20)
         await callback.message.answer(_format_commissions(rows), reply_markup=_referral_keyboard())
 
+    @router.callback_query(F.data == "referrals:rebates")
+    async def referral_rebates(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        rows = await database.list_rebate_records(callback.from_user.id, 20)
+        await callback.message.answer(_format_rebates(rows), reply_markup=_referral_keyboard())
+
     @router.callback_query(F.data == "referrals:copy")
     async def referral_copy(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
@@ -681,8 +734,23 @@ def build_router(
             "/admin_deposits\n"
             "/admin_deposit <order_id>\n"
             "/admin_adjust_balance <telegram_user_id> <amount> <reason>\n"
+            "/admin_bets\n"
+            "/admin_bet <bet_id>\n"
+            "/admin_settle_win <bet_id>\n"
+            "/admin_settle_loss <bet_id>\n"
+            "/admin_settle_void <bet_id>\n"
+            "/admin_cancel_bet <bet_id>\n"
+            "/admin_withdrawals\n"
+            "/admin_withdraw <withdraw_id>\n"
+            "/admin_approve_withdraw <withdraw_id>\n"
+            "/admin_reject_withdraw <withdraw_id> <reason>\n"
+            "/admin_mark_withdraw_paid <withdraw_id> <txid>\n"
             "/admin_commissions\n"
             "/admin_settle_commission <commission_id>\n"
+            "/admin_rebate_rules\n"
+            "/admin_rebate_preview <user_id>\n"
+            "/admin_generate_rebates\n"
+            "/admin_settle_rebate <rebate_record_id>\n"
             "/admin_referrals <telegram_user_id>"
         )
 
@@ -691,8 +759,11 @@ def build_router(
         if not _is_admin(message.from_user.id if message.from_user else None, settings):
             await message.answer("无管理员权限。")
             return
-        effective_settings = await _effective_settings(cache, settings)
-        fixtures, _ = await get_bettable_matches_range(cache, api_client, database, effective_settings)
+        dashboard = await database.admin_dashboard()
+        fixtures = [None] * int(dashboard.get("pending_bets") or 0)
+        effective_settings = settings
+        await message.answer(_format_admin_dashboard(dashboard, settings.wallet_currency))
+        return
         await message.answer(f"当前可投注赛事：{len(fixtures)} 场\n封盘提前：{effective_settings.bet_cutoff_minutes} 分钟")
 
     @router.message(Command("admin_markets"))
@@ -828,6 +899,172 @@ def build_router(
             {"settled": bool(record)},
         )
         await message.answer("返佣已标记结算。" if record else "返佣不存在或已处理。")
+
+    @router.message(Command("admin_bets"))
+    async def admin_bets(message: Message) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        await message.answer(_format_admin_bets(await database.list_admin_bets("pending", 20)))
+
+    @router.message(Command("admin_bet"))
+    async def admin_bet(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        bet_id = _first_int_arg(command)
+        if bet_id is None:
+            await message.answer("用法：/admin_bet <bet_id>")
+            return
+        await message.answer(_format_admin_bet(await database.get_bet(bet_id)))
+
+    async def _admin_settle_bet(message: Message, command: CommandObject, status: str, action: str) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        bet_id = _first_int_arg(command)
+        if bet_id is None:
+            await message.answer(f"用法：/{action} <bet_id>")
+            return
+        try:
+            result = await wallet_service.settle_bet(bet_id, message.from_user.id, status)
+        except ValueError as exc:
+            await message.answer(f"结算失败：{exc}")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            action,
+            "bet",
+            str(bet_id),
+            {"status": status, "settled": bool(result)},
+        )
+        await message.answer(f"注单已结算：{status}" if result else "注单不存在或已处理。")
+
+    @router.message(Command("admin_settle_win"))
+    async def admin_settle_win(message: Message, command: CommandObject) -> None:
+        await _admin_settle_bet(message, command, "won", "admin_settle_win")
+
+    @router.message(Command("admin_settle_loss"))
+    async def admin_settle_loss(message: Message, command: CommandObject) -> None:
+        await _admin_settle_bet(message, command, "lost", "admin_settle_loss")
+
+    @router.message(Command("admin_settle_void"))
+    async def admin_settle_void(message: Message, command: CommandObject) -> None:
+        await _admin_settle_bet(message, command, "void", "admin_settle_void")
+
+    @router.message(Command("admin_cancel_bet"))
+    async def admin_cancel_bet(message: Message, command: CommandObject) -> None:
+        await _admin_settle_bet(message, command, "cancelled", "admin_cancel_bet")
+
+    @router.message(Command("admin_withdrawals"))
+    async def admin_withdrawals(message: Message) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        await message.answer(_format_withdrawals(await database.list_withdraw_requests("pending", 20)))
+
+    @router.message(Command("admin_withdraw"))
+    async def admin_withdraw(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        withdraw_id = _first_int_arg(command)
+        if withdraw_id is None:
+            await message.answer("用法：/admin_withdraw <withdraw_id>")
+            return
+        await message.answer(_format_withdraw(await database.get_withdraw_request(withdraw_id)))
+
+    @router.message(Command("admin_approve_withdraw"))
+    async def admin_approve_withdraw(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        withdraw_id = _first_int_arg(command)
+        if withdraw_id is None:
+            await message.answer("用法：/admin_approve_withdraw <withdraw_id>")
+            return
+        row = await wallet_service.approve_withdraw(withdraw_id, message.from_user.id)
+        await database.add_admin_audit_log(message.from_user.id, "admin_approve_withdraw", "withdraw", str(withdraw_id), {"approved": bool(row)})
+        await message.answer("提现已审核通过，请人工转账后 mark paid。" if row else "提现申请不存在或已处理。")
+
+    @router.message(Command("admin_reject_withdraw"))
+    async def admin_reject_withdraw(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_reject_withdraw <withdraw_id> <reason>")
+            return
+        row = await wallet_service.reject_withdraw(int(parts[0]), message.from_user.id, parts[1])
+        await database.add_admin_audit_log(message.from_user.id, "admin_reject_withdraw", "withdraw", parts[0], {"rejected": bool(row), "reason": parts[1]})
+        await message.answer("提现已拒绝并退回冻结金额。" if row else "提现申请不存在或已处理。")
+
+    @router.message(Command("admin_mark_withdraw_paid"))
+    async def admin_mark_withdraw_paid(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_mark_withdraw_paid <withdraw_id> <txid>")
+            return
+        row = await wallet_service.mark_withdraw_paid(int(parts[0]), message.from_user.id, parts[1])
+        await database.add_admin_audit_log(message.from_user.id, "admin_mark_withdraw_paid", "withdraw", parts[0], {"paid": bool(row), "txid": parts[1]})
+        await message.answer("提现已标记为已人工出款。" if row else "提现申请不存在或已处理。")
+
+    @router.message(Command("admin_rebate_rules"))
+    async def admin_rebate_rules(message: Message) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        await message.answer(_format_rebate_rules(await database.list_rebate_rules()))
+
+    @router.message(Command("admin_rebate_preview"))
+    async def admin_rebate_preview(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        user_id = _first_int_arg(command)
+        if user_id is None:
+            await message.answer("用法：/admin_rebate_preview <user_id>")
+            return
+        summary = await database.get_referral_summary(user_id)
+        records = await database.list_rebate_records(user_id, 10)
+        await message.answer(_format_admin_referral_summary(summary, settings.wallet_currency) + "\n\n" + _format_rebates(records))
+
+    @router.message(Command("admin_generate_rebates"))
+    async def admin_generate_rebates(message: Message) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        if not settings.rebate_enabled:
+            await message.answer("返水功能未启用。")
+            return
+        period_end = datetime.now()
+        period_start = period_end - timedelta(days=7)
+        count = await wallet_service.generate_rebates(period_start, period_end)
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_generate_rebates",
+            "rebate",
+            None,
+            {"period_start": period_start.isoformat(), "period_end": period_end.isoformat(), "count": count},
+        )
+        await message.answer(f"已生成 pending 返水记录：{count} 条。")
+
+    @router.message(Command("admin_settle_rebate"))
+    async def admin_settle_rebate(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        rebate_id = _first_int_arg(command)
+        if rebate_id is None:
+            await message.answer("用法：/admin_settle_rebate <rebate_record_id>")
+            return
+        row = await wallet_service.settle_rebate(rebate_id)
+        await database.add_admin_audit_log(message.from_user.id, "admin_settle_rebate", "rebate", str(rebate_id), {"settled": bool(row)})
+        await message.answer("返水已入账。" if row else "返水记录不存在或已处理。")
 
     @router.message(Command("admin_referrals"))
     async def admin_referrals(message: Message, command: CommandObject) -> None:
@@ -1373,7 +1610,7 @@ def _wallet_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="充值记录", callback_data="wallet:records"),
                 InlineKeyboardButton(text="账变记录", callback_data="wallet:ledger"),
             ],
-            [InlineKeyboardButton(text="提现申请", callback_data="wallet:withdraw")],
+            [InlineKeyboardButton(text="提现申请", callback_data="wallet:withdraw_prompt")],
             [InlineKeyboardButton(text="返回首页", callback_data="home")],
         ]
     )
@@ -1503,6 +1740,142 @@ def _format_commissions(rows: list[dict]) -> str:
     for row in rows:
         lines.append(
             f"#{row.get('id')} user={row.get('user_id')} source={row.get('source_user_id')} {_money(row.get('amount'))} {row.get('status')}"
+        )
+    return "\n".join(lines)
+
+
+def _format_admin_dashboard(row: dict, currency: str) -> str:
+    return (
+        "管理员面板\n"
+        f"今日充值：{_money(row.get('today_deposit'))} {currency}\n"
+        f"今日提现申请：{_money(row.get('today_withdraw_request'))} {currency}\n"
+        f"待结算注单：{row.get('pending_bets') or 0}\n"
+        f"待审核提现：{row.get('pending_withdrawals') or 0}\n"
+        f"待结算佣金：{row.get('pending_commissions') or 0}\n"
+        f"待结算返水：{row.get('pending_rebates') or 0}\n"
+        f"用户总数：{row.get('total_users') or 0}\n"
+        f"有效代理数：{row.get('active_agents') or 0}"
+    )
+
+
+def _format_referrals(link: str, summary: dict, currency: str) -> str:
+    return (
+        "邀请推广\n"
+        "我的邀请链接：\n"
+        f"{link}\n\n"
+        f"直属下级：{summary.get('direct_count') or 0} 人\n"
+        f"有效下级：{summary.get('active_count') or 0} 人\n"
+        f"下级总充值：{_money(summary.get('total_deposit'))} {currency}\n"
+        f"下级总投注流水：{_money(summary.get('total_turnover'))} {currency}\n"
+        f"待结算佣金：{_money(summary.get('pending_commission'))} {currency}\n"
+        f"已结算佣金：{_money(summary.get('settled_commission'))} {currency}\n"
+        f"待结算返水：{_money(summary.get('pending_rebate'))} {currency}"
+    )
+
+
+def _format_referral_children(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无直属下级。"
+    lines = ["直属下级"]
+    for row in rows:
+        name = row.get("username") or row.get("first_name") or "-"
+        lines.append(
+            f"{row.get('user_id')} {name} | registered={row.get('created_at')} "
+            f"| deposit={_money(row.get('total_deposit'))} | turnover={_money(row.get('total_turnover'))} "
+            f"| active={'Y' if row.get('is_active') else 'N'}"
+        )
+    return "\n".join(lines)
+
+
+def _format_admin_referral_summary(summary: dict, currency: str) -> str:
+    return (
+        "下级统计\n"
+        f"直属下级：{summary.get('direct_count') or 0} 人\n"
+        f"有效下级：{summary.get('active_count') or 0} 人\n"
+        f"累计下级充值：{_money(summary.get('total_deposit'))} {currency}\n"
+        f"累计下级投注流水：{_money(summary.get('total_turnover'))} {currency}\n"
+        f"待结算返佣：{_money(summary.get('pending_commission'))} {currency}\n"
+        f"已结算返佣：{_money(summary.get('settled_commission'))} {currency}\n"
+        f"待结算返水：{_money(summary.get('pending_rebate'))} {currency}"
+    )
+
+
+def _format_admin_bets(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无待结算注单。"
+    lines = ["待结算注单"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} {row.get('fixture_label')} "
+            f"{row.get('selection')} stake={row.get('stake')} payout={row.get('potential_payout')}"
+        )
+    return "\n".join(lines)
+
+
+def _format_admin_bet(row: dict | None) -> str:
+    if not row:
+        return "注单不存在。"
+    return (
+        f"注单 #{row.get('id')}\n"
+        f"user={row.get('user_id')}\n"
+        f"fixture={row.get('fixture_label')}\n"
+        f"market={row.get('market_title')}\n"
+        f"selection={row.get('selection')}\n"
+        f"stake={row.get('stake')}\n"
+        f"odds={row.get('odds')}\n"
+        f"potential_payout={row.get('potential_payout')}\n"
+        f"status={row.get('status')}\n"
+        f"balance_frozen={row.get('balance_frozen')}"
+    )
+
+
+def _format_withdrawals(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无待审核提现。"
+    lines = ["待审核提现"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} amount={_money(row.get('amount'))} "
+            f"{row.get('network') or '-'} {row.get('status')}"
+        )
+    return "\n".join(lines)
+
+
+def _format_withdraw(row: dict | None) -> str:
+    if not row:
+        return "提现申请不存在。"
+    return (
+        f"提现 #{row.get('id')}\n"
+        f"user={row.get('user_id')}\n"
+        f"amount={_money(row.get('amount'))}\n"
+        f"network={row.get('network') or '-'}\n"
+        f"address={row.get('address') or '-'}\n"
+        f"status={row.get('status')}\n"
+        f"admin_note={row.get('admin_note') or '-'}"
+    )
+
+
+def _format_rebate_rules(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无返水规则。请直接在 rebate_rules 表配置 active 规则。"
+    lines = ["返水规则"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} {row.get('name')} mode={row.get('mode')} "
+            f"active_ref={row.get('min_active_referrals')} turnover={_money(row.get('min_turnover'))} "
+            f"rate={row.get('rebate_rate')} {row.get('status')}"
+        )
+    return "\n".join(lines)
+
+
+def _format_rebates(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无返水记录。"
+    lines = ["返水记录"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} amount={_money(row.get('rebate_amount'))} "
+            f"turnover={_money(row.get('turnover'))} active_ref={row.get('active_referrals')} {row.get('status')}"
         )
     return "\n".join(lines)
 

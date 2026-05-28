@@ -121,6 +121,8 @@ class Database:
                 amount NUMERIC(18, 6) NOT NULL,
                 balance_before NUMERIC(18, 6) NOT NULL,
                 balance_after NUMERIC(18, 6) NOT NULL,
+                frozen_before NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                frozen_after NUMERIC(18, 6) NOT NULL DEFAULT 0,
                 ref_type TEXT,
                 ref_id TEXT,
                 description TEXT,
@@ -128,6 +130,11 @@ class Database:
             )
             """
         )
+        for statement in (
+            "ALTER TABLE wallet_ledger ADD COLUMN IF NOT EXISTS frozen_before NUMERIC(18, 6) NOT NULL DEFAULT 0",
+            "ALTER TABLE wallet_ledger ADD COLUMN IF NOT EXISTS frozen_after NUMERIC(18, 6) NOT NULL DEFAULT 0",
+        ):
+            await self._pool.execute(statement)
         await self._pool.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_ledger_ref ON wallet_ledger (ref_type, ref_id, type) WHERE ref_type IS NOT NULL AND ref_id IS NOT NULL"
         )
@@ -182,9 +189,55 @@ class Database:
                 address TEXT,
                 network TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                admin_id BIGINT,
+                admin_note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reviewed_at TIMESTAMPTZ,
+                paid_at TIMESTAMPTZ
             )
             """
+        )
+        for statement in (
+            "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS admin_id BIGINT",
+            "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS admin_note TEXT",
+            "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ",
+            "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
+        ):
+            await self._pool.execute(statement)
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rebate_rules (
+                id BIGSERIAL PRIMARY KEY,
+                name TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                min_active_referrals INTEGER NOT NULL DEFAULT 0,
+                min_turnover NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                rebate_rate NUMERIC(10, 6) NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rebate_records (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                period_start TIMESTAMPTZ NOT NULL,
+                period_end TIMESTAMPTZ NOT NULL,
+                turnover NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                active_referrals INTEGER NOT NULL DEFAULT 0,
+                rebate_amount NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                rule_id BIGINT REFERENCES rebate_rules(id),
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                settled_at TIMESTAMPTZ
+            )
+            """
+        )
+        await self._pool.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_rebate_records_period ON rebate_records (user_id, period_start, period_end, rule_id)"
         )
 
     async def _ensure_betting_schema(self) -> None:
@@ -223,6 +276,9 @@ class Database:
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS potential_payout NUMERIC(12, 2)",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS bettable_status_at_submit TEXT",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS amount_cents BIGINT NOT NULL DEFAULT 0",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS balance_frozen BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS settled_by_admin_id BIGINT",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         ):
             await self._pool.execute(statement)
@@ -618,6 +674,73 @@ class Database:
             or 0
         )
 
+    async def get_bet(self, bet_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            "SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout FROM bets WHERE id = $1",
+            bet_id,
+        )
+        return dict(row) if row else None
+
+    async def list_admin_bets(self, status: str = "pending", limit: int = 20) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout
+            FROM bets
+            WHERE status = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            status,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_withdraw_requests(self, status: str | None = None, limit: int = 20) -> list[dict]:
+        if status:
+            rows = await self._pool.fetch(
+                "SELECT * FROM withdraw_requests WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
+                status,
+                limit,
+            )
+        else:
+            rows = await self._pool.fetch("SELECT * FROM withdraw_requests ORDER BY created_at DESC LIMIT $1", limit)
+        return [dict(row) for row in rows]
+
+    async def get_withdraw_request(self, withdraw_id: int) -> dict | None:
+        row = await self._pool.fetchrow("SELECT * FROM withdraw_requests WHERE id = $1", withdraw_id)
+        return dict(row) if row else None
+
+    async def list_rebate_rules(self) -> list[dict]:
+        rows = await self._pool.fetch("SELECT * FROM rebate_rules ORDER BY mode, min_turnover, min_active_referrals, id")
+        return [dict(row) for row in rows]
+
+    async def list_rebate_records(self, user_id: int | None = None, limit: int = 20) -> list[dict]:
+        if user_id is None:
+            rows = await self._pool.fetch("SELECT * FROM rebate_records ORDER BY created_at DESC LIMIT $1", limit)
+        else:
+            rows = await self._pool.fetch(
+                "SELECT * FROM rebate_records WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def admin_dashboard(self) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            SELECT
+                COALESCE((SELECT SUM(actual_amount) FROM deposit_orders WHERE status = 'paid' AND paid_at >= CURRENT_DATE), 0) AS today_deposit,
+                COALESCE((SELECT SUM(amount) FROM withdraw_requests WHERE created_at >= CURRENT_DATE), 0) AS today_withdraw_request,
+                (SELECT COUNT(*) FROM bets WHERE status = 'pending') AS pending_bets,
+                (SELECT COUNT(*) FROM withdraw_requests WHERE status = 'pending') AS pending_withdrawals,
+                (SELECT COUNT(*) FROM commission_records WHERE status = 'pending') AS pending_commissions,
+                (SELECT COUNT(*) FROM rebate_records WHERE status = 'pending') AS pending_rebates,
+                (SELECT COUNT(*) FROM users) AS total_users,
+                (SELECT COUNT(DISTINCT parent_user_id) FROM referral_relations) AS active_agents
+            """
+        )
+        return dict(row)
+
     async def get_market_override(self, fixture_id: int) -> dict | None:
         row = await self._pool.fetchrow(
             """
@@ -803,13 +926,36 @@ class Database:
             SELECT
                 (SELECT COUNT(*) FROM referral_relations WHERE parent_user_id = $1) AS direct_count,
                 COALESCE((
+                    SELECT COUNT(*)
+                    FROM referral_relations r
+                    WHERE r.parent_user_id = $1
+                    AND (
+                        EXISTS (
+                            SELECT 1 FROM deposit_orders d
+                            WHERE d.user_id = r.user_id AND d.status = 'paid'
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM bets b
+                            WHERE COALESCE(b.user_id, b.telegram_user_id) = r.user_id
+                              AND b.status IN ('won', 'lost')
+                        )
+                    )
+                ), 0) AS active_count,
+                COALESCE((
                     SELECT SUM(d.actual_amount)
                     FROM deposit_orders d
                     JOIN referral_relations r ON r.user_id = d.user_id
                     WHERE r.parent_user_id = $1 AND d.status = 'paid'
                 ), 0) AS total_deposit,
+                COALESCE((
+                    SELECT SUM(b.stake)
+                    FROM bets b
+                    JOIN referral_relations r ON r.user_id = COALESCE(b.user_id, b.telegram_user_id)
+                    WHERE r.parent_user_id = $1 AND b.status IN ('won', 'lost')
+                ), 0) AS total_turnover,
                 COALESCE((SELECT SUM(amount) FROM commission_records WHERE user_id = $1 AND status = 'pending'), 0) AS pending_commission,
-                COALESCE((SELECT SUM(amount) FROM commission_records WHERE user_id = $1 AND status = 'settled'), 0) AS settled_commission
+                COALESCE((SELECT SUM(amount) FROM commission_records WHERE user_id = $1 AND status = 'settled'), 0) AS settled_commission,
+                COALESCE((SELECT SUM(rebate_amount) FROM rebate_records WHERE user_id = $1 AND status = 'pending'), 0) AS pending_rebate
             """,
             user_id,
         )
@@ -832,9 +978,28 @@ class Database:
     async def list_referrals(self, user_id: int, limit: int = 20) -> list[dict]:
         rows = await self._pool.fetch(
             """
-            SELECT r.user_id, u.username, u.first_name, r.created_at
+            SELECT
+                r.user_id,
+                u.username,
+                u.first_name,
+                r.created_at,
+                COALESCE(d.total_deposit, 0) AS total_deposit,
+                COALESCE(b.total_turnover, 0) AS total_turnover,
+                (COALESCE(d.total_deposit, 0) > 0 OR COALESCE(b.total_turnover, 0) > 0) AS is_active
             FROM referral_relations r
             LEFT JOIN users u ON u.telegram_user_id = r.user_id
+            LEFT JOIN (
+                SELECT user_id, SUM(actual_amount) AS total_deposit
+                FROM deposit_orders
+                WHERE status = 'paid'
+                GROUP BY user_id
+            ) d ON d.user_id = r.user_id
+            LEFT JOIN (
+                SELECT COALESCE(user_id, telegram_user_id) AS user_id, SUM(stake) AS total_turnover
+                FROM bets
+                WHERE status IN ('won', 'lost')
+                GROUP BY COALESCE(user_id, telegram_user_id)
+            ) b ON b.user_id = r.user_id
             WHERE r.parent_user_id = $1
             ORDER BY r.created_at DESC
             LIMIT $2

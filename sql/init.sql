@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS bets (
     potential_payout NUMERIC(12, 2),
     status TEXT NOT NULL DEFAULT 'pending',
     bettable_status_at_submit TEXT,
+    balance_frozen BOOLEAN NOT NULL DEFAULT FALSE,
+    settled_by_admin_id BIGINT,
+    settled_at TIMESTAMPTZ,
     amount_cents BIGINT NOT NULL DEFAULT 0,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -177,6 +180,8 @@ CREATE TABLE IF NOT EXISTS wallet_ledger (
     amount NUMERIC(18, 6) NOT NULL,
     balance_before NUMERIC(18, 6) NOT NULL,
     balance_after NUMERIC(18, 6) NOT NULL,
+    frozen_before NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    frozen_after NUMERIC(18, 6) NOT NULL DEFAULT 0,
     ref_type TEXT,
     ref_id TEXT,
     description TEXT,
@@ -220,7 +225,37 @@ CREATE TABLE IF NOT EXISTS withdraw_requests (
     address TEXT,
     network TEXT,
     status TEXT NOT NULL DEFAULT 'pending',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    admin_id BIGINT,
+    admin_note TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ,
+    paid_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS rebate_rules (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    mode TEXT NOT NULL,
+    min_active_referrals INTEGER NOT NULL DEFAULT 0,
+    min_turnover NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    rebate_rate NUMERIC(10, 6) NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS rebate_records (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    period_start TIMESTAMPTZ NOT NULL,
+    period_end TIMESTAMPTZ NOT NULL,
+    turnover NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    active_referrals INTEGER NOT NULL DEFAULT 0,
+    rebate_amount NUMERIC(18, 6) NOT NULL DEFAULT 0,
+    rule_id BIGINT REFERENCES rebate_rules(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    settled_at TIMESTAMPTZ
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_deposit_orders_trade_id ON deposit_orders (trade_id) WHERE trade_id IS NOT NULL;
@@ -228,3 +263,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_deposit_orders_block_tx ON deposit_orders 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_deposit_orders_chain_tx ON deposit_orders (chain_tx_id) WHERE chain_tx_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_ledger_ref ON wallet_ledger (ref_type, ref_id, type) WHERE ref_type IS NOT NULL AND ref_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_commission_source ON commission_records (user_id, source_type, source_ref_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rebate_records_period ON rebate_records (user_id, period_start, period_end, rule_id);

@@ -56,6 +56,16 @@ class Settings:
     wallet_currency: str
     withdraw_enabled: bool
     real_betting_enabled: bool
+    bet_settlement_admin_only: bool
+    min_bet_amount: Decimal
+    max_bet_amount: Decimal
+    min_withdraw_amount: Decimal
+    rebate_enabled: bool
+    rebate_mode: str
+    rebate_by_active_referrals_enabled: bool
+    rebate_by_turnover_enabled: bool
+    rebate_settlement_admin_only: bool
+    referral_turnover_commission_rate: Decimal
     log_level: str = "INFO"
 
 
@@ -130,6 +140,16 @@ def load_settings() -> Settings:
         wallet_currency=os.getenv("WALLET_CURRENCY", "USDT"),
         withdraw_enabled=_parse_bool(os.getenv("WITHDRAW_ENABLED", "false")),
         real_betting_enabled=_parse_bool(os.getenv("REAL_BETTING_ENABLED", "false")),
+        bet_settlement_admin_only=_parse_bool(os.getenv("BET_SETTLEMENT_ADMIN_ONLY", "true")),
+        min_bet_amount=Decimal(os.getenv("MIN_BET_AMOUNT", "1")),
+        max_bet_amount=Decimal(os.getenv("MAX_BET_AMOUNT", "100")),
+        min_withdraw_amount=Decimal(os.getenv("MIN_WITHDRAW_AMOUNT", "10")),
+        rebate_enabled=_parse_bool(os.getenv("REBATE_ENABLED", "true")),
+        rebate_mode=os.getenv("REBATE_MODE", "none"),
+        rebate_by_active_referrals_enabled=_parse_bool(os.getenv("REBATE_BY_ACTIVE_REFERRALS_ENABLED", "false")),
+        rebate_by_turnover_enabled=_parse_bool(os.getenv("REBATE_BY_TURNOVER_ENABLED", "false")),
+        rebate_settlement_admin_only=_parse_bool(os.getenv("REBATE_SETTLEMENT_ADMIN_ONLY", "true")),
+        referral_turnover_commission_rate=Decimal(os.getenv("REFERRAL_TURNOVER_COMMISSION_RATE", "0.00")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 

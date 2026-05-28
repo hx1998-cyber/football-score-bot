@@ -133,7 +133,7 @@ These futures odds are demo/manual data and are only for feature testing. The bo
 
 ## Safety and Compliance
 
-Current betting and prediction flows are simulation only. Recharge integration and wallet ledger are available for testing, but withdrawal, real betting settlement, automatic payout, and real-money wagering remain disabled.
+Default betting and prediction flows are simulation only. Recharge integration and wallet ledger are available for testing. Real betting and withdrawal requests are disabled by default and must be explicitly enabled in `.env`; payout, settlement, and withdrawal payment remain manual admin actions.
 
 ## GMPay Recharge, Wallet Ledger, and Referrals
 
@@ -159,11 +159,21 @@ GMPAY_ORDER_EXPIRE_MINUTES=30
 APP_PUBLIC_BASE_URL=
 ADMIN_USER_IDS=
 REFERRAL_DEPOSIT_COMMISSION_RATE=0.00
+REFERRAL_TURNOVER_COMMISSION_RATE=0.00
 REFERRAL_AGENT_ENABLED=true
 MAX_REFERRAL_LEVEL=1
 WALLET_CURRENCY=USDT
 WITHDRAW_ENABLED=false
 REAL_BETTING_ENABLED=false
+BET_SETTLEMENT_ADMIN_ONLY=true
+MIN_BET_AMOUNT=1
+MAX_BET_AMOUNT=100
+MIN_WITHDRAW_AMOUNT=10
+REBATE_ENABLED=true
+REBATE_MODE=none
+REBATE_BY_ACTIVE_REFERRALS_ENABLED=false
+REBATE_BY_TURNOVER_ENABLED=false
+REBATE_SETTLEMENT_ADMIN_ONLY=true
 ```
 
 `GMPAY_NOTIFY_URL` must point to the API service webhook:
@@ -215,6 +225,33 @@ Webhook behavior:
 - Wallet balances are changed only through `wallet_ledger` entries inside database transactions.
 - The bot never stores user private keys and does not implement automatic withdrawal.
 
+## Real Betting, Settlement, and Withdrawal Review
+
+`REAL_BETTING_ENABLED=false` is the default. In this mode bet confirmation keeps the simulated flow and does not deduct or freeze wallet balance.
+
+When `REAL_BETTING_ENABLED=true`, bet confirmation checks wallet balance, freezes the stake, writes `wallet_ledger.type=bet_freeze`, and creates a pending bet with `balance_frozen=true`. Bets are never auto-settled. Admins must manually settle each bet:
+
+- `/admin_bets`
+- `/admin_bet <bet_id>`
+- `/admin_settle_win <bet_id>`
+- `/admin_settle_loss <bet_id>`
+- `/admin_settle_void <bet_id>`
+- `/admin_cancel_bet <bet_id>`
+
+Winning settlement releases frozen stake and credits `potential_payout`. Loss settlement releases frozen stake without refund. Void and cancel settlement refund stake. Every admin settlement writes `admin_audit_logs`, and settled bets are idempotent.
+
+`WITHDRAW_ENABLED=false` is the default. When enabled, users submit `/withdraw <amount> <USDT-TRC20-address>`. The bot freezes the withdrawal amount and creates `withdraw_requests.status=pending`; it never sends funds automatically.
+
+Withdrawal admins use:
+
+- `/admin_withdrawals`
+- `/admin_withdraw <withdraw_id>`
+- `/admin_approve_withdraw <withdraw_id>`
+- `/admin_reject_withdraw <withdraw_id> <reason>`
+- `/admin_mark_withdraw_paid <withdraw_id> <txid>`
+
+Approve only records review approval. Mark paid is used after the admin manually transfers funds. Reject refunds the frozen amount. All operations write `admin_audit_logs`.
+
 Start services:
 
 ```bash
@@ -252,6 +289,24 @@ The first version creates only pending first-level deposit commission records:
 - `REFERRAL_DEPOSIT_COMMISSION_RATE=0.02` creates a pending `2 USDT` commission for a `100 USDT` paid deposit.
 - Commissions are not automatically credited to wallet balance. Admin settlement only marks the commission as settled.
 
+`/referrals` shows the invite link, direct referrals, active referrals, referral deposit, referral turnover, pending/settled commission, and pending rebate. `/start ref_CODE` binds the first parent only; self-invite is rejected and existing bindings are not overwritten.
+
+## Rebate Skeleton
+
+Rebate is enabled as a skeleton with no automatic wallet credit. Configure active rules directly in `rebate_rules`:
+
+- `mode=active_referrals` matches by effective direct referrals in the period.
+- `mode=turnover` matches by settled bet turnover in the period.
+
+Admin commands:
+
+- `/admin_rebate_rules`
+- `/admin_rebate_preview <user_id>`
+- `/admin_generate_rebates`
+- `/admin_settle_rebate <rebate_record_id>`
+
+Generation creates only `pending` `rebate_records`. Admin settlement writes `wallet_ledger.type=rebate` and credits wallet balance.
+
 ## Admin Commands
 
 Admin commands require `ADMIN_USER_IDS` and should be used in private chat to avoid exposing user data:
@@ -261,16 +316,39 @@ Admin commands require `ADMIN_USER_IDS` and should be used in private chat to av
 /admin_deposits
 /admin_deposit <order_id>
 /admin_adjust_balance <telegram_user_id> <amount> <reason>
+/admin_bets
+/admin_bet <bet_id>
+/admin_settle_win <bet_id>
+/admin_settle_loss <bet_id>
+/admin_settle_void <bet_id>
+/admin_cancel_bet <bet_id>
+/admin_withdrawals
+/admin_withdraw <withdraw_id>
+/admin_approve_withdraw <withdraw_id>
+/admin_reject_withdraw <withdraw_id> <reason>
+/admin_mark_withdraw_paid <withdraw_id> <txid>
 /admin_commissions
 /admin_settle_commission <commission_id>
+/admin_rebate_rules
+/admin_rebate_preview <user_id>
+/admin_generate_rebates
+/admin_settle_rebate <rebate_record_id>
 /admin_referrals <telegram_user_id>
 ```
 
 Manual balance adjustments write both `wallet_ledger` and `admin_audit_logs`.
 
+Accounting audit:
+
+```bash
+python -m football_score_bot.tools.accounting_audit
+```
+
+The audit checks negative balances, pending bet/withdraw frozen coverage, deposit and settlement ledger presence, and wallet balance consistency with latest ledger rows.
+
 ## Risk Notice
 
-Real-money operation requires legal compliance, risk control, payment security, key management, anti-fraud, accounting, and operational review before launch. Real betting settlement, automatic withdrawal, and multi-level agent settlement are not enabled in this version.
+Real-money operation requires legal compliance, risk control, payment security, key management, anti-fraud, accounting, and operational review before launch. Keep `REAL_BETTING_ENABLED=false` and `WITHDRAW_ENABLED=false` during dry runs. Before trial operation, define max exposure per fixture, settlement SOPs, withdrawal review SOPs, admin permission separation, incident rollback rules, and daily accounting reconciliation.
 
 Before any real-money launch, the product must complete legal compliance review, responsible-gaming controls, payment review, risk controls, settlement rules, audit logs, and jurisdiction-specific licensing checks.
 
