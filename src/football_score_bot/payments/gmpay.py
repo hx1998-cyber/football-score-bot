@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -21,6 +24,15 @@ class GMPayTransaction:
     network: str
     expires_at: datetime
     raw_json: dict[str, Any]
+
+
+class GMPayCreateOrderError(RuntimeError):
+    """Raised when GMPay rejects a create-order request."""
+
+    def __init__(self, message: str, *, status_code: int | None = None, response_body: str | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.response_body = response_body
 
 
 def sign_payload(params: dict[str, Any], secret_key: str, *, sign_type: str = "md5") -> str:
@@ -111,7 +123,19 @@ class GMPayClient:
             f"{self._base_url}{self._create_order_path}",
             json=payload,
         )
-        response.raise_for_status()
+        if response.status_code >= 400:
+            body_text = response.text
+            logger.warning(
+                "gmpay create failed status=%s body=%s payload=%s",
+                response.status_code,
+                body_text,
+                _redacted_payload(payload),
+            )
+            raise GMPayCreateOrderError(
+                f"GMPay create order failed with HTTP {response.status_code}",
+                status_code=response.status_code,
+                response_body=body_text,
+            )
         body = response.json()
         data = _response_data(body)
         if not data:
@@ -152,6 +176,13 @@ def _response_data(body: dict[str, Any]) -> dict[str, Any]:
     if any(key in body for key in ("payment_url", "pay_url", "trade_id")):
         return body
     return {}
+
+
+def _redacted_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: "***" if key in {"signature", "secret", "token"} else value
+        for key, value in payload.items()
+    }
 
 
 def _parse_expires_at(data: dict[str, Any]) -> datetime | None:

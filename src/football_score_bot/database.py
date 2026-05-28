@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from decimal import Decimal
+from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
@@ -35,8 +36,40 @@ class Database:
         )
         await self._ensure_betting_schema()
         await self._ensure_wallet_schema()
+        await self._ensure_role_schema()
         await self._ensure_futures_schema()
         await self.ensure_futures_seeded()
+
+    async def _ensure_role_schema(self) -> None:
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_roles (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL UNIQUE,
+                role TEXT NOT NULL DEFAULT 'user',
+                invited_by_user_id BIGINT,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_applications (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                total_deposit NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                total_turnover NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                valid_referrals INTEGER NOT NULL DEFAULT 0,
+                note TEXT,
+                reviewed_by BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reviewed_at TIMESTAMPTZ
+            )
+            """
+        )
 
     async def _ensure_wallet_schema(self) -> None:
         await self._pool.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT")
@@ -213,12 +246,23 @@ class Database:
                 min_active_referrals INTEGER NOT NULL DEFAULT 0,
                 min_turnover NUMERIC(18, 6) NOT NULL DEFAULT 0,
                 rebate_rate NUMERIC(10, 6) NOT NULL DEFAULT 0,
+                threshold NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                rate NUMERIC(10, 6) NOT NULL DEFAULT 0,
+                fixed_amount NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                role_scope TEXT NOT NULL DEFAULT 'user',
                 status TEXT NOT NULL DEFAULT 'active',
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
             """
         )
+        for statement in (
+            "ALTER TABLE rebate_rules ADD COLUMN IF NOT EXISTS threshold NUMERIC(18, 6) NOT NULL DEFAULT 0",
+            "ALTER TABLE rebate_rules ADD COLUMN IF NOT EXISTS rate NUMERIC(10, 6) NOT NULL DEFAULT 0",
+            "ALTER TABLE rebate_rules ADD COLUMN IF NOT EXISTS fixed_amount NUMERIC(18, 6) NOT NULL DEFAULT 0",
+            "ALTER TABLE rebate_rules ADD COLUMN IF NOT EXISTS role_scope TEXT NOT NULL DEFAULT 'user'",
+        ):
+            await self._pool.execute(statement)
         await self._pool.execute(
             """
             CREATE TABLE IF NOT EXISTS rebate_records (
@@ -238,6 +282,24 @@ class Database:
         )
         await self._pool.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_rebate_records_period ON rebate_records (user_id, period_start, period_end, rule_id)"
+        )
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS rebate_requests (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                requested_to_user_id BIGINT,
+                period_start TIMESTAMPTZ,
+                period_end TIMESTAMPTZ,
+                turnover NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                active_referrals INTEGER NOT NULL DEFAULT 0,
+                requested_amount NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                note TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reviewed_at TIMESTAMPTZ
+            )
+            """
         )
 
     async def _ensure_betting_schema(self) -> None:
@@ -277,11 +339,45 @@ class Database:
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS bettable_status_at_submit TEXT",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS amount_cents BIGINT NOT NULL DEFAULT 0",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS balance_frozen BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS bet_no TEXT",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS league_name TEXT",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS home_team TEXT",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS away_team TEXT",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS fixture_start_time TIMESTAMPTZ",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS payout NUMERIC(12, 2) NOT NULL DEFAULT 0",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS is_simulated BOOLEAN NOT NULL DEFAULT TRUE",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS result_score TEXT",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS settlement_source TEXT",
+            "ALTER TABLE bets ADD COLUMN IF NOT EXISTS settlement_note TEXT",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS settled_by_admin_id BIGINT",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS settled_at TIMESTAMPTZ",
             "ALTER TABLE bets ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()",
         ):
             await self._pool.execute(statement)
+        await self._pool.execute(
+            """
+            UPDATE bets
+            SET bet_no = 'B' || upper(to_hex(id::BIGINT))
+            WHERE bet_no IS NULL
+            """
+        )
+        await self._pool.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_bets_bet_no ON bets (bet_no)")
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS settlement_logs (
+                id BIGSERIAL PRIMARY KEY,
+                bet_id BIGINT NOT NULL,
+                fixture_id BIGINT,
+                previous_status TEXT,
+                new_status TEXT NOT NULL,
+                result_score TEXT,
+                payout NUMERIC(12, 2) NOT NULL DEFAULT 0,
+                source TEXT NOT NULL,
+                raw_fixture_json JSONB NOT NULL DEFAULT '{}'::jsonb,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
         await self._pool.execute(
             """
             CREATE TABLE IF NOT EXISTS admin_market_overrides (
@@ -643,54 +739,124 @@ class Database:
             )
         )
 
-    async def list_user_bets(self, telegram_user_id: int, status_group: str = "pending", limit: int = 20) -> list[dict]:
+    async def list_user_bets(
+        self,
+        telegram_user_id: int,
+        status_group: str = "pending",
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict]:
         if status_group == "settled":
             statuses = ("won", "lost", "cancelled", "void")
         else:
-            statuses = ("pending",)
+            statuses = ("pending", "manual_required")
         rows = await self._pool.fetch(
             """
             SELECT
-                id, fixture_id, fixture_label, market_key, market_title, selection,
+                id, bet_no, fixture_id, fixture_label, league_name, home_team, away_team,
+                fixture_start_time, market_key, market_title, selection,
                 odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout,
-                status, bettable_status_at_submit, created_at
+                payout::TEXT AS payout, status, result_score, settlement_source, settlement_note,
+                settled_at, bettable_status_at_submit, created_at
             FROM bets
             WHERE COALESCE(user_id, telegram_user_id) = $1 AND status = ANY($2::TEXT[])
             ORDER BY created_at DESC
-            LIMIT $3
+            LIMIT $3 OFFSET $4
             """,
             telegram_user_id,
             list(statuses),
             limit,
+            offset,
         )
         return [dict(row) for row in rows]
+
+    async def count_user_bets_by_group(self, telegram_user_id: int, status_group: str) -> int:
+        statuses = ("won", "lost", "cancelled", "void") if status_group == "settled" else ("pending", "manual_required")
+        return int(
+            await self._pool.fetchval(
+                """
+                SELECT COUNT(*) FROM bets
+                WHERE COALESCE(user_id, telegram_user_id) = $1 AND status = ANY($2::TEXT[])
+                """,
+                telegram_user_id,
+                list(statuses),
+            )
+            or 0
+        )
 
     async def count_user_pending_bets(self, telegram_user_id: int) -> int:
         return int(
             await self._pool.fetchval(
-                "SELECT COUNT(*) FROM bets WHERE COALESCE(user_id, telegram_user_id) = $1 AND status = 'pending'",
+                "SELECT COUNT(*) FROM bets WHERE COALESCE(user_id, telegram_user_id) = $1 AND status IN ('pending', 'manual_required')",
                 telegram_user_id,
             )
             or 0
         )
 
-    async def get_bet(self, bet_id: int) -> dict | None:
+    async def get_bet(self, bet_id: int | str) -> dict | None:
+        if isinstance(bet_id, str) and not bet_id.isdigit():
+            return await self.get_bet_by_no(bet_id)
         row = await self._pool.fetchrow(
             "SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout FROM bets WHERE id = $1",
-            bet_id,
+            int(bet_id),
+        )
+        return dict(row) if row else None
+
+    async def get_bet_by_no(self, bet_no: str) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout,
+                   payout::TEXT AS payout
+            FROM bets
+            WHERE upper(bet_no) = upper($1)
+            """,
+            bet_no,
+        )
+        return dict(row) if row else None
+
+    async def get_user_bet(self, telegram_user_id: int, bet_id_or_no: str) -> dict | None:
+        if bet_id_or_no.isdigit():
+            where = "id = $2"
+            value: int | str = int(bet_id_or_no)
+        else:
+            where = "upper(bet_no) = upper($2)"
+            value = bet_id_or_no
+        row = await self._pool.fetchrow(
+            f"""
+            SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout,
+                   payout::TEXT AS payout
+            FROM bets
+            WHERE COALESCE(user_id, telegram_user_id) = $1 AND {where}
+            """,
+            telegram_user_id,
+            value,
         )
         return dict(row) if row else None
 
     async def list_admin_bets(self, status: str = "pending", limit: int = 20) -> list[dict]:
+        statuses = ("pending", "manual_required") if status == "pending" else (status,)
         rows = await self._pool.fetch(
             """
             SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout
             FROM bets
-            WHERE status = $1
+            WHERE status = ANY($1::TEXT[])
             ORDER BY created_at DESC
             LIMIT $2
             """,
-            status,
+            list(statuses),
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_pending_bets_for_settlement(self, limit: int = 200) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout
+            FROM bets
+            WHERE status = 'pending'
+            ORDER BY fixture_start_time NULLS FIRST, created_at
+            LIMIT $1
+            """,
             limit,
         )
         return [dict(row) for row in rows]
@@ -789,17 +955,25 @@ class Database:
             updated_by,
         )
 
-    async def create_deposit_order(self, user_id: int, order_id: str, amount: Decimal, currency: str = "USDT") -> dict:
+    async def create_deposit_order(
+        self,
+        user_id: int,
+        order_id: str,
+        amount: Decimal,
+        currency: str = "USDT",
+        network: str | None = None,
+    ) -> dict:
         row = await self._pool.fetchrow(
             """
-            INSERT INTO deposit_orders (order_id, user_id, amount_requested, currency, status, updated_at)
-            VALUES ($1, $2, $3, $4, 'pending', NOW())
+            INSERT INTO deposit_orders (order_id, user_id, amount_requested, actual_amount, currency, network, status, updated_at)
+            VALUES ($1, $2, $3, $3, $4, $5, 'pending', NOW())
             RETURNING *
             """,
             order_id,
             user_id,
             amount,
             currency,
+            network,
         )
         return dict(row)
 
@@ -837,6 +1011,21 @@ class Database:
             payment_url,
             expires_at,
             network,
+            json.dumps(raw_response),
+        )
+        return dict(row) if row else None
+
+    async def fail_deposit_order(self, order_id: str, raw_response: dict[str, Any]) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE deposit_orders
+            SET status = 'failed',
+                raw_response_json = $2::jsonb,
+                updated_at = NOW()
+            WHERE order_id = $1 AND status = 'pending'
+            RETURNING *
+            """,
+            order_id,
             json.dumps(raw_response),
         )
         return dict(row) if row else None
@@ -1040,6 +1229,178 @@ class Database:
             target_id,
             json.dumps(payload),
         )
+
+    async def get_user_role_row(self, user_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            "SELECT * FROM user_roles WHERE user_id = $1 AND status = 'active'",
+            user_id,
+        )
+        return dict(row) if row else None
+
+    async def set_user_role(self, user_id: int, role: str, invited_by_user_id: int | None) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO user_roles (user_id, role, invited_by_user_id, status, updated_at)
+            VALUES ($1, $2, $3, 'active', NOW())
+            ON CONFLICT (user_id)
+            DO UPDATE SET role = EXCLUDED.role,
+                          invited_by_user_id = EXCLUDED.invited_by_user_id,
+                          status = 'active',
+                          updated_at = NOW()
+            RETURNING *
+            """,
+            user_id,
+            role,
+            invited_by_user_id,
+        )
+        return dict(row)
+
+    async def remove_user_role(self, user_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE user_roles
+            SET role = 'user', status = 'suspended', updated_at = NOW()
+            WHERE user_id = $1
+            RETURNING *
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
+    async def list_users(self, limit: int = 50) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT u.telegram_user_id, u.username, u.first_name, u.created_at,
+                   COALESCE(r.role, 'user') AS role,
+                   COALESCE(w.balance, 0)::TEXT AS balance,
+                   COALESCE(w.frozen_balance, 0)::TEXT AS frozen_balance
+            FROM users u
+            LEFT JOIN user_roles r ON r.user_id = u.telegram_user_id AND r.status = 'active'
+            LEFT JOIN wallets w ON w.user_id = u.telegram_user_id AND w.currency = 'USDT'
+            ORDER BY u.created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_user_admin_view(self, user_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT u.telegram_user_id, u.username, u.first_name, u.created_at,
+                   COALESCE(r.role, 'user') AS role,
+                   COALESCE(w.balance, 0)::TEXT AS balance,
+                   COALESCE(w.frozen_balance, 0)::TEXT AS frozen_balance,
+                   (SELECT COUNT(*) FROM referral_relations WHERE parent_user_id = $1) AS direct_referrals,
+                   (SELECT COUNT(*) FROM bets WHERE COALESCE(user_id, telegram_user_id) = $1) AS bets_count
+            FROM users u
+            LEFT JOIN user_roles r ON r.user_id = u.telegram_user_id AND r.status = 'active'
+            LEFT JOIN wallets w ON w.user_id = u.telegram_user_id AND w.currency = 'USDT'
+            WHERE u.telegram_user_id = $1
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
+    async def create_agent_application(
+        self,
+        user_id: int,
+        total_deposit: Decimal,
+        total_turnover: Decimal,
+        valid_referrals: int,
+        note: str | None = None,
+    ) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO agent_applications (
+                user_id, status, total_deposit, total_turnover, valid_referrals, note
+            )
+            VALUES ($1, 'pending', $2, $3, $4, $5)
+            RETURNING *
+            """,
+            user_id,
+            total_deposit,
+            total_turnover,
+            valid_referrals,
+            note,
+        )
+        return dict(row)
+
+    async def list_agent_applications(self, status: str = "pending", limit: int = 50) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT *
+            FROM agent_applications
+            WHERE status = $1
+            ORDER BY created_at DESC
+            LIMIT $2
+            """,
+            status,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def review_agent_application(
+        self,
+        application_id: int,
+        status: str,
+        reviewed_by: int,
+        note: str | None = None,
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE agent_applications
+            SET status = $2, reviewed_by = $3, note = COALESCE($4, note), reviewed_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING *
+            """,
+            application_id,
+            status,
+            reviewed_by,
+            note,
+        )
+        return dict(row) if row else None
+
+    async def create_rebate_request(
+        self,
+        user_id: int,
+        requested_to_user_id: int | None,
+        turnover: Decimal,
+        active_referrals: int,
+        requested_amount: Decimal = Decimal("0"),
+        note: str | None = None,
+    ) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO rebate_requests (
+                user_id, requested_to_user_id, period_start, period_end,
+                turnover, active_referrals, requested_amount, status, note
+            )
+            VALUES ($1, $2, NOW() - INTERVAL '7 days', NOW(), $3, $4, $5, 'pending', $6)
+            RETURNING *
+            """,
+            user_id,
+            requested_to_user_id,
+            turnover,
+            active_referrals,
+            requested_amount,
+            note,
+        )
+        return dict(row)
+
+    async def list_rebate_requests(self, user_id: int | None = None, limit: int = 50) -> list[dict]:
+        if user_id is None:
+            rows = await self._pool.fetch(
+                "SELECT * FROM rebate_requests ORDER BY created_at DESC LIMIT $1",
+                limit,
+            )
+        else:
+            rows = await self._pool.fetch(
+                "SELECT * FROM rebate_requests WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+                user_id,
+                limit,
+            )
+        return [dict(row) for row in rows]
 
     async def close(self) -> None:
         await self._pool.close()

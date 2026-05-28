@@ -43,6 +43,7 @@ class ScoreCacheWorker:
         self._bot_username = bot_username
         self._stop_event = asyncio.Event()
         self._last_broadcast_signature: str | None = None
+        self._last_failure_log: dict[str, datetime] = {}
 
     async def run(self) -> None:
         tasks = [
@@ -67,8 +68,8 @@ class ScoreCacheWorker:
         while not self._stop_event.is_set():
             try:
                 await callback()
-            except Exception:
-                logger.warning("score cache worker %s update failed", name, exc_info=True)
+            except Exception as exc:
+                self._log_api_failure(f"worker:{name}", "score cache worker %s update failed: %s", name, exc)
             try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=max(seconds, 1))
             except asyncio.TimeoutError:
@@ -89,7 +90,16 @@ class ScoreCacheWorker:
         total = 0
         for offset in range(max(1, self._settings.bettable_days_ahead)):
             fixture_date = date.today() + timedelta(days=offset)
-            fixtures = await self._api_client.get_fixtures_by_date(fixture_date)
+            try:
+                fixtures = await self._api_client.get_fixtures_by_date(fixture_date)
+            except Exception as exc:
+                self._log_api_failure(
+                    f"fixtures:{fixture_date.isoformat()}",
+                    "score cache fixtures update failed date=%s; keeping existing cache: %s",
+                    fixture_date.isoformat(),
+                    exc,
+                )
+                continue
             await self._cache.set_json(f"football:today_fixtures:{fixture_date.isoformat()}", fixtures, ttl_seconds=300)
             total += len(fixtures)
         logger.info("score cache fixtures updated: %s", total)
@@ -101,8 +111,17 @@ class ScoreCacheWorker:
             today = date.today()
             all_fixtures = await self._cache.get_json(f"football:today_fixtures:{today.isoformat()}", [])
             if not all_fixtures:
-                all_fixtures = await self._api_client.get_fixtures_by_date(today)
-                await self._cache.set_json(f"football:today_fixtures:{today.isoformat()}", all_fixtures)
+                try:
+                    all_fixtures = await self._api_client.get_fixtures_by_date(today)
+                    await self._cache.set_json(f"football:today_fixtures:{today.isoformat()}", all_fixtures)
+                except Exception as exc:
+                    self._log_api_failure(
+                        f"featured:{today.isoformat()}",
+                        "score cache featured fixtures fetch failed date=%s; keeping existing cache: %s",
+                        today.isoformat(),
+                        exc,
+                    )
+                    return
             featured = filter_featured_fixtures(all_fixtures, self._settings)
             await self._cache.set_json(f"football:featured_matches:{today.isoformat()}", featured)
             await self._cache.set_text(LAST_FEATURED_KEY, _now_hhmm())
@@ -125,13 +144,27 @@ class ScoreCacheWorker:
             try:
                 odds_items = await self._api_client.get_pre_match_odds_by_date(fixture_date)
                 await self._cache.set_json(f"football:odds_raw:{date_key}", odds_items, ttl_seconds=120)
-            except Exception:
-                logger.warning("score cache odds update failed date=%s", date_key, exc_info=True)
+            except Exception as exc:
+                self._log_api_failure(
+                    f"odds:{date_key}",
+                    "score cache odds update failed date=%s; keeping existing cache: %s",
+                    date_key,
+                    exc,
+                )
                 continue
             fixtures = await self._cache.get_json(f"football:today_fixtures:{date_key}", [])
             if not fixtures:
-                fixtures = await self._api_client.get_fixtures_by_date(fixture_date)
-                await self._cache.set_json(f"football:today_fixtures:{date_key}", fixtures, ttl_seconds=300)
+                try:
+                    fixtures = await self._api_client.get_fixtures_by_date(fixture_date)
+                    await self._cache.set_json(f"football:today_fixtures:{date_key}", fixtures, ttl_seconds=300)
+                except Exception as exc:
+                    self._log_api_failure(
+                        f"odds-fixtures:{date_key}",
+                        "score cache odds fixtures fetch failed date=%s; keeping existing cache: %s",
+                        date_key,
+                        exc,
+                    )
+                    continue
             odds_first_matches, odds_by_fixture = build_odds_first_matches(odds_items, fixtures)
             await self._cache.set_json(f"football:odds_first_matches:{date_key}", odds_first_matches, ttl_seconds=120)
             await self._cache.set_json(f"football:featured_odds:{date_key}", odds_by_fixture, ttl_seconds=120)
@@ -154,7 +187,7 @@ class ScoreCacheWorker:
         featured_live = await self._cache.get_json(f"football:featured_live:{today.isoformat()}", [])
         if not featured_live:
             return
-        event_lines = await self._group_event_lines(featured_live[:10])
+        event_lines = await self._group_event_lines(featured_live[:5])
         if not event_lines:
             return
         signature = "\n".join(event_lines)
@@ -199,10 +232,15 @@ class ScoreCacheWorker:
             if events is None:
                 try:
                     events = await self._api_client.get_fixture_events(int(fixture_id))
-                    await self._cache.set_json(key, events, ttl_seconds=60)
+                    await self._cache.set_json(key, events, ttl_seconds=300)
                     logger.info("fixture_events fixture_id=%s count=%s", fixture_id, len(events))
-                except Exception:
-                    logger.warning("fixture_events fixture_id=%s failed", fixture_id, exc_info=True)
+                except Exception as exc:
+                    self._log_api_failure(
+                        f"fixture-events:{fixture_id}",
+                        "fixture_events fixture_id=%s failed; keeping existing cache: %s",
+                        fixture_id,
+                        exc,
+                    )
                     continue
             teams = fixture.get("teams", {})
             label = f"{teams.get('home', {}).get('name', '主队')} vs {teams.get('away', {}).get('name', '客队')}"
@@ -217,6 +255,14 @@ class ScoreCacheWorker:
                 icon = "⚽" if event_type == "Goal" else "🟥"
                 lines.append(f"{icon} {minute}' {player} {team}｜{label}")
         return lines
+
+    def _log_api_failure(self, key: str, message: str, *args: Any) -> None:
+        now = datetime.now()
+        last = self._last_failure_log.get(key)
+        if last and (now - last).total_seconds() < 300:
+            return
+        self._last_failure_log[key] = now
+        logger.warning(message, *args)
 
 
 def _now_hhmm() -> str:

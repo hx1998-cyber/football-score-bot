@@ -13,6 +13,7 @@ from football_score_bot.config import load_settings
 from football_score_bot.database import Database
 from football_score_bot.handlers import build_router
 from football_score_bot.workers.score_cache_worker import ScoreCacheWorker
+from football_score_bot.workers.settlement_worker import SettlementWorker
 
 
 async def main() -> None:
@@ -43,13 +44,23 @@ async def main() -> None:
         bot_username=bot_info.username,
     )
     worker_task = asyncio.create_task(worker.run())
+    settlement_worker = SettlementWorker(
+        api_client,
+        database,
+        settings,
+        bot=bot,
+        bot_username=bot_info.username,
+    )
+    settlement_worker_task = asyncio.create_task(settlement_worker.run())
 
     try:
         await setup_bot_commands(bot)
         await dispatcher.start_polling(bot)
     finally:
         worker.stop()
+        settlement_worker.stop()
         await worker_task
+        await settlement_worker_task
         await api_client.close()
         await database.close()
         await redis.aclose()

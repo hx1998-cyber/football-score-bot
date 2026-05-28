@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+import random
+import string
+import time
 from decimal import Decimal
 from typing import Any
 
@@ -330,31 +333,56 @@ class WalletService:
         potential_payout: Decimal,
         bettable_status_at_submit: str,
         real_betting_enabled: bool,
+        league_name: str | None = None,
+        home_team: str | None = None,
+        away_team: str | None = None,
+        fixture_start_time: Any | None = None,
     ) -> int | None:
         async with self._database.pool.acquire() as conn:
             async with conn.transaction():
-                bet_id = await conn.fetchval(
-                    """
-                    INSERT INTO bets (
-                        telegram_user_id, user_id, fixture_id, fixture_label, market_key, market_title,
-                        selection, odds, stake, potential_payout, status, bettable_status_at_submit,
-                        balance_frozen, updated_at
+                bet_id = None
+                bet_no = ""
+                for _ in range(8):
+                    bet_no = _new_bet_no()
+                    bet_id = await conn.fetchval(
+                        """
+                        INSERT INTO bets (
+                            bet_no, telegram_user_id, user_id, fixture_id, fixture_label, league_name,
+                            home_team, away_team, fixture_start_time, market_key, market_title,
+                            selection, odds, stake, potential_payout, payout, status,
+                            bettable_status_at_submit, balance_frozen, is_simulated, updated_at
+                        )
+                        VALUES (
+                            $1, $2, $2, $3, $4, $5,
+                            $6, $7, $8, $9, $10,
+                            $11, $12, $13, $14, 0, 'pending',
+                            $15, $16, $17, NOW()
+                        )
+                        ON CONFLICT (bet_no) DO NOTHING
+                        RETURNING id
+                        """,
+                        bet_no,
+                        user_id,
+                        fixture_id,
+                        fixture_label,
+                        league_name,
+                        home_team,
+                        away_team,
+                        fixture_start_time,
+                        market_key,
+                        market_title,
+                        selection,
+                        odds,
+                        stake,
+                        potential_payout,
+                        bettable_status_at_submit,
+                        real_betting_enabled,
+                        not real_betting_enabled,
                     )
-                    VALUES ($1, $1, $2, $3, $4, $5, $6, $7, $8, $9, 'pending', $10, $11, NOW())
-                    RETURNING id
-                    """,
-                    user_id,
-                    fixture_id,
-                    fixture_label,
-                    market_key,
-                    market_title,
-                    selection,
-                    odds,
-                    stake,
-                    potential_payout,
-                    bettable_status_at_submit,
-                    real_betting_enabled,
-                )
+                    if bet_id:
+                        break
+                if not bet_id:
+                    raise RuntimeError("failed to allocate bet number")
                 if not real_betting_enabled:
                     return int(bet_id)
 
@@ -362,7 +390,10 @@ class WalletService:
                 balance_before = Decimal(str(wallet["balance"]))
                 frozen_before = Decimal(str(wallet["frozen_balance"]))
                 if balance_before < stake:
-                    await conn.execute("DELETE FROM bets WHERE id = $1", bet_id)
+                    await conn.execute(
+                        "UPDATE bets SET status = 'cancelled', settlement_note = 'insufficient balance', updated_at = NOW() WHERE id = $1",
+                        bet_id,
+                    )
                     return None
                 balance_after = balance_before - stake
                 frozen_after = frozen_before + stake
@@ -396,13 +427,86 @@ class WalletService:
                 )
                 return int(bet_id)
 
-    async def settle_bet(self, bet_id: int, admin_user_id: int, outcome: str) -> dict | None:
+    async def cancel_bet(self, bet_id: int, user_id: int, *, real_betting_enabled: bool) -> dict | None:
+        async with self._database.pool.acquire() as conn:
+            async with conn.transaction():
+                bet = await conn.fetchrow(
+                    "SELECT * FROM bets WHERE id = $1 AND COALESCE(user_id, telegram_user_id) = $2 FOR UPDATE",
+                    bet_id,
+                    user_id,
+                )
+                if not bet or bet["status"] != "pending":
+                    return None
+                stake = Decimal(str(bet["stake"] or 0))
+                if real_betting_enabled and bool(bet["balance_frozen"]):
+                    wallet = await self._locked_wallet(conn, user_id)
+                    balance_before = Decimal(str(wallet["balance"]))
+                    frozen_before = Decimal(str(wallet["frozen_balance"]))
+                    if frozen_before < stake:
+                        raise ValueError("insufficient frozen balance")
+                    balance_after = balance_before + stake
+                    frozen_after = frozen_before - stake
+                    await conn.execute(
+                        """
+                        UPDATE wallets
+                        SET balance = $3, frozen_balance = $4, updated_at = NOW()
+                        WHERE user_id = $1 AND currency = $2
+                        """,
+                        user_id,
+                        self._currency,
+                        balance_after,
+                        frozen_after,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO wallet_ledger (
+                            user_id, currency, type, amount, balance_before, balance_after,
+                            frozen_before, frozen_after, ref_type, ref_id, description
+                        )
+                        VALUES ($1, $2, 'bet_cancel_refund', $3, $4, $5, $6, $7, 'bet', $8, 'Bet cancelled before lock')
+                        ON CONFLICT DO NOTHING
+                        """,
+                        user_id,
+                        self._currency,
+                        stake,
+                        balance_before,
+                        balance_after,
+                        frozen_before,
+                        frozen_after,
+                        str(bet_id),
+                    )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE bets
+                    SET status = 'cancelled',
+                        payout = 0,
+                        settlement_source = 'user',
+                        settlement_note = 'cancelled by user',
+                        settled_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1 AND status = 'pending'
+                    RETURNING *
+                    """,
+                    bet_id,
+                )
+                return dict(row) if row else None
+
+    async def settle_bet(
+        self,
+        bet_id: int,
+        admin_user_id: int,
+        outcome: str,
+        *,
+        source: str = "admin",
+        result_score: str | None = None,
+        note: str | None = None,
+    ) -> dict | None:
         if outcome not in {"won", "lost", "void", "cancelled"}:
             raise ValueError("invalid bet outcome")
         async with self._database.pool.acquire() as conn:
             async with conn.transaction():
                 bet = await conn.fetchrow("SELECT * FROM bets WHERE id = $1 FOR UPDATE", bet_id)
-                if not bet or bet["status"] != "pending":
+                if not bet or bet["status"] not in {"pending", "manual_required"}:
                     return None
                 user_id = int(bet["user_id"] or bet["telegram_user_id"])
                 stake = Decimal(str(bet["stake"] or 0))
@@ -421,7 +525,7 @@ class WalletService:
                     ledger_type = "bet_loss"
                 else:
                     balance_delta = stake if bet["balance_frozen"] else Decimal("0")
-                    ledger_type = "bet_void_refund"
+                    ledger_type = "bet_cancel_refund" if outcome == "cancelled" else "bet_void_refund"
                 balance_after = balance_before + balance_delta
                 await conn.execute(
                     """
@@ -457,12 +561,38 @@ class WalletService:
                 await conn.execute(
                     """
                     UPDATE bets
-                    SET status = $2, settled_by_admin_id = $3, settled_at = NOW(), updated_at = NOW()
+                    SET status = $2,
+                        payout = $4,
+                        result_score = COALESCE($5, result_score),
+                        settlement_source = $6,
+                        settlement_note = $7,
+                        settled_by_admin_id = $3,
+                        settled_at = NOW(),
+                        updated_at = NOW()
                     WHERE id = $1
                     """,
                     bet_id,
                     outcome,
                     admin_user_id,
+                    amount,
+                    result_score,
+                    source,
+                    note or f"{source} settlement: {outcome}",
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO settlement_logs (
+                        bet_id, fixture_id, previous_status, new_status, result_score, payout, source
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    bet_id,
+                    bet["fixture_id"],
+                    bet["status"],
+                    outcome,
+                    result_score,
+                    amount,
+                    source,
                 )
                 return {"bet_id": bet_id, "user_id": user_id, "status": outcome, "balance_after": balance_after}
 
@@ -794,3 +924,14 @@ class WalletService:
 def _optional_text(value: Any) -> str | None:
     text = str(value).strip() if value is not None else ""
     return text or None
+
+
+def _new_bet_no() -> str:
+    alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    value = int(time.time() * 1000)
+    chars: list[str] = []
+    while value:
+        value, rem = divmod(value, 36)
+        chars.append(alphabet[rem])
+    suffix = "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+    return "B" + "".join(reversed(chars))[-7:] + suffix

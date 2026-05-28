@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import logging
-import uuid
+import json
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
 from datetime import date, datetime, timedelta
 from typing import Any
 
+import asyncpg
 from aiogram import F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -42,10 +43,16 @@ from football_score_bot.formatters import (
 )
 from football_score_bot.i18n import LANGUAGE_LABELS, SUPPORTED_LANGUAGES, normalize_language, t
 from football_score_bot.localization.sports_names import translate_league_name, translate_team_name
-from football_score_bot.payments.gmpay import GMPayClient
+from football_score_bot.payments.gmpay import GMPayClient, GMPayCreateOrderError
+from football_score_bot.payments.order_ids import generate_gmpay_order_id
 from football_score_bot.services.wallet_service import WalletService
+from football_score_bot.services.permission_service import PermissionService
+from football_score_bot.services.settlement_service import SettlementService
 from football_score_bot.keyboards import (
+    bet_amount_keyboard,
+    bet_created_keyboard,
     bet_confirm_keyboard,
+    bet_detail_keyboard,
     featured_matches_keyboard,
     bet_placeholder_keyboard,
     futures_back_keyboard,
@@ -66,6 +73,7 @@ from football_score_bot.time_utils import now_hhmm
 
 
 logger = logging.getLogger(__name__)
+_api_failure_log_times: dict[str, datetime] = {}
 
 
 def build_router(
@@ -80,6 +88,12 @@ def build_router(
         currency=settings.wallet_currency,
         referral_deposit_commission_rate=settings.referral_deposit_commission_rate,
         referral_agent_enabled=settings.referral_agent_enabled,
+    )
+    permission_service = PermissionService(database, settings)
+    settlement_service = SettlementService(
+        database,
+        wallet_service,
+        real_betting_enabled=settings.real_betting_enabled,
     )
     gmpay_client = GMPayClient(
         pid=settings.gmpay_pid,
@@ -417,7 +431,13 @@ def build_router(
             await callback.message.answer(f"当前不可投注：{reason_label(bet_status.reason)}")
             return
         await callback.message.answer(
-            format_bet_confirm(fixture, getattr(market, "title", market_key), _outcome_button_label(outcome), outcome.odds),
+            format_bet_confirm(
+                fixture,
+                getattr(market, "title", market_key),
+                _outcome_button_label(outcome),
+                outcome.odds,
+                stake=str(settings.default_bet_amount),
+            ),
             reply_markup=bet_confirm_keyboard(fixture_id, market_key, page, outcome_index),
         )
 
@@ -451,7 +471,12 @@ def build_router(
         if not bet_status.is_bettable:
             await callback.message.answer(f"当前不可投注：{reason_label(bet_status.reason)}")
             return
-        stake_decimal = Decimal("10")
+        raw_stake = parts[5] if len(parts) > 5 else str(settings.default_bet_amount)
+        try:
+            stake_decimal = _validated_amount(raw_stake, settings.min_bet_amount, settings.max_bet_amount)
+        except ValueError as exc:
+            await callback.message.answer(str(exc))
+            return
         if stake_decimal < settings.min_bet_amount or stake_decimal > settings.max_bet_amount:
             await callback.message.answer(
                 f"下注金额超出限制：{_money(settings.min_bet_amount)}-{_money(settings.max_bet_amount)} {settings.wallet_currency}"
@@ -477,10 +502,20 @@ def build_router(
             potential_payout=potential_payout_decimal,
             bettable_status_at_submit=bet_status.reason,
             real_betting_enabled=settings.real_betting_enabled,
+            league_name=(fixture.get("league") or {}).get("name"),
+            home_team=(fixture.get("teams") or {}).get("home", {}).get("name"),
+            away_team=(fixture.get("teams") or {}).get("away", {}).get("name"),
+            fixture_start_time=_fixture_start_time(fixture),
         )
         if bet_id is None:
             await callback.message.answer("余额不足，无法提交真实下注。")
             return
+        bet = await database.get_bet(bet_id)
+        await callback.message.answer(
+            _format_bet_created(bet or {"id": bet_id}, settings.wallet_currency),
+            reply_markup=bet_created_keyboard(str((bet or {}).get("bet_no") or bet_id), fixture_id),
+        )
+        return
         if settings.real_betting_enabled:
             await callback.message.answer(f"下注成功，等待管理员结算。\n注单号：{bet_id}", reply_markup=my_bets_keyboard())
         else:
@@ -490,6 +525,37 @@ def build_router(
     async def bet_amount_placeholder(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
         await callback.message.answer("第一版固定模拟金额为 $10，暂不修改金额。")
+
+    @router.callback_query(F.data.startswith("bet_amount:"))
+    async def bet_amount(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        parts = callback.data.split(":")
+        await callback.message.answer(
+            "请选择投注金额：",
+            reply_markup=bet_amount_keyboard(int(parts[1]), parts[2], int(parts[3]), int(parts[4])),
+        )
+
+    @router.callback_query(F.data.startswith("bet_amount_set:"))
+    async def bet_amount_set(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        parts = callback.data.split(":")
+        fixture_id = int(parts[1])
+        market_key = parts[2]
+        page = int(parts[3])
+        outcome_index = int(parts[4])
+        amount = parts[5]
+        if amount == "custom":
+            await callback.message.answer("自定义金额暂未开放，请先选择固定金额。")
+            return
+        await callback.message.answer(
+            f"金额已改为 {amount} USDT，请确认下注。",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="确认下注", callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:{amount}")],
+                    [InlineKeyboardButton(text="返回赔率", callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page}")],
+                ]
+            ),
+        )
 
     @router.callback_query(F.data == "bet_placeholder")
     async def bet_placeholder(callback: CallbackQuery) -> None:
@@ -662,9 +728,10 @@ def build_router(
         if not callback.from_user:
             await callback.message.answer("请先打开机器人后再查看注单。", reply_markup=my_bets_keyboard())
             return
-        status_group = callback.data.split(":", 1)[1]
-        bets_list = await database.list_user_bets(callback.from_user.id, status_group=status_group)
-        await callback.message.answer(format_my_bets(bets_list), reply_markup=my_bets_keyboard())
+        parts = callback.data.split(":")
+        status_group = parts[1] if len(parts) > 1 else "pending"
+        page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        await _send_bets_page(callback.message, callback.from_user.id, status_group, page, database)
 
     @router.message(F.text.in_(_translated_texts("betting_center") | _translated_texts("my_bets") | {"📊 我的注单"}))
     @router.message(Command("bets"))
@@ -673,8 +740,70 @@ def build_router(
         if not message.from_user:
             await message.answer("请先打开机器人后再查看注单。", reply_markup=my_bets_keyboard())
             return
-        bets_list = await database.list_user_bets(message.from_user.id, status_group="pending")
-        await message.answer(format_my_bets(bets_list), reply_markup=my_bets_keyboard())
+        await _send_bets_page(message, message.from_user.id, "pending", 0, database)
+
+    @router.callback_query(F.data.startswith("bet_detail:"))
+    async def bet_detail(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        parts = callback.data.split(":")
+        bet_key = parts[1]
+        status_group = parts[2] if len(parts) > 2 else "pending"
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 0
+        bet = await database.get_user_bet(callback.from_user.id, bet_key)
+        if not bet:
+            await callback.message.answer("注单不存在。")
+            return
+        await callback.message.answer(
+            _format_bet_detail(bet, settings.wallet_currency),
+            reply_markup=bet_detail_keyboard(str(bet.get("bet_no") or bet.get("id")), str(bet.get("status")), status_group, page),
+        )
+
+    @router.callback_query(F.data.startswith("bet_cancel:"))
+    async def bet_cancel(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        bet_key = callback.data.split(":", 1)[1]
+        bet = await database.get_user_bet(callback.from_user.id, bet_key)
+        if not bet or bet.get("status") != "pending":
+            await callback.message.answer("本单已进入结算阶段，无法删除。")
+            return
+        start_time = bet.get("fixture_start_time")
+        if isinstance(start_time, datetime) and datetime.now(start_time.tzinfo) >= start_time - timedelta(minutes=settings.bet_cancel_before_start_minutes):
+            await callback.message.answer("本单已进入结算阶段，无法删除。")
+            return
+        row = await wallet_service.cancel_bet(int(bet["id"]), callback.from_user.id, real_betting_enabled=settings.real_betting_enabled)
+        await callback.message.answer(
+            f"注单已取消\n\n注单号：{bet.get('bet_no') or bet.get('id')}\n状态：已取消" if row else "本单已进入结算阶段，无法删除。"
+        )
+
+    @router.callback_query(F.data.startswith("bet_settle:"))
+    async def bet_settle(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        bet_key = callback.data.split(":", 1)[1]
+        bet = await database.get_user_bet(callback.from_user.id, bet_key)
+        if not bet or bet.get("status") != "pending":
+            await callback.message.answer("该注单无需结算或不存在。")
+            return
+        try:
+            fixture = await api_client.get_fixture_detail(int(bet["fixture_id"]))
+        except Exception:
+            await callback.message.answer("赛果暂未确认，请稍后再试。")
+            return
+        result = await settlement_service.settle_bet_from_fixture(bet, fixture, source="auto")
+        if result.get("settled"):
+            fresh = await database.get_user_bet(callback.from_user.id, bet_key)
+            await callback.message.answer(_format_bet_detail(fresh or bet, settings.wallet_currency))
+        elif result.get("reason") == "not_final":
+            await callback.message.answer("比赛尚未结束，系统将在赛果确认后自动结算。")
+        elif result.get("reason") == "unsupported_market":
+            await callback.message.answer("该玩法需要人工结算，系统会尽快处理。")
+        else:
+            await callback.message.answer("赛果暂未确认，请稍后再试。")
 
     @router.message(F.text.in_(_translated_texts("referrals")))
     @router.message(Command("referrals"))
@@ -1083,6 +1212,89 @@ def build_router(
             + _format_referral_children(rows)
         )
 
+    @router.message(Command("admin_invite_admin"))
+    async def admin_invite_admin(message: Message, command: CommandObject) -> None:
+        await _admin_set_role_command(message, command, "admin")
+
+    @router.message(Command("admin_invite_agent"))
+    async def admin_invite_agent(message: Message, command: CommandObject) -> None:
+        await _admin_set_role_command(message, command, "agent")
+
+    @router.message(Command("admin_remove_role"))
+    async def admin_remove_role(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.can_invite_admin(message.from_user.id):
+            await message.answer("只有超级管理员可以移除角色。")
+            return
+        target_user_id = _first_int_arg(command)
+        if target_user_id is None:
+            await message.answer("用法：/admin_remove_role <telegram_user_id>")
+            return
+        row = await database.remove_user_role(target_user_id)
+        await database.add_admin_audit_log(message.from_user.id, "admin_remove_role", "user_role", str(target_user_id), {"removed": bool(row)})
+        await message.answer("角色已移除。" if row else "用户没有可移除角色。")
+
+    @router.message(Command("admin_users"))
+    async def admin_users(message: Message) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        await message.answer(_format_admin_users(await database.list_users(50)))
+
+    @router.message(Command("admin_user"))
+    async def admin_user(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        user_id = _first_int_arg(command)
+        if user_id is None:
+            await message.answer("用法：/admin_user <telegram_user_id>")
+            return
+        if not await permission_service.can_manage_user(message.from_user.id, user_id):
+            await message.answer("你只能查看自己的下级用户。")
+            return
+        await message.answer(_format_admin_user(await database.get_user_admin_view(user_id)))
+
+    @router.message(Command("admin_agent_applications"))
+    async def admin_agent_applications(message: Message) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可以审核代理申请。")
+            return
+        await message.answer(_format_agent_applications(await database.list_agent_applications()))
+
+    @router.message(Command("admin_approve_agent"))
+    async def admin_approve_agent(message: Message, command: CommandObject) -> None:
+        await _review_agent_application_command(message, command, "approved")
+
+    @router.message(Command("admin_reject_agent"))
+    async def admin_reject_agent(message: Message, command: CommandObject) -> None:
+        await _review_agent_application_command(message, command, "rejected")
+
+    async def _admin_set_role_command(message: Message, command: CommandObject, role: str) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.can_invite_admin(message.from_user.id):
+            await message.answer("只有超级管理员可以邀请管理员/代理。")
+            return
+        target_user_id = _first_int_arg(command)
+        if target_user_id is None:
+            await message.answer(f"用法：/admin_invite_{role} <telegram_user_id>")
+            return
+        row = await database.set_user_role(target_user_id, role, message.from_user.id)
+        await database.add_admin_audit_log(message.from_user.id, f"admin_invite_{role}", "user_role", str(target_user_id), {"role": role})
+        await message.answer(f"已设置 {target_user_id} 为 {role}。id={row['id']}")
+
+    async def _review_agent_application_command(message: Message, command: CommandObject, status: str) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可以审核代理申请。")
+            return
+        application_id = _first_int_arg(command)
+        if application_id is None:
+            await message.answer(f"用法：/admin_{status}_agent <application_id>")
+            return
+        row = await database.review_agent_application(application_id, status, message.from_user.id)
+        if row and status == "approved":
+            await database.set_user_role(int(row["user_id"]), "agent", message.from_user.id)
+        await database.add_admin_audit_log(message.from_user.id, f"admin_{status}_agent", "agent_application", str(application_id), {"reviewed": bool(row)})
+        await message.answer("代理申请已处理。" if row else "申请不存在或已处理。")
+
     return router
 
 
@@ -1231,9 +1443,18 @@ async def _get_fixtures_by_date(
     fixtures = [] if force_refresh else await cache.get_json(key, [])
     if fixtures:
         return fixtures
-    fixtures = await api_client.get_fixtures_by_date(fixture_date)
-    await cache.set_json(key, fixtures, ttl_seconds=300)
-    return fixtures
+    try:
+        fixtures = await api_client.get_fixtures_by_date(fixture_date)
+        await cache.set_json(key, fixtures, ttl_seconds=300)
+        return fixtures
+    except Exception as exc:
+        _log_api_failure(
+            f"fixtures:{fixture_date.isoformat()}",
+            "fixtures fetch failed date=%s; keeping existing cache: %s",
+            fixture_date.isoformat(),
+            exc,
+        )
+        return await cache.get_json(key, [])
 
 
 async def _get_odds_raw_by_date(
@@ -1251,7 +1472,7 @@ async def _get_odds_raw_by_date(
         odds_items = await api_client.get_pre_match_odds_by_date(fixture_date)
         await cache.set_json(key, odds_items, ttl_seconds=120)
         return odds_items
-    except Exception:
+    except Exception as exc:
         return await cache.get_json(key, [])
 
 
@@ -1259,10 +1480,14 @@ async def _get_live(cache: RedisCache, api_client: ApiFootballClient) -> list[di
     fixtures = await cache.get_json("football:live_fixtures", [])
     if fixtures:
         return fixtures
-    fixtures = await api_client.get_live_fixtures()
-    await cache.set_json("football:live_fixtures", fixtures)
-    await cache.set_text("football:last_update:live", _now_hhmm())
-    return fixtures
+    try:
+        fixtures = await api_client.get_live_fixtures()
+        await cache.set_json("football:live_fixtures", fixtures)
+        await cache.set_text("football:last_update:live", _now_hhmm())
+        return fixtures
+    except Exception as exc:
+        _log_api_failure("live-fixtures", "live fixtures fetch failed; keeping existing cache: %s", exc)
+        return await cache.get_json("football:live_fixtures", [])
 
 
 async def _get_featured_live(
@@ -1292,8 +1517,9 @@ async def _get_featured_today(
         return fixtures
     all_fixtures = await cache.get_json(f"football:today_fixtures:{today}", [])
     if not all_fixtures:
-        all_fixtures = await api_client.get_fixtures_by_date(date.today())
-        await cache.set_json(f"football:today_fixtures:{today}", all_fixtures)
+        all_fixtures = await _get_fixtures_by_date(cache, api_client, date.today())
+        if not all_fixtures:
+            return []
     fixtures = filter_featured_fixtures(all_fixtures, settings)
     await cache.set_json(key, fixtures)
     await cache.set_text("football:last_update:featured", _now_hhmm())
@@ -1378,7 +1604,7 @@ async def _get_fixture_odds(
         await cache.set_json(key, normalized.to_dict(), ttl_seconds=120)
         await cache.set_text(f"football:odds:last_update:{fixture_id}", _now_hhmm(), ttl_seconds=120)
         return normalized
-    except Exception:
+    except Exception as exc:
         cached = await cache.get_json(key)
         return normalized_from_dict(cached) if cached else None
 
@@ -1494,14 +1720,19 @@ async def _get_fixture_events_cached(
         return cached, False
     try:
         events = await api_client.get_fixture_events(fixture_id)
-        await cache.set_json(key, events, ttl_seconds=60)
+        await cache.set_json(key, events, ttl_seconds=300)
         logger.info("fixture_events fixture_id=%s count=%s", fixture_id, len(events))
         return events, False
-    except Exception:
+    except Exception as exc:
         cached = await cache.get_json(key, None)
         if cached is not None:
             return cached, False
-        logger.warning("fixture_events fixture_id=%s failed", fixture_id, exc_info=True)
+        _log_api_failure(
+            f"fixture-events:{fixture_id}",
+            "fixture_events fixture_id=%s failed; keeping existing cache: %s",
+            fixture_id,
+            exc,
+        )
         return [], True
 
 
@@ -1516,7 +1747,14 @@ async def _effective_settings(cache: RedisCache, settings: Settings) -> Settings
 
 
 def _is_admin(telegram_user_id: int | None, settings: Settings) -> bool:
-    return bool(telegram_user_id and telegram_user_id in settings.admin_user_ids)
+    return bool(
+        telegram_user_id
+        and (
+            telegram_user_id in settings.super_admin_user_ids
+            or telegram_user_id in settings.admin_user_ids
+            or telegram_user_id in settings.agent_user_ids
+        )
+    )
 
 
 def _admin_private_allowed(message: Message, settings: Settings) -> bool:
@@ -1575,8 +1813,33 @@ async def _create_recharge_order(
     if amount < settings.gmpay_min_recharge_usdt:
         await message.answer(f"最低充值金额：{_money(settings.gmpay_min_recharge_usdt)} {settings.wallet_currency}")
         return
-    order_id = f"dep_{user_id}_{int(datetime.now().timestamp())}_{uuid.uuid4().hex[:8]}"
-    order = await database.create_deposit_order(user_id, order_id, amount, settings.wallet_currency)
+    if amount > settings.max_recharge_amount:
+        await message.answer(f"充值金额不能超过：{_money(settings.max_recharge_amount)} {settings.wallet_currency}")
+        return
+    for _ in range(5):
+        order_id = generate_gmpay_order_id()
+        try:
+            order = await database.create_deposit_order(
+                user_id,
+                order_id,
+                amount,
+                settings.wallet_currency,
+                settings.gmpay_default_network,
+            )
+            break
+        except asyncpg.UniqueViolationError:
+            continue
+    else:
+        logger.warning("failed to allocate unique gmpay order_id user_id=%s", user_id)
+        await message.answer("充值订单创建失败，请稍后再试。")
+        return
+    logger.info(
+        "creating gmpay deposit order order_id=%s order_id_length=%s amount=%s network=%s",
+        order_id,
+        len(order_id),
+        amount,
+        settings.gmpay_default_network,
+    )
     try:
         transaction = await gmpay_client.create_transaction(
             order_id=order_id,
@@ -1585,7 +1848,9 @@ async def _create_recharge_order(
             notify_url=settings.gmpay_notify_url,
             redirect_url=settings.gmpay_redirect_url,
         )
-    except Exception:
+    except Exception as exc:
+        raw_response = _gmpay_create_failure_response(exc)
+        await database.fail_deposit_order(order_id, raw_response)
         logger.warning("gmpay create transaction failed order_id=%s", order_id, exc_info=True)
         await message.answer("充值订单创建失败，请稍后再试。")
         return
@@ -1600,6 +1865,21 @@ async def _create_recharge_order(
         raw_response=transaction.raw_json,
     ) or order
     await message.answer(_format_deposit_order(order, settings.wallet_currency), reply_markup=_deposit_order_keyboard(order))
+
+
+def _gmpay_create_failure_response(exc: Exception) -> dict[str, Any]:
+    response: dict[str, Any] = {
+        "error": str(exc),
+        "type": exc.__class__.__name__,
+    }
+    if isinstance(exc, GMPayCreateOrderError):
+        response["status_code"] = exc.status_code
+        if exc.response_body:
+            try:
+                response["response_body"] = json.loads(exc.response_body)
+            except json.JSONDecodeError:
+                response["response_body"] = exc.response_body
+    return response
 
 
 def _wallet_keyboard() -> InlineKeyboardMarkup:
@@ -1641,6 +1921,27 @@ def _deposit_order_keyboard(order: dict | None) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="刷新充值状态", callback_data=f"deposit:refresh:{order['order_id']}")])
     rows.append([InlineKeyboardButton(text="返回钱包", callback_data="wallet")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _recharge_amount_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="2 USDT", callback_data="wallet:amount:2"),
+                InlineKeyboardButton(text="5 USDT", callback_data="wallet:amount:5"),
+            ],
+            [
+                InlineKeyboardButton(text="10 USDT", callback_data="wallet:amount:10"),
+                InlineKeyboardButton(text="20 USDT", callback_data="wallet:amount:20"),
+            ],
+            [
+                InlineKeyboardButton(text="50 USDT", callback_data="wallet:amount:50"),
+                InlineKeyboardButton(text="100 USDT", callback_data="wallet:amount:100"),
+            ],
+            [InlineKeyboardButton(text="自定义金额", callback_data="wallet:amount:custom")],
+            [InlineKeyboardButton(text="返回钱包", callback_data="wallet")],
+        ]
+    )
 
 
 def _referral_keyboard() -> InlineKeyboardMarkup:
@@ -1880,6 +2181,162 @@ def _format_rebates(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
+def _format_admin_users(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无用户。"
+    lines = ["用户列表"]
+    for row in rows:
+        lines.append(
+            f"{row.get('telegram_user_id')} {row.get('username') or row.get('first_name') or '-'} "
+            f"role={row.get('role')} balance={_money(row.get('balance'))}"
+        )
+    return "\n".join(lines)
+
+
+def _format_admin_user(row: dict | None) -> str:
+    if not row:
+        return "用户不存在。"
+    return (
+        "用户详情\n"
+        f"user_id={row.get('telegram_user_id')}\n"
+        f"name={row.get('username') or row.get('first_name') or '-'}\n"
+        f"role={row.get('role')}\n"
+        f"balance={_money(row.get('balance'))}\n"
+        f"frozen={_money(row.get('frozen_balance'))}\n"
+        f"direct_referrals={row.get('direct_referrals') or 0}\n"
+        f"bets_count={row.get('bets_count') or 0}"
+    )
+
+
+def _format_agent_applications(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无待审核代理申请。"
+    lines = ["代理申请"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} deposit={_money(row.get('total_deposit'))} "
+            f"turnover={_money(row.get('total_turnover'))} referrals={row.get('valid_referrals')} {row.get('status')}"
+        )
+    return "\n".join(lines)
+
+
+async def _send_bets_page(message: Message, user_id: int, status_group: str, page: int, database: Database) -> None:
+    page = max(page, 0)
+    per_page = 5
+    pending_count = await database.count_user_bets_by_group(user_id, "pending")
+    settled_count = await database.count_user_bets_by_group(user_id, "settled")
+    rows = await database.list_user_bets(user_id, status_group=status_group, limit=per_page, offset=page * per_page)
+    total = settled_count if status_group == "settled" else pending_count
+    await message.answer(
+        _format_bets_page(rows, pending_count, settled_count, status_group),
+        reply_markup=my_bets_keyboard(
+            rows,
+            status_group,
+            page,
+            has_prev=page > 0,
+            has_next=(page + 1) * per_page < total,
+        ),
+    )
+
+
+def _format_bets_page(rows: list[dict], pending_count: int, settled_count: int, status_group: str) -> str:
+    title = "📊 我的注单"
+    lines = [title, "", f"待结算：{pending_count} 张", f"已结算：{settled_count} 张", ""]
+    if not rows:
+        lines.append("暂无注单。")
+        return "\n".join(lines)
+    for index, bet in enumerate(rows, 1):
+        lines.append(
+            f"{index}. {bet.get('bet_no') or bet.get('id')} | {bet.get('fixture_label') or '-'} | "
+            f"{_money(bet.get('stake'))} USDT | {_bet_status_label(str(bet.get('status')))}"
+        )
+    return "\n".join(lines)
+
+
+def _format_bet_created(bet: dict, currency: str) -> str:
+    return (
+        "🎫 注单已创建\n\n"
+        f"注单号：{bet.get('bet_no') or bet.get('id')}\n"
+        f"比赛：{bet.get('fixture_label') or '-'}\n"
+        f"玩法：{bet.get('market_title') or bet.get('market_key') or '-'}\n"
+        f"选择：{bet.get('selection') or '-'}\n"
+        f"金额：{_money(bet.get('stake'))} {currency}\n"
+        f"赔率：{bet.get('odds') or '-'}\n"
+        f"预计返还：{_money(bet.get('potential_payout'))} {currency}\n"
+        "状态：待结算"
+    )
+
+
+def _format_bet_detail(bet: dict, currency: str) -> str:
+    status = str(bet.get("status") or "")
+    settled = status in {"won", "lost", "void", "cancelled"}
+    title = "🎫 已结算注单" if settled else "🎫 注单详情"
+    lines = [
+        title,
+        "",
+        f"注单号：{bet.get('bet_no') or bet.get('id')}",
+        f"比赛：{bet.get('fixture_label') or '-'}",
+        f"玩法：{bet.get('market_title') or bet.get('market_key') or '-'}",
+        f"选择：{bet.get('selection') or '-'}",
+    ]
+    if settled:
+        lines.append(f"赛果：{bet.get('result_score') or '-'}")
+    lines.extend(
+        [
+            f"金额：{_money(bet.get('stake'))} {currency}",
+            f"赔率：{bet.get('odds') or '-'}",
+            f"预计返还：{_money(bet.get('potential_payout'))} {currency}",
+        ]
+    )
+    if settled:
+        lines.append(f"返还：{_money(bet.get('payout'))} {currency}")
+    lines.append(f"状态：{_bet_status_label(status)}")
+    if bet.get("settled_at"):
+        lines.append(f"结算时间：{bet.get('settled_at')}")
+    if bet.get("settlement_note"):
+        lines.append(f"备注：{bet.get('settlement_note')}")
+    return "\n".join(lines)
+
+
+def _bet_status_label(status: str) -> str:
+    return {
+        "pending": "待结算",
+        "manual_required": "待人工结算",
+        "won": "已中奖",
+        "lost": "未中奖",
+        "void": "已作废",
+        "cancelled": "已取消",
+    }.get(status, status or "-")
+
+
+def _validated_amount(raw: str, minimum: Decimal, maximum: Decimal) -> Decimal:
+    try:
+        amount = Decimal(str(raw).strip())
+    except Exception as exc:
+        raise ValueError("金额必须是数字。") from exc
+    if amount.as_tuple().exponent < -2:
+        raise ValueError("金额最多支持 2 位小数。")
+    if amount < minimum or amount > maximum:
+        raise ValueError(f"金额范围：{_money(minimum)}-{_money(maximum)} USDT")
+    return amount.quantize(Decimal("0.01"))
+
+
+def _fixture_start_time(fixture: dict[str, Any]) -> datetime | None:
+    raw = (fixture.get("fixture") or {}).get("date")
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    timestamp = (fixture.get("fixture") or {}).get("timestamp")
+    if timestamp:
+        try:
+            return datetime.fromtimestamp(int(timestamp))
+        except (TypeError, ValueError, OSError):
+            return None
+    return None
+
+
 def _money(value: Any) -> str:
     try:
         return f"{Decimal(str(value or 0)):.2f}"
@@ -1925,6 +2382,15 @@ def _translated_texts(key: str) -> set[str]:
 
 def _now_hhmm() -> str:
     return now_hhmm()
+
+
+def _log_api_failure(key: str, message: str, *args: Any) -> None:
+    now = datetime.now()
+    last = _api_failure_log_times.get(key)
+    if last and (now - last).total_seconds() < 300:
+        return
+    _api_failure_log_times[key] = now
+    logger.warning(message, *args)
 
 
 def _format_bet_placeholder(fixture: dict[str, Any], selection: str, odds: str) -> str:

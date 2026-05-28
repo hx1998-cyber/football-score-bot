@@ -35,6 +35,11 @@ class ApiFootballClient:
         data = await self._get("/fixtures/events", params={"fixture": fixture_id})
         return data.get("response", [])
 
+    async def get_fixture_detail(self, fixture_id: int) -> dict[str, Any] | None:
+        data = await self._get("/fixtures", params={"id": fixture_id})
+        response = data.get("response", [])
+        return response[0] if response else None
+
     async def get_live_odds(self) -> list[dict[str, Any]]:
         data = await self._get("/odds/live", params={})
         return data.get("response", [])

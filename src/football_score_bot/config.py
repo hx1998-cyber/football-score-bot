@@ -27,7 +27,9 @@ class Settings:
     show_tomorrow_matches: bool
     bettable_days_ahead: int
     max_bettable_matches: int
+    super_admin_user_ids: set[int]
     admin_user_ids: set[int]
+    agent_user_ids: set[int]
     default_language: str
     payment_provider: str
     gmpay_pid: str
@@ -57,15 +59,31 @@ class Settings:
     withdraw_enabled: bool
     real_betting_enabled: bool
     bet_settlement_admin_only: bool
+    bet_auto_settlement_enabled: bool
+    bet_settlement_interval_seconds: int
+    settlement_require_final_status: bool
+    settlement_notify_group_enabled: bool
+    settlement_group_chat_id: int | None
+    settlement_public_win_min_payout: Decimal
     min_bet_amount: Decimal
     max_bet_amount: Decimal
+    default_bet_amount: Decimal
+    min_recharge_amount: Decimal
+    max_recharge_amount: Decimal
+    bet_cancel_before_start_minutes: int
     min_withdraw_amount: Decimal
     rebate_enabled: bool
+    rebate_request_enabled: bool
     rebate_mode: str
     rebate_by_active_referrals_enabled: bool
     rebate_by_turnover_enabled: bool
     rebate_settlement_admin_only: bool
     referral_turnover_commission_rate: Decimal
+    agent_application_enabled: bool
+    agent_min_total_deposit: Decimal
+    agent_min_total_turnover: Decimal
+    agent_min_valid_referrals: int
+    worldcup_demo_markets_enabled: bool
     log_level: str = "INFO"
 
 
@@ -108,7 +126,9 @@ def load_settings() -> Settings:
         show_tomorrow_matches=_parse_bool(os.getenv("SHOW_TOMORROW_MATCHES", "true")),
         bettable_days_ahead=max(1, int(os.getenv("BETTABLE_DAYS_AHEAD", "2"))),
         max_bettable_matches=int(os.getenv("MAX_BETTABLE_MATCHES", "30")),
+        super_admin_user_ids=_parse_int_set(os.getenv("SUPER_ADMIN_USER_IDS", "")),
         admin_user_ids=_parse_int_set(os.getenv("ADMIN_USER_IDS", "")),
+        agent_user_ids=_parse_int_set(os.getenv("AGENT_USER_IDS", "")),
         default_language=os.getenv("DEFAULT_LANGUAGE", "zh-CN"),
         payment_provider=os.getenv("PAYMENT_PROVIDER", "gmpay"),
         gmpay_pid=os.getenv("GMPAY_PID", ""),
@@ -125,7 +145,7 @@ def load_settings() -> Settings:
         gmpay_default_token=os.getenv("GMPAY_DEFAULT_TOKEN", "usdt"),
         gmpay_default_network=os.getenv("GMPAY_DEFAULT_NETWORK", "tron"),
         gmpay_default_payment_type=os.getenv("GMPAY_DEFAULT_PAYMENT_TYPE") or None,
-        gmpay_min_recharge_usdt=Decimal(os.getenv("GMPAY_MIN_RECHARGE_USDT", "10")),
+        gmpay_min_recharge_usdt=Decimal(os.getenv("GMPAY_MIN_RECHARGE_USDT", "2")),
         gmpay_order_expire_minutes=int(os.getenv("GMPAY_ORDER_EXPIRE_MINUTES", "30")),
         epusdt_base_url=os.getenv("EPUSDT_BASE_URL", "").rstrip("/"),
         epusdt_api_secret=os.getenv("EPUSDT_API_SECRET", ""),
@@ -140,16 +160,32 @@ def load_settings() -> Settings:
         wallet_currency=os.getenv("WALLET_CURRENCY", "USDT"),
         withdraw_enabled=_parse_bool(os.getenv("WITHDRAW_ENABLED", "false")),
         real_betting_enabled=_parse_bool(os.getenv("REAL_BETTING_ENABLED", "false")),
-        bet_settlement_admin_only=_parse_bool(os.getenv("BET_SETTLEMENT_ADMIN_ONLY", "true")),
-        min_bet_amount=Decimal(os.getenv("MIN_BET_AMOUNT", "1")),
+        bet_settlement_admin_only=_parse_bool(os.getenv("BET_SETTLEMENT_ADMIN_ONLY", "false")),
+        bet_auto_settlement_enabled=_parse_bool(os.getenv("BET_AUTO_SETTLEMENT_ENABLED", "true")),
+        bet_settlement_interval_seconds=max(10, int(os.getenv("BET_SETTLEMENT_INTERVAL_SECONDS", "60"))),
+        settlement_require_final_status=_parse_bool(os.getenv("SETTLEMENT_REQUIRE_FINAL_STATUS", "true")),
+        settlement_notify_group_enabled=_parse_bool(os.getenv("SETTLEMENT_NOTIFY_GROUP_ENABLED", "false")),
+        settlement_group_chat_id=_parse_optional_int(os.getenv("SETTLEMENT_GROUP_CHAT_ID", "")),
+        settlement_public_win_min_payout=Decimal(os.getenv("SETTLEMENT_PUBLIC_WIN_MIN_PAYOUT", "0")),
+        min_bet_amount=Decimal(os.getenv("MIN_BET_AMOUNT", "2")),
         max_bet_amount=Decimal(os.getenv("MAX_BET_AMOUNT", "100")),
+        default_bet_amount=Decimal(os.getenv("DEFAULT_BET_AMOUNT", "2")),
+        min_recharge_amount=Decimal(os.getenv("MIN_RECHARGE_AMOUNT", "2")),
+        max_recharge_amount=Decimal(os.getenv("MAX_RECHARGE_AMOUNT", "1000")),
+        bet_cancel_before_start_minutes=int(os.getenv("BET_CANCEL_BEFORE_START_MINUTES", "5")),
         min_withdraw_amount=Decimal(os.getenv("MIN_WITHDRAW_AMOUNT", "10")),
         rebate_enabled=_parse_bool(os.getenv("REBATE_ENABLED", "true")),
+        rebate_request_enabled=_parse_bool(os.getenv("REBATE_REQUEST_ENABLED", "true")),
         rebate_mode=os.getenv("REBATE_MODE", "none"),
         rebate_by_active_referrals_enabled=_parse_bool(os.getenv("REBATE_BY_ACTIVE_REFERRALS_ENABLED", "false")),
         rebate_by_turnover_enabled=_parse_bool(os.getenv("REBATE_BY_TURNOVER_ENABLED", "false")),
         rebate_settlement_admin_only=_parse_bool(os.getenv("REBATE_SETTLEMENT_ADMIN_ONLY", "true")),
         referral_turnover_commission_rate=Decimal(os.getenv("REFERRAL_TURNOVER_COMMISSION_RATE", "0.00")),
+        agent_application_enabled=_parse_bool(os.getenv("AGENT_APPLICATION_ENABLED", "true")),
+        agent_min_total_deposit=Decimal(os.getenv("AGENT_MIN_TOTAL_DEPOSIT", "100")),
+        agent_min_total_turnover=Decimal(os.getenv("AGENT_MIN_TOTAL_TURNOVER", "500")),
+        agent_min_valid_referrals=int(os.getenv("AGENT_MIN_VALID_REFERRALS", "5")),
+        worldcup_demo_markets_enabled=_parse_bool(os.getenv("WORLDCUP_DEMO_MARKETS_ENABLED", "true")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 
@@ -176,6 +212,16 @@ def _parse_int_set(value: str) -> set[int]:
         except ValueError:
             continue
     return result
+
+
+def _parse_optional_int(value: str) -> int | None:
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def _parse_bool(value: str) -> bool:

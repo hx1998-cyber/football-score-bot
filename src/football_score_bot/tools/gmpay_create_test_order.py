@@ -3,12 +3,11 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import time
-import uuid
 from decimal import Decimal
 
 from football_score_bot.config import load_settings
 from football_score_bot.payments.gmpay import GMPayClient
+from football_score_bot.payments.order_ids import generate_gmpay_order_id
 
 
 async def main() -> None:
@@ -17,7 +16,7 @@ async def main() -> None:
     args = parser.parse_args()
     settings = load_settings()
     amount = Decimal(args.amount)
-    order_id = f"dep_test_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+    order_id = generate_gmpay_order_id()
     client = GMPayClient(
         pid=settings.gmpay_pid,
         base_url=settings.gmpay_base_url,
@@ -39,7 +38,10 @@ async def main() -> None:
         )
         print("order_id:", order_id)
         print("request payload without secret:")
-        print(json.dumps({**unsigned, "signature": client.sign_payload(unsigned)}, ensure_ascii=False, indent=2))
+        redacted = {**unsigned, "signature": "***"}
+        if "token" in redacted:
+            redacted["token"] = "***"
+        print(json.dumps(redacted, ensure_ascii=False, indent=2))
         tx = await client.create_transaction(
             order_id=order_id,
             amount=amount,

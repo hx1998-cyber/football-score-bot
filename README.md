@@ -211,6 +211,8 @@ The minimum GMPay create-order body sent by the bot is:
 }
 ```
 
+GMPay limits `order_id` to a maximum length of 32 characters. Recharge orders use a short alphanumeric format like `D1779981951A7K9X2`; the Telegram user id is stored separately in `deposit_orders.user_id` and is not embedded in `order_id`.
+
 Do not put `GMPAY_SECRET` in logs, request bodies, or README examples. It belongs only in `.env` and is used for both create-order signing and webhook verification.
 
 Webhook behavior:
@@ -404,3 +406,46 @@ Manual checks:
 - Group `/subscribe` broadcasts featured live matches only.
 - Repeated `/today` clicks read Redis odds/fixture caches before falling back to API-Football.
 - Logs do not print API keys or Telegram tokens.
+## M10 Single Bet Lifecycle
+
+M10 moves betting to a single-ticket lifecycle. Each submitted bet gets a short `bet_no`, an independent detail view, and its own settlement state. `/bets` now paginates pending and settled tickets instead of rendering every ticket into one long message. Pending tickets can show settlement check and delete actions; settled tickets are read-only for normal users.
+
+Normal users can only cancel a pending bet before kickoff and before the configured lock window (`BET_CANCEL_BEFORE_START_MINUTES`). Deleting a ticket never removes the database row; it marks the bet `cancelled`. Settled tickets cannot be cancelled or reopened by normal users.
+
+`REAL_BETTING_ENABLED=false` keeps local and trial betting simulated: bets are created with `is_simulated=true` and no real wallet balance is changed. When `REAL_BETTING_ENABLED=true`, placing a bet moves stake from `wallets.balance` to `wallets.frozen_balance` and writes `wallet_ledger type=bet_freeze`. Settlement, void refunds, and user cancellations also write `wallet_ledger`.
+
+Automatic settlement is controlled by:
+
+- `BET_AUTO_SETTLEMENT_ENABLED`
+- `BET_SETTLEMENT_INTERVAL_SECONDS`
+- `SETTLEMENT_REQUIRE_FINAL_STATUS`
+- `SETTLEMENT_NOTIFY_GROUP_ENABLED`
+- `SETTLEMENT_GROUP_CHAT_ID`
+- `SETTLEMENT_PUBLIC_WIN_MIN_PAYOUT`
+
+The settlement worker scans pending bets by `fixture_id`, requests API-Football fixture details once per fixture, and only settles final statuses `FT`, `AET`, and `PEN`. Cancelled, postponed, abandoned, or suspended fixtures are voided by default. Network errors are logged as warnings and do not clear cached score data or crash the bot.
+
+Automatic settlement currently supports:
+
+- `match_winner`
+- `correct_score`
+- `over_under`
+- `btts`
+
+Unsupported markets such as handicaps, HT/FT, corners, and unknown markets are moved to `manual_required` with an operator note for manual settlement.
+
+## Roles And Admin Controls
+
+Roles are configured through `SUPER_ADMIN_USER_IDS`, `ADMIN_USER_IDS`, `AGENT_USER_IDS`, and persisted in `user_roles`. Super admins can invite/remove admins and agents. Admins and agents are restricted to their own downstream users for management views. Reopening or reversing settled bets is reserved for the super admin path. Admin actions must write `admin_audit_logs`.
+
+Withdrawals remain manual. Users can create withdrawal requests only when `WITHDRAW_ENABLED=true`; approval does not send funds automatically. Operators must mark a withdrawal as paid after external transfer. Rejecting a withdrawal returns frozen funds through wallet ledger entries.
+
+Rebate support is request-first. Users can request rebates, agents/admins can view downstream rebate context, and super admins approve payout. Rebate payout must write `wallet_ledger type=rebate`.
+
+## World Cup Zone
+
+The 2026 World Cup zone includes schedule, standings, champion prediction, group qualification, Golden Boot, MVP, and prediction entry points. If API-Football does not yet expose final 2026 World Cup data, the bot uses built-in demo seed markets from `worldcup_seed.py`. Futures markets are advance markets; final odds and market availability must be reviewed before trial operation.
+
+## Production Safety
+
+Before any real launch or paid trial, complete local legal compliance review, risk controls, wallet reconciliation, payment callback hardening, withdrawal review procedures, API key/token handling review, and operational incident playbooks. Never print Telegram tokens, API keys, GMPay secrets, or database passwords in logs.
