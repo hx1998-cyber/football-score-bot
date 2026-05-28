@@ -11,7 +11,7 @@ Telegram football score bot with featured match filtering, API-Football data, Re
 - Background cache worker refreshes fixtures and odds so user clicks do not call API-Football directly.
 - Group `/subscribe` broadcasts only featured live matches. If no featured live match exists, no group message is sent.
 - UI languages: Simplified Chinese, Traditional Chinese, English, Japanese, Korean.
-- Match odds support simulated bet slips for flow testing only. Wallet, deposit, withdrawal, real-money betting, and payment flows are not implemented.
+- Match odds support simulated bet slips for flow testing only. Wallet ledger and GMPay recharge callbacks are available; withdrawal, real betting settlement, and real-money wagering remain disabled.
 - World Cup futures markets support demo/manual odds and simulated prediction records only.
 
 ## Configuration
@@ -144,15 +144,15 @@ Configuration:
 ```env
 PAYMENT_PROVIDER=gmpay
 GMPAY_PID=1000
+GMPAY_SECRET=
 GMPAY_BASE_URL=https://hosea.cc.cd
 GMPAY_CREATE_ORDER_PATH=/payments/gmpay/v1/order/create-transaction
-GMPAY_SECRET=
-GMPAY_SIGN_TYPE=md5
-GMPAY_NOTIFY_URL=https://your-domain.example/webhooks/gmpay
-GMPAY_REDIRECT_URL=
 GMPAY_DEFAULT_CURRENCY=cny
 GMPAY_DEFAULT_TOKEN=usdt
 GMPAY_DEFAULT_NETWORK=tron
+GMPAY_NOTIFY_URL=https://your-domain.example/webhooks/gmpay
+GMPAY_REDIRECT_URL=
+GMPAY_SIGN_TYPE=md5
 GMPAY_DEFAULT_PAYMENT_TYPE=
 GMPAY_MIN_RECHARGE_USDT=10
 GMPAY_ORDER_EXPIRE_MINUTES=30
@@ -186,13 +186,32 @@ POST {GMPAY_BASE_URL}{GMPAY_CREATE_ORDER_PATH}
 
 The create-order request includes `pid`; `GMPAY_SECRET` is only used to sign and is never sent in the request body. The signing logic is isolated in `football_score_bot.payments.gmpay.sign_payload`: keep all non-empty fields, exclude `signature`, sort by ASCII key, join as `key=value&key=value`, append `GMPAY_SECRET` directly at the end, then compute lower-case MD5.
 
+The minimum GMPay create-order body sent by the bot is:
+
+```json
+{
+  "pid": "1000",
+  "order_id": "...",
+  "currency": "cny",
+  "token": "usdt",
+  "network": "tron",
+  "amount": 100,
+  "notify_url": "https://your-domain.example/webhooks/gmpay",
+  "signature": "md5(...)"
+}
+```
+
+Do not put `GMPAY_SECRET` in logs, request bodies, or README examples. It belongs only in `.env` and is used for both create-order signing and webhook verification.
+
 Webhook behavior:
 
 - `POST /webhooks/gmpay` accepts JSON and `application/x-www-form-urlencoded` callback bodies.
 - GMPay signature is verified before reading the order as paid.
+- Failed signature verification returns `401` and does not credit the wallet.
 - `success`, `paid`, `2`, and `TRADE_SUCCESS` style statuses are treated as successful payment.
 - `order_id`, `trade_id`, `actual_amount`, and `chain_tx_id`/`block_transaction_id`/`txid` are parsed compatibly.
 - `order_id`, `trade_id`, `chain_tx_id`, and `wallet_ledger` references are unique/idempotent, so repeat callbacks do not add balance twice.
+- Successful callbacks return plain text `ok` with `text/plain`.
 - Wallet balances are changed only through `wallet_ledger` entries inside database transactions.
 - The bot never stores user private keys and does not implement automatic withdrawal.
 

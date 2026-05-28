@@ -61,11 +61,7 @@ class WalletService:
                 if not order:
                     return False
                 if order["status"] == "paid":
-                    existing = await conn.fetchval(
-                        "SELECT id FROM wallet_ledger WHERE ref_type = 'deposit_order' AND ref_id = $1 AND type = 'deposit'",
-                        order_id,
-                    )
-                    return False if existing else False
+                    return False
                 if trade_id:
                     duplicate_trade = await conn.fetchval(
                         """
@@ -100,6 +96,25 @@ class WalletService:
                 )
                 balance_before = Decimal(str(wallet["balance"]))
                 balance_after = balance_before + actual_amount
+                ledger_id = await conn.fetchval(
+                    """
+                    INSERT INTO wallet_ledger (
+                        user_id, currency, type, amount, balance_before, balance_after,
+                        ref_type, ref_id, description
+                    )
+                    VALUES ($1, $2, 'deposit', $3, $4, $5, 'deposit_order', $6, 'GMPay deposit')
+                    ON CONFLICT DO NOTHING
+                    RETURNING id
+                    """,
+                    user_id,
+                    self._currency,
+                    actual_amount,
+                    balance_before,
+                    balance_after,
+                    order_id,
+                )
+                if not ledger_id:
+                    return False
                 await conn.execute(
                     """
                     UPDATE wallets
@@ -112,22 +127,6 @@ class WalletService:
                     self._currency,
                     balance_after,
                     actual_amount,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO wallet_ledger (
-                        user_id, currency, type, amount, balance_before, balance_after,
-                        ref_type, ref_id, description
-                    )
-                    VALUES ($1, $2, 'deposit', $3, $4, $5, 'deposit_order', $6, 'GMPay deposit')
-                    ON CONFLICT DO NOTHING
-                    """,
-                    user_id,
-                    self._currency,
-                    actual_amount,
-                    balance_before,
-                    balance_after,
-                    order_id,
                 )
                 await conn.execute(
                     """
