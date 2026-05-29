@@ -94,6 +94,29 @@ MENU_SETTINGS_TEXTS = {"设置", "⚙️ 设置", "Settings"}
 MENU_HELP_TEXTS = {"帮助", "❓ 帮助", "Help"}
 
 
+def format_bet_confirm(
+    fixture: dict[str, Any],
+    market_title: str,
+    selection: str,
+    odds: str,
+    stake: str = "10",
+) -> str:
+    teams = fixture.get("teams", {})
+    home = teams.get("home", {}).get("name", "主队")
+    away = teams.get("away", {}).get("name", "客队")
+    return "\n".join(
+        [
+            "🎯 确认下注",
+            f"比赛：{home} vs {away}",
+            f"玩法：{market_title}",
+            f"选择：{selection}",
+            f"赔率：{odds}",
+            f"金额：{stake} USDT",
+            f"预计派彩：{_potential_payout_text(stake, odds)} USDT",
+        ]
+    )
+
+
 def build_router(
     api_client: ApiFootballClient,
     cache: RedisCache,
@@ -474,7 +497,9 @@ def build_router(
                 _outcome_button_label(outcome),
                 outcome.odds,
                 stake=str(settings.default_bet_amount),
-            ),
+            )
+            + "\n\n"
+            + _bet_mode_notice(settings),
             reply_markup=bet_confirm_keyboard(fixture_id, market_key, page, outcome_index),
         )
 
@@ -1020,9 +1045,10 @@ def build_router(
         link = f"https://t.me/{bot_info.username}?start=ref_{code}"
         summary = await database.get_referral_summary(user.id)
         role = await permission_service.get_user_role(user.id)
+        application = await database.get_latest_agent_application(user.id)
         await message.answer(
-            _format_referrals(link, summary, settings.wallet_currency),
-            reply_markup=_referral_keyboard(role),
+            _format_referrals(link, summary, settings.wallet_currency, role, application),
+            reply_markup=_referral_keyboard(role, application),
         )
 
     @router.callback_query(F.data == "referrals:children")
@@ -1097,6 +1123,14 @@ def build_router(
         await _safe_callback_answer(callback)
         if not callback.from_user:
             return
+        role = await permission_service.get_user_role(callback.from_user.id)
+        if role in {"agent", "admin", "super_admin"}:
+            await callback.message.answer(f"当前身份：{_role_label(role)}，无需重复申请代理。", reply_markup=_referral_keyboard(role))
+            return
+        application = await database.get_latest_agent_application(callback.from_user.id)
+        if application and str(application.get("status")) == "pending":
+            await callback.message.answer("代理申请审核中，请勿重复提交。", reply_markup=_referral_keyboard(role, application))
+            return
         metrics = await database.get_agent_application_metrics(callback.from_user.id)
         ok = (
             Decimal(str(metrics.get("total_deposit") or 0)) >= settings.agent_min_total_deposit
@@ -1110,6 +1144,11 @@ def build_router(
         await state.update_data(metrics=metrics)
         await state.set_state(AgentApplicationStates.waiting_note)
         await callback.message.answer("请输入代理申请说明。", reply_markup=_cancel_keyboard("referrals"))
+
+    @router.callback_query(F.data == "referrals:agent_pending")
+    async def agent_pending(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        await callback.message.answer("代理申请审核中，请等待管理员处理。")
 
     @router.message(AgentApplicationStates.waiting_note)
     async def agent_note_input(message: Message, state: FSMContext) -> None:
@@ -1189,7 +1228,7 @@ def build_router(
         if role not in {"super_admin", "admin", "agent"}:
             await message.answer("无管理员权限。")
             return
-        await message.answer(_admin_menu_text(role))
+        await message.answer(_admin_menu_text(role), reply_markup=_admin_panel_keyboard(role))
 
     @router.message(Command("admin"))
     async def admin(message: Message) -> None:
@@ -1819,6 +1858,56 @@ def build_router(
             await database.set_user_role(int(row["user_id"]), "agent", message.from_user.id)
         await database.add_admin_audit_log(message.from_user.id, f"admin_{status}_agent", "agent_application", str(application_id), {"reviewed": bool(row)})
         await message.answer("代理申请已处理。" if row else "申请不存在或已处理。")
+
+    @router.callback_query(F.data.in_({
+        "admin:stats",
+        "admin:markets",
+        "admin:bets",
+        "admin:wallets",
+        "admin:withdrawals",
+        "admin:deposits",
+        "admin:users",
+        "admin:rebates",
+        "admin:commissions",
+        "admin:settings",
+    }))
+    async def admin_panel_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        role = await permission_service.get_user_role(callback.from_user.id)
+        if role not in {"super_admin", "admin", "agent"}:
+            await callback.message.answer("无管理员权限。")
+            return
+        data = callback.data
+        if data == "admin:stats":
+            await callback.message.answer(_format_admin_dashboard(await database.admin_dashboard(), settings.wallet_currency))
+        elif data == "admin:markets":
+            await callback.message.answer("🎯 可投注赛事管理\n\n使用 /admin_markets 查看当前可投注赛事；使用 /admin_suspend 和 /admin_resume 管理封盘。")
+        elif data == "admin:bets":
+            await callback.message.answer(_format_admin_bets(await database.list_admin_bets("pending", 20)))
+        elif data == "admin:wallets":
+            await callback.message.answer("💰 用户钱包\n\n请输入：/admin_wallet <telegram_user_id>\n手动调账：/admin_adjust_balance <telegram_user_id> <amount> <reason>")
+        elif data == "admin:withdrawals":
+            await callback.message.answer(_format_withdrawals(await database.list_withdraw_requests("pending", 20)))
+        elif data == "admin:deposits":
+            await callback.message.answer(_format_deposit_records(await database.list_deposit_orders(20)))
+        elif data == "admin:users":
+            if role != "super_admin":
+                await callback.message.answer("👥 用户/代理管理\n\n代理可在推广页面查看自己的下级。授权管理员/代理需要超级管理员权限。")
+            else:
+                await callback.message.answer(_format_admin_users(await database.list_users(50)))
+        elif data == "admin:rebates":
+            await callback.message.answer("🎁 返水管理\n\n待处理返水申请请使用 /admin_rebate_preview <user_id> 查看；结算使用 /admin_settle_rebate <rebate_record_id>。")
+        elif data == "admin:commissions":
+            await callback.message.answer(_format_commissions(await database.list_commissions(None if role == "super_admin" else callback.from_user.id, 20)))
+        elif data == "admin:settings":
+            await callback.message.answer(
+                "系统设置\n\n"
+                f"真实下注：{'开启' if settings.real_betting_enabled else '关闭'}\n"
+                f"测试下注余额校验：{'开启' if settings.bet_require_balance_for_simulation else '关闭'}\n"
+                f"提现：{'开启' if settings.withdraw_enabled else '关闭'}"
+            )
 
     @router.callback_query()
     async def unknown_callback(callback: CallbackQuery) -> None:
@@ -2558,16 +2647,13 @@ def _referral_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def _referral_keyboard(role: str = "user") -> InlineKeyboardMarkup:
+def _referral_keyboard(role: str = "user", application: dict | None = None) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="下级管理", callback_data="referrals:children"),
             InlineKeyboardButton(text="返佣记录", callback_data="referrals:commissions"),
         ],
-        [
-            InlineKeyboardButton(text="申请返水", callback_data="referrals:rebate_apply"),
-            InlineKeyboardButton(text="申请成为代理", callback_data="referrals:agent_apply"),
-        ],
+        [InlineKeyboardButton(text="返水管理", callback_data="referrals:rebate_apply")],
     ]
     if role in {"agent", "admin", "super_admin"}:
         rows.append(
@@ -2577,6 +2663,12 @@ def _referral_keyboard(role: str = "user") -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="下级返水", callback_data="referrals:sub_rebates"),
             ]
         )
+    else:
+        status = str((application or {}).get("status") or "")
+        if status == "pending":
+            rows.append([InlineKeyboardButton(text="代理申请审核中", callback_data="referrals:agent_pending")])
+        else:
+            rows.append([InlineKeyboardButton(text="申请成为代理", callback_data="referrals:agent_apply")])
     rows.extend(
         [
             [InlineKeyboardButton(text="复制邀请链接", callback_data="referrals:copy")],
@@ -2843,16 +2935,32 @@ def _format_admin_referral_summary(summary: dict, currency: str) -> str:
     )
 
 
-def _format_referrals(link: str, summary: dict, currency: str) -> str:
-    return (
-        "👥 推广邀请\n"
-        "我的邀请链接：\n"
-        f"{link}\n\n"
-        f"直属下级：{summary.get('direct_count') or 0} 人\n"
-        f"有效下级：{summary.get('active_count') or 0} 人\n"
-        f"累计返佣：{_money(summary.get('settled_commission'))} {currency}\n"
-        f"待结算返佣：{_money(summary.get('pending_commission'))} {currency}"
-    )
+def _format_referrals(
+    link: str,
+    summary: dict,
+    currency: str,
+    role: str = "user",
+    application: dict | None = None,
+) -> str:
+    lines = [
+        "👥 推广邀请",
+        "我的邀请链接：",
+        link,
+        "",
+        f"直属下级：{summary.get('direct_count') or 0} 人",
+        f"有效下级：{summary.get('active_count') or 0} 人",
+        f"累计返佣：{_money(summary.get('settled_commission'))} {currency}",
+        f"待结算返佣：{_money(summary.get('pending_commission'))} {currency}",
+    ]
+    if role in {"super_admin", "admin", "agent"}:
+        lines.insert(1, f"当前身份：{_role_label(role)}")
+    elif application and str(application.get("status")) == "pending":
+        lines.append("")
+        lines.append("代理申请审核中")
+    elif application and str(application.get("status")) == "rejected":
+        lines.append("")
+        lines.append("代理申请未通过，可重新申请成为代理。")
+    return "\n".join(lines)
 
 
 def _format_admin_bets(rows: list[dict]) -> str:
@@ -3027,7 +3135,9 @@ async def _send_bet_confirm_for_amount(
             _outcome_button_label(outcome),
             outcome.odds,
             stake=amount,
-        ),
+        )
+        + "\n\n"
+        + _bet_mode_notice(settings),
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="确认下注", callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:{amount}")],
@@ -3165,6 +3275,19 @@ def _bet_status_label(status: str) -> str:
     }.get(status, status or "-")
 
 
+def _format_admin_bets(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无待开奖注单。"
+    lines = ["注单开奖"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} {row.get('fixture_label')} "
+            f"{row.get('selection')} stake={row.get('stake')} payout={row.get('potential_payout')}"
+        )
+    lines.append("\n命令：/admin_settle_win 判定中奖，/admin_settle_loss 判定未中奖，/admin_settle_void 作废退还。")
+    return "\n".join(lines)
+
+
 def _validated_amount(raw: str, minimum: Decimal, maximum: Decimal) -> Decimal:
     try:
         amount = Decimal(str(raw).strip())
@@ -3236,42 +3359,80 @@ def _translated_texts(key: str) -> set[str]:
     return {t(lang, key) for lang in SUPPORTED_LANGUAGES}
 
 
+def _role_label(role: str) -> str:
+    return {
+        "super_admin": "超级管理员",
+        "admin": "管理员",
+        "agent": "代理",
+    }.get(role, "普通用户")
+
+
+def _potential_payout_text(stake: str, odds: str) -> str:
+    try:
+        return _money(Decimal(str(stake)) * Decimal(str(odds)))
+    except Exception:
+        return "0.00"
+
+
+def _bet_mode_notice(settings: Settings) -> str:
+    if settings.real_betting_enabled:
+        return "真实下注模式：下注将冻结余额，开奖后自动派彩。"
+    if settings.bet_require_balance_for_simulation:
+        return "当前为测试下注模式，需钱包余额覆盖下注金额，但不会真实扣款。"
+    return "当前为模拟下注模式，不校验余额，不扣真实余额。"
+
+
 def _admin_menu_text(role: str) -> str:
-    title = "超级管理员面板" if role == "super_admin" else "管理员面板"
+    if role == "super_admin":
+        return (
+            "🛡 超级管理员面板\n\n"
+            "当前身份：超级管理员\n\n"
+            "常用功能：\n"
+            "/admin_stats 平台统计\n"
+            "/admin_deposits 充值订单\n"
+            "/admin_withdrawals 提现审核\n"
+            "/admin_bets 注单开奖\n"
+            "/admin_wallet <telegram_user_id> 用户钱包\n"
+            "/admin_invite_agent <telegram_user_id> 授权代理\n"
+            "/admin_invite_admin <telegram_user_id> 授权管理员\n"
+            "/admin_adjust_balance <telegram_user_id> <amount> <reason> 手动调账"
+        )
     return (
-        f"{title}\nrole={role}\n\n"
-        "/admin_stats\n"
-        "/admin_markets\n"
-        "/admin_suspend <fixture_id>\n"
-        "/admin_resume <fixture_id>\n"
-        "/admin_set_cutoff <minutes>\n"
-        "/admin_wallet <telegram_user_id>\n"
-        "/admin_deposits\n"
-        "/admin_deposit <order_id>\n"
-        "/admin_mark_deposit_paid <order_id> <amount> <txid> <reason>\n"
-        "/admin_reject_deposit <order_id> <reason>\n"
-        "/admin_clear_my_test_bets\n"
-        "/admin_clear_user_test_bets <telegram_user_id>\n"
-        "/admin_adjust_balance <telegram_user_id> <amount> <reason>\n"
-        "/admin_bets\n"
-        "/admin_bet <bet_id>\n"
-        "/admin_settle_win <bet_id>\n"
-        "/admin_settle_loss <bet_id>\n"
-        "/admin_settle_void <bet_id>\n"
-        "/admin_cancel_bet\n"
-        "/admin_withdrawals\n"
-        "/admin_withdraw <withdraw_id>\n"
-        "/admin_approve_withdraw <withdraw_id>\n"
-        "/admin_reject_withdraw <withdraw_id> <reason>\n"
-        "/admin_mark_withdraw_paid <withdraw_id> <txid>\n"
-        "/admin_commissions\n"
-        "/admin_settle_commission <commission_id>\n"
-        "/admin_rebate_rules\n"
-        "/admin_rebate_preview <user_id>\n"
-        "/admin_generate_rebates\n"
-        "/admin_settle_rebate <rebate_record_id>\n"
-        "/admin_referrals <telegram_user_id>"
+        "👥 代理/管理员面板\n\n"
+        f"当前身份：{_role_label(role)}\n\n"
+        "/admin_stats 平台统计\n"
+        "/admin_deposits 充值订单\n"
+        "/admin_withdrawals 提现审核\n"
+        "/admin_bets 注单开奖\n"
+        "/admin_commissions 佣金记录\n"
+        "/admin_referrals <telegram_user_id> 下级统计"
     )
+
+
+def _admin_panel_keyboard(role: str) -> InlineKeyboardMarkup:
+    if role == "super_admin":
+        rows = [
+            [InlineKeyboardButton(text="📊 平台统计", callback_data="admin:stats")],
+            [InlineKeyboardButton(text="🎯 可投注赛事管理", callback_data="admin:markets")],
+            [InlineKeyboardButton(text="🎫 注单开奖", callback_data="admin:bets")],
+            [InlineKeyboardButton(text="💰 用户钱包", callback_data="admin:wallets")],
+            [InlineKeyboardButton(text="🏧 提现审核", callback_data="admin:withdrawals")],
+            [InlineKeyboardButton(text="💳 充值订单", callback_data="admin:deposits")],
+            [InlineKeyboardButton(text="👥 用户/代理管理", callback_data="admin:users")],
+            [InlineKeyboardButton(text="🎁 返水管理", callback_data="admin:rebates")],
+            [InlineKeyboardButton(text="💸 佣金管理", callback_data="admin:commissions")],
+            [InlineKeyboardButton(text="系统设置", callback_data="admin:settings")],
+        ]
+    else:
+        rows = [
+            [InlineKeyboardButton(text="我的下级", callback_data="referrals:children")],
+            [InlineKeyboardButton(text="下级充值", callback_data="referrals:sub_deposits")],
+            [InlineKeyboardButton(text="下级投注", callback_data="referrals:sub_bets")],
+            [InlineKeyboardButton(text="返水申请", callback_data="admin:rebates")],
+            [InlineKeyboardButton(text="佣金记录", callback_data="admin:commissions")],
+            [InlineKeyboardButton(text="返回首页", callback_data="home")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _now_hhmm() -> str:
@@ -3297,4 +3458,126 @@ def _format_bet_placeholder(fixture: dict[str, Any], selection: str, odds: str) 
         f"选择：{selection}\n"
         f"赔率：{odds}\n\n"
         "当前仅展示赔率，不扣余额，不生成真实注单。"
+    )
+
+# M11-Fix-3 final wording overrides.
+def _format_bets_page(rows: list[dict], stats: dict, status_group: str, settings: Settings) -> str:
+    pending_count = int(stats.get("pending_count") or 0)
+    manual_required_count = int(stats.get("manual_required_count") or 0)
+    settled_count = int(stats.get("settled_count") or 0)
+    lines = [
+        "📊 我的注单",
+        "",
+        f"待开奖：{pending_count + manual_required_count} 张",
+        f"已开奖：{settled_count} 张",
+        _bet_mode_notice(settings),
+        "",
+    ]
+    if not rows:
+        lines.append("暂无注单。")
+        return "\n".join(lines)
+    for index, bet in enumerate(rows, 1):
+        tag = " ｜ 测试单" if bet.get("is_simulated") else ""
+        lines.append(
+            f"{index}. {bet.get('bet_no') or bet.get('id')} | {bet.get('fixture_label') or '-'} | "
+            f"{_money(bet.get('stake'))} {settings.wallet_currency} | {_bet_status_label(str(bet.get('status')))}{tag}"
+        )
+    return "\n".join(lines)
+
+
+def _format_bet_created(bet: dict, currency: str) -> str:
+    tag = "\n类型：测试单" if bet.get("is_simulated") else ""
+    return (
+        "🎫 注单已创建\n\n"
+        f"注单号：{bet.get('bet_no') or bet.get('id')}\n"
+        f"比赛：{bet.get('fixture_label') or '-'}\n"
+        f"玩法：{bet.get('market_title') or bet.get('market_key') or '-'}\n"
+        f"选择：{bet.get('selection') or '-'}\n"
+        f"金额：{_money(bet.get('stake'))} {currency}\n"
+        f"赔率：{bet.get('odds') or '-'}\n"
+        f"预计派彩：{_money(bet.get('potential_payout'))} {currency}\n"
+        "状态：待开奖"
+        f"{tag}"
+    )
+
+
+def _format_insufficient_balance(stake: Decimal, balance: Decimal, currency: str) -> str:
+    return (
+        "💰 钱包余额不足\n\n"
+        f"本次下注：{_money(stake)} {currency}\n"
+        f"当前余额：{_money(balance)} {currency}\n\n"
+        "请先充值后再下注。"
+    )
+
+
+def _insufficient_balance_keyboard(fixture_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="充值 USDT", callback_data="wallet:recharge")]]
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_bet_detail(bet: dict, currency: str) -> str:
+    status = str(bet.get("status") or "")
+    opened = status in {"won", "lost", "void", "cancelled"}
+    title = "🎫 已开奖注单" if opened else "🎫 注单详情"
+    lines = [
+        title,
+        "",
+        f"注单号：{bet.get('bet_no') or bet.get('id')}",
+        f"比赛：{bet.get('fixture_label') or '-'}",
+        f"玩法：{bet.get('market_title') or bet.get('market_key') or '-'}",
+        f"选择：{bet.get('selection') or '-'}",
+        f"金额：{_money(bet.get('stake'))} {currency}",
+        f"赔率：{bet.get('odds') or '-'}",
+        f"预计派彩：{_money(bet.get('potential_payout'))} {currency}",
+        f"状态：{_bet_status_label(status)}",
+    ]
+    if bet.get("is_simulated"):
+        lines.append("类型：测试单")
+    if opened:
+        lines.append(f"派彩：{_money(bet.get('payout'))} {currency}")
+        if bet.get("result_score"):
+            lines.append(f"赛果：{bet.get('result_score')}")
+    if bet.get("settled_at"):
+        lines.append(f"开奖时间：{bet.get('settled_at')}")
+    if bet.get("settlement_note"):
+        lines.append(f"备注：{bet.get('settlement_note')}")
+    return "\n".join(lines)
+
+
+def _bet_status_label(status: str) -> str:
+    return {
+        "pending": "待开奖",
+        "manual_required": "待人工开奖",
+        "won": "已中奖",
+        "lost": "未中奖",
+        "void": "已作废",
+        "cancelled": "已取消",
+    }.get(status, status or "-")
+
+
+async def _start_text(
+    cache: RedisCache,
+    api_client: ApiFootballClient,
+    database: Database,
+    settings: Settings,
+    telegram_user_id: int | None,
+) -> str:
+    today_matches, _ = await get_bettable_matches_range(cache, api_client, database, settings)
+    tomorrow = date.today() + timedelta(days=1)
+    tomorrow_matches, _ = await get_bettable_matches_for_date(cache, api_client, database, settings, tomorrow)
+    live = await _get_live(cache, api_client)
+    stats = await database.get_user_bet_stats(telegram_user_id) if telegram_user_id else {}
+    pending = int(stats.get("pending_count") or 0) + int(stats.get("manual_required_count") or 0)
+    simulated_pending = int(stats.get("simulated_pending_count") or 0)
+    return (
+        "WorldCupTop Bot\n\n"
+        f"今日可投注：{_count_by_date(today_matches, date.today())} 场\n"
+        f"明日可投注：{len(tomorrow_matches)} 场\n"
+        f"实时比赛：{len(live)} 场\n"
+        f"我的待开奖注单：{pending} 张\n"
+        f"其中测试单：{simulated_pending} 张\n"
+        f"{_bet_mode_notice(settings)}"
     )

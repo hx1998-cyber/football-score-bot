@@ -138,3 +138,27 @@ def _settlement_message(bet: dict, status: str, currency: str) -> str:
         f"选择：{bet.get('selection')}\n"
         "状态：未中奖"
     )
+
+# M11-Fix-3 wording override.
+def _settlement_message(bet: dict, status: str, currency: str) -> str:
+    bet_no = bet.get("bet_no") or bet.get("id")
+    if status == "won":
+        return (
+            "🎉 注单已开奖：中奖\n\n"
+            f"注单号：{bet_no}\n"
+            f"比赛：{bet.get('fixture_label')}\n"
+            f"玩法：{bet.get('market_title') or bet.get('market_key')}\n"
+            f"选择：{bet.get('selection')}\n"
+            f"金额：{bet.get('stake')} {currency}\n"
+            f"赔率：{bet.get('odds')}\n"
+            f"派彩：{bet.get('potential_payout')} {currency}"
+        )
+    if status == "void":
+        return f"注单已开奖：作废退还\n\n注单号：{bet_no}\n原因：比赛取消或异常\n退还：{bet.get('stake')} {currency}"
+    return (
+        "📉 注单已开奖：未中奖\n\n"
+        f"注单号：{bet_no}\n"
+        f"比赛：{bet.get('fixture_label')}\n"
+        f"选择：{bet.get('selection')}\n"
+        "状态：未中奖"
+    )

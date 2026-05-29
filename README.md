@@ -499,6 +499,31 @@ Telegram user input flows now use aiogram FSM state:
 
 Every FSM flow has a cancel action that clears state and returns to the related menu.
 
+## Product Terms And Real-Test Settings
+
+User-facing betting terms use draw and payout wording:
+
+- `待开奖`: ticket is waiting for match result confirmation.
+- `已开奖`: result has been decided.
+- `派彩`: payout after opening.
+
+Recommended `.env` for real-money rehearsal without freezing balances:
+
+```env
+REAL_BETTING_ENABLED=false
+BET_REQUIRE_BALANCE_FOR_SIMULATION=true
+WITHDRAW_ENABLED=false
+SUPER_ADMIN_USER_IDS=your Telegram numeric ID
+ADMIN_USER_IDS=
+AGENT_USER_IDS=
+```
+
+Enable real balance freezing only when operations are ready:
+
+```env
+REAL_BETTING_ENABLED=true
+```
+
 ## GMPay Callback Diagnostics
 
 `/webhooks/gmpay` logs callback diagnostics without printing secrets:

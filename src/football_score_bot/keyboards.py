@@ -424,3 +424,63 @@ def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
         resize_keyboard=True,
         input_field_placeholder=t(lang, "start_title"),
     )
+
+# M11-Fix-3 overrides: stable menu labels and draw/payout wording.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 可投注赛事"), KeyboardButton(text="📊 我的注单")],
+            [KeyboardButton(text="💰 钱包"), KeyboardButton(text="👥 推广")],
+            [KeyboardButton(text="🏆 世界杯"), KeyboardButton(text="🌐 语言")],
+            [KeyboardButton(text="设置"), KeyboardButton(text="帮助")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def my_bets_keyboard(
+    bets: list[dict] | None = None,
+    status_group: str = "pending",
+    page: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="待开奖", callback_data="bets:pending:0"),
+            InlineKeyboardButton(text="已开奖", callback_data="bets:settled:0"),
+        ]
+    ]
+    for bet in bets or []:
+        bet_key = str(bet.get("bet_no") or bet.get("id"))
+        rows.append([InlineKeyboardButton(text=f"注单 {bet_key}", callback_data=f"bet_detail:{bet_key}:{status_group}:{page}")])
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"bets:{status_group}:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"bets:{status_group}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_detail_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
+        rows.append([InlineKeyboardButton(text="删除本单", callback_data=f"bet_cancel:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

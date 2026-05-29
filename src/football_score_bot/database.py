@@ -1478,6 +1478,19 @@ class Database:
         )
         return [dict(row) for row in rows]
 
+    async def get_latest_agent_application(self, user_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT *
+            FROM agent_applications
+            WHERE user_id = $1
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
     async def review_agent_application(
         self,
         application_id: int,
