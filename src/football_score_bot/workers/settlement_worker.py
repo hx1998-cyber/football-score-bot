@@ -37,6 +37,8 @@ class SettlementWorker:
             currency=settings.wallet_currency,
             referral_deposit_commission_rate=settings.referral_deposit_commission_rate,
             referral_agent_enabled=settings.referral_agent_enabled,
+            payout_freeze_enabled=settings.payout_freeze_enabled,
+            payout_freeze_hours=settings.payout_freeze_hours,
         )
         self._settlement_service = SettlementService(
             database,

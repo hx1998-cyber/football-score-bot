@@ -7,6 +7,8 @@ from dataclasses import replace
 from decimal import Decimal
 from datetime import date, datetime, timedelta
 from typing import Any
+from time import time
+from urllib.parse import parse_qs, urlparse
 
 import asyncpg
 from aiogram import F, Router
@@ -129,6 +131,8 @@ def build_router(
         currency=settings.wallet_currency,
         referral_deposit_commission_rate=settings.referral_deposit_commission_rate,
         referral_agent_enabled=settings.referral_agent_enabled,
+        payout_freeze_enabled=settings.payout_freeze_enabled,
+        payout_freeze_hours=settings.payout_freeze_hours,
     )
     permission_service = PermissionService(database, settings)
     settlement_service = SettlementService(
@@ -309,6 +313,10 @@ def build_router(
     async def futures_market(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback, "加载中...")
         lang = await _callback_lang(callback, database, settings)
+        risk = await database.get_user_risk_status(callback.from_user.id)
+        if _risk_blocks(risk, "bet"):
+            await callback.message.answer("账户当前被限制下注，请联系管理员。")
+            return
         parts = callback.data.split(":")
         market_key = parts[2]
         page = int(parts[4]) if len(parts) >= 5 and parts[3] == "page" else 0
@@ -508,6 +516,10 @@ def build_router(
         await _safe_callback_answer(callback, "加载中...")
         if not callback.from_user:
             await callback.message.answer("请先打开机器人后再提交投注。")
+            return
+        risk = await database.get_user_risk_status(callback.from_user.id)
+        if _risk_blocks(risk, "bet"):
+            await callback.message.answer("账户当前被限制下注，请联系管理员。")
             return
         parts = callback.data.split(":")
         fixture_id = int(parts[1])
@@ -982,6 +994,9 @@ def build_router(
         await _safe_callback_answer(callback)
         if not callback.from_user:
             return
+        if not settings.user_cancel_after_confirm_enabled:
+            await callback.message.answer("注单已确认，无法自行取消。如需处理，请联系管理员。")
+            return
         bet_key = callback.data.split(":", 1)[1]
         bet = await database.get_user_bet(callback.from_user.id, bet_key)
         if not bet or bet.get("status") != "pending":
@@ -1387,7 +1402,7 @@ def build_router(
         if not order:
             await message.answer("订单不存在。")
             return
-        if str(order.get("status")) not in {"manual_review", "pending", "failed"}:
+        if str(order.get("status")) not in {"manual_review", "pending", "failed", "rejected"}:
             await message.answer("该订单状态不允许人工标记到账。")
             return
         paid = await wallet_service.credit_deposit(
@@ -1395,6 +1410,7 @@ def build_router(
             order,
             {
                 "actual_amount": amount,
+                "trade_id": txid,
                 "chain_tx_id": txid,
                 "txid": txid,
                 "manual_review_note": reason,
@@ -1452,6 +1468,7 @@ def build_router(
         if not await permission_service.is_super_admin(message.from_user.id):
             await message.answer("只有超级管理员可以调账。")
             return
+        await state.clear()
         parts = (command.args or "").strip().split(maxsplit=2)
         if len(parts) < 3:
             await state.clear()
@@ -1466,7 +1483,12 @@ def build_router(
         except Exception:
             await message.answer("用法：/admin_adjust_balance <telegram_user_id> <amount> <reason>")
             return
-        ledger = await wallet_service.manual_adjust(target_user_id, amount, parts[2], message.from_user.id)
+        try:
+            ledger = await wallet_service.manual_adjust(target_user_id, amount, parts[2], message.from_user.id)
+        except ValueError:
+            await state.clear()
+            await message.answer("余额不足，不能扣成负数。")
+            return
         await database.add_admin_audit_log(
             message.from_user.id,
             "admin_adjust_balance",
@@ -1571,6 +1593,37 @@ def build_router(
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
+        bet_key = (command.args or "").strip().split(maxsplit=1)[0] if (command.args or "").strip() else ""
+        if not bet_key:
+            await message.answer("用法：/admin_bet <bet_no_or_id>")
+            return
+        await message.answer(_format_admin_bet(await database.get_bet(bet_key)))
+        return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        bet_key = parts[0] if parts else ""
+        note = parts[1] if len(parts) > 1 else None
+        if not bet_key:
+            await message.answer(f"用法：/{action} <bet_no_or_id>")
+            return
+        bet = await database.get_bet(bet_key)
+        if not bet:
+            await message.answer("未找到该注单，请检查注单号。")
+            return
+        bet_id = int(bet["id"])
+        try:
+            result = await wallet_service.settle_bet(bet_id, message.from_user.id, status, note=note)
+        except ValueError as exc:
+            await message.answer(f"结算失败：{exc}")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            action,
+            "bet",
+            str(bet.get("bet_no") or bet_id),
+            {"status": status, "settled": bool(result), "note": note},
+        )
+        await message.answer(f"注单已开奖：{status}" if result else "注单不存在、已开奖或状态不允许。")
+        return
         bet_id = _first_int_arg(command)
         if bet_id is None:
             await message.answer("用法：/admin_bet <bet_id>")
@@ -1578,6 +1631,34 @@ def build_router(
         await message.answer(_format_admin_bet(await database.get_bet(bet_id)))
 
     async def _admin_settle_bet(message: Message, command: CommandObject, status: str, action: str) -> None:
+        parts = (command.args or "").strip().split(maxsplit=1)
+        bet_key = parts[0] if parts else ""
+        note = parts[1] if len(parts) > 1 else None
+        if not bet_key:
+            await message.answer(f"用法：/{action} <bet_no_or_id>")
+            return
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        bet = await database.get_bet(bet_key)
+        if not bet:
+            await message.answer("未找到该注单，请检查注单号。")
+            return
+        bet_id = int(bet["id"])
+        try:
+            result = await wallet_service.settle_bet(bet_id, message.from_user.id, status, note=note)
+        except ValueError as exc:
+            await message.answer(f"结算失败：{exc}")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            action,
+            "bet",
+            str(bet.get("bet_no") or bet_id),
+            {"status": status, "settled": bool(result), "note": note},
+        )
+        await message.answer(f"注单已开奖：{status}" if result else "注单不存在、已开奖或状态不允许。")
+        return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1858,6 +1939,187 @@ def build_router(
             await database.set_user_role(int(row["user_id"]), "agent", message.from_user.id)
         await database.add_admin_audit_log(message.from_user.id, f"admin_{status}_agent", "agent_application", str(application_id), {"reviewed": bool(row)})
         await message.answer("代理申请已处理。" if row else "申请不存在或已处理。")
+
+    @router.message(Command("admin_rebate_requests"))
+    async def admin_rebate_requests(message: Message) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        await message.answer(_format_rebate_requests(await database.list_rebate_requests(None, 50)))
+
+    @router.message(Command("admin_rebate_request"))
+    async def admin_rebate_request(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        request_id = _first_int_arg(command)
+        if request_id is None:
+            await message.answer("用法：/admin_rebate_request <request_id>")
+            return
+        await message.answer(_format_rebate_requests([await database.get_rebate_request(request_id)]))
+
+    @router.message(Command("admin_approve_rebate_request"))
+    async def admin_approve_rebate_request(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=2)
+        if len(parts) != 3:
+            await message.answer("用法：/admin_approve_rebate_request <request_id> <amount> <reason>")
+            return
+        row = await database.update_rebate_request_status(int(parts[0]), "approved", approved_amount=Decimal(parts[1]), reason=parts[2])
+        await database.add_admin_audit_log(message.from_user.id, "admin_approve_rebate_request", "rebate_request", parts[0], {"approved": bool(row), "amount": parts[1], "reason": parts[2]})
+        await message.answer("返水申请已批准。" if row else "返水申请不存在或状态不允许。")
+
+    @router.message(Command("admin_reject_rebate_request"))
+    async def admin_reject_rebate_request(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_reject_rebate_request <request_id> <reason>")
+            return
+        row = await database.update_rebate_request_status(int(parts[0]), "rejected", reason=parts[1])
+        await database.add_admin_audit_log(message.from_user.id, "admin_reject_rebate_request", "rebate_request", parts[0], {"rejected": bool(row), "reason": parts[1]})
+        await message.answer("返水申请已拒绝。" if row else "返水申请不存在或状态不允许。")
+
+    @router.message(Command("admin_pay_rebate_request"))
+    async def admin_pay_rebate_request(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        request_id = _first_int_arg(command)
+        if request_id is None:
+            await message.answer("用法：/admin_pay_rebate_request <request_id>")
+            return
+        request = await database.get_rebate_request(request_id)
+        if not request or request.get("status") != "approved":
+            await message.answer("返水申请不存在或未批准。")
+            return
+        amount = Decimal(str(request.get("approved_amount") or request.get("requested_amount") or 0))
+        if amount <= 0:
+            await message.answer("批准金额无效。")
+            return
+        ledger = await wallet_service.add_ledger_entry(int(request["user_id"]), "rebate", amount, ref_type="rebate_request", ref_id=str(request_id), description="Admin rebate request payout")
+        row = await database.mark_rebate_request_paid(request_id)
+        await database.add_admin_audit_log(message.from_user.id, "admin_pay_rebate_request", "rebate_request", str(request_id), {"paid": bool(row), "amount": str(amount), "ledger_id": ledger["id"]})
+        await message.answer("返水已派发到账。" if row else "返水派发状态更新失败。")
+
+    @router.message(Command("admin_payout_freezes"))
+    async def admin_payout_freezes(message: Message) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        await message.answer(_format_payout_freezes(await database.list_payout_freezes("frozen", 50), settings.wallet_currency))
+
+    @router.message(Command("admin_unlock_payout"))
+    async def admin_unlock_payout(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_unlock_payout <freeze_id> <reason>")
+            return
+        row = await wallet_service.unlock_payout_freeze(int(parts[0]), reason=parts[1])
+        await database.add_admin_audit_log(message.from_user.id, "admin_unlock_payout", "payout_freeze", parts[0], {"unlocked": bool(row), "reason": parts[1]})
+        await message.answer("派彩冻结已解冻。" if row else "派彩冻结不存在或状态不允许。")
+
+    @router.message(Command("admin_extend_payout_freeze"))
+    async def admin_extend_payout_freeze(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=2)
+        if len(parts) != 3:
+            await message.answer("用法：/admin_extend_payout_freeze <freeze_id> <hours> <reason>")
+            return
+        row = await wallet_service.extend_payout_freeze(int(parts[0]), int(parts[1]), parts[2])
+        await database.add_admin_audit_log(message.from_user.id, "admin_extend_payout_freeze", "payout_freeze", parts[0], {"extended": bool(row), "hours": parts[1], "reason": parts[2]})
+        await message.answer("派彩冻结已延期。" if row else "派彩冻结不存在或状态不允许。")
+
+    @router.message(Command("admin_freeze_balance"))
+    async def admin_freeze_balance(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可冻结余额。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=2)
+        if len(parts) != 3:
+            await message.answer("用法：/admin_freeze_balance <telegram_user_id> <amount> <reason>")
+            return
+        row = await wallet_service.freeze_balance(int(parts[0]), Decimal(parts[1]), parts[2], message.from_user.id)
+        await database.add_admin_audit_log(message.from_user.id, "admin_freeze_balance", "wallet", parts[0], {"frozen": bool(row), "amount": parts[1], "reason": parts[2]})
+        await message.answer(f"余额冻结完成，freeze_id={row['id']}。" if row else "余额不足，无法冻结。")
+
+    @router.message(Command("admin_unfreeze_balance"))
+    async def admin_unfreeze_balance(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可解冻余额。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_unfreeze_balance <freeze_id> <reason>")
+            return
+        row = await wallet_service.unfreeze_balance(int(parts[0]), parts[1])
+        await database.add_admin_audit_log(message.from_user.id, "admin_unfreeze_balance", "wallet_freeze", parts[0], {"unfrozen": bool(row), "reason": parts[1]})
+        await message.answer("余额已解冻。" if row else "冻结记录不存在或状态不允许。")
+
+    @router.message(Command("admin_user_freezes"))
+    async def admin_user_freezes(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        user_id = _first_int_arg(command)
+        if user_id is None:
+            await message.answer("用法：/admin_user_freezes <telegram_user_id>")
+            return
+        await message.answer(_format_wallet_freezes(await database.list_wallet_freezes(user_id), settings.wallet_currency))
+
+    async def _risk_command(message: Message, command: CommandObject, action: str, **updates: Any) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可操作风控。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if not parts:
+            await message.answer(f"用法：/{action} <telegram_user_id> [reason]")
+            return
+        reason = parts[1] if len(parts) > 1 else None
+        row = await database.update_user_risk_status(int(parts[0]), ban_reason=reason, risk_note=reason, **updates)
+        await database.add_admin_audit_log(message.from_user.id, action, "user", parts[0], {"updated": bool(row), "reason": reason, **updates})
+        await message.answer("用户风控状态已更新。" if row else "用户不存在。")
+
+    @router.message(Command("admin_ban_user"))
+    async def admin_ban_user(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_ban_user", status="banned", bet_restricted=True, withdraw_restricted=True)
+
+    @router.message(Command("admin_unban_user"))
+    async def admin_unban_user(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_unban_user", status="active", bet_restricted=False, withdraw_restricted=False)
+
+    @router.message(Command("admin_freeze_user"))
+    async def admin_freeze_user(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_freeze_user", status="frozen", bet_restricted=True, withdraw_restricted=True)
+
+    @router.message(Command("admin_unfreeze_user"))
+    async def admin_unfreeze_user(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_unfreeze_user", status="active", bet_restricted=False, withdraw_restricted=False)
+
+    @router.message(Command("admin_restrict_bet"))
+    async def admin_restrict_bet(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_restrict_bet", bet_restricted=True)
+
+    @router.message(Command("admin_unrestrict_bet"))
+    async def admin_unrestrict_bet(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_unrestrict_bet", bet_restricted=False)
+
+    @router.message(Command("admin_restrict_withdraw"))
+    async def admin_restrict_withdraw(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_restrict_withdraw", withdraw_restricted=True)
+
+    @router.message(Command("admin_unrestrict_withdraw"))
+    async def admin_unrestrict_withdraw(message: Message, command: CommandObject) -> None:
+        await _risk_command(message, command, "admin_unrestrict_withdraw", withdraw_restricted=False)
 
     @router.callback_query(F.data.in_({
         "admin:stats",
@@ -2482,9 +2744,24 @@ async def _create_recharge_order(
         )
     except Exception as exc:
         raw_response = _gmpay_create_failure_response(exc)
-        await database.fail_deposit_order(order_id, raw_response)
+        await database.fail_deposit_order(order_id, raw_response, error_message="create transaction failed")
         logger.warning("gmpay create transaction failed order_id=%s", order_id, exc_info=True)
         await message.answer("充值订单创建失败，请稍后再试。")
+        return
+    original_payment_url = transaction.payment_url
+    final_payment_url = _build_safe_gmpay_cashier_url(
+        original_payment_url,
+        transaction.trade_id,
+        settings.gmpay_public_cashier_base_url,
+    )
+    if not final_payment_url:
+        await database.fail_deposit_order(
+            order_id,
+            transaction.raw_json,
+            error_message="invalid payment url",
+            payment_url_check_status="invalid",
+        )
+        await message.answer("支付页面暂时不可用，请联系管理员。")
         return
     order = await database.update_deposit_order_transaction(
         order_id,
@@ -2492,7 +2769,10 @@ async def _create_recharge_order(
         actual_amount=transaction.actual_amount,
         token=transaction.token,
         network=transaction.network,
-        payment_url=transaction.payment_url,
+        payment_url=final_payment_url,
+        original_payment_url=original_payment_url,
+        final_payment_url=final_payment_url,
+        payment_url_check_status="passed",
         expires_at=transaction.expires_at,
         raw_response=transaction.raw_json,
     ) or order
@@ -2512,6 +2792,46 @@ def _gmpay_create_failure_response(exc: Exception) -> dict[str, Any]:
             except json.JSONDecodeError:
                 response["response_body"] = exc.response_body
     return response
+
+
+def _build_safe_gmpay_cashier_url(original_url: str, trade_id: str | None, public_cashier_base_url: str) -> str | None:
+    source = urlparse(str(original_url or ""))
+    detected_trade_id = (trade_id or "").strip()
+    prefix = "/pay/checkout-counter/"
+    if source.path.startswith(prefix):
+        detected_trade_id = source.path[len(prefix) :].strip("/").split("/", 1)[0] or detected_trade_id
+    if not detected_trade_id:
+        detected_trade_id = parse_qs(source.query).get("trade_id", [""])[0].strip()
+    base = urlparse(public_cashier_base_url)
+    if base.scheme != "https" or base.netloc != "pay.hosea.cc.cd":
+        return None
+    if not detected_trade_id or "/" in detected_trade_id or "\\" in detected_trade_id:
+        return None
+    final = f"{base.scheme}://{base.netloc}/cashier/{detected_trade_id}?t={int(time())}"
+    return final if _safe_final_payment_url(final) else None
+
+
+def _safe_final_payment_url(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme != "https" or parsed.netloc != "pay.hosea.cc.cd":
+        return False
+    if parsed.path == "/" or not parsed.path.startswith("/cashier/"):
+        return False
+    lowered = value.lower()
+    return not any(token in lowered for token in ("login", "admin", "dashboard", "panel", "backend"))
+
+
+def _risk_blocks(risk: dict | None, action: str) -> bool:
+    status = str((risk or {}).get("status") or "active")
+    if status == "banned":
+        return action in {"bet", "withdraw", "deposit", "rebate"}
+    if status == "frozen":
+        return action in {"bet", "withdraw"}
+    if action == "bet" and bool((risk or {}).get("bet_restricted")):
+        return True
+    if action == "withdraw" and bool((risk or {}).get("withdraw_restricted")):
+        return True
+    return False
 
 
 def _wallet_keyboard() -> InlineKeyboardMarkup:
@@ -2765,6 +3085,44 @@ def _format_deposit_order(order: dict, currency: str) -> str:
     )
 
 
+def _format_rebate_requests(rows: list[dict | None]) -> str:
+    clean = [row for row in rows if row]
+    if not clean:
+        return "暂无返水申请。"
+    lines = ["待处理返水申请"]
+    for row in clean:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} turnover={_money(row.get('turnover'))} "
+            f"active_referrals={row.get('active_referrals') or 0} requested={_money(row.get('requested_amount'))} "
+            f"status={row.get('status')} note={row.get('note') or '-'} created_at={row.get('created_at')}"
+        )
+    return "\n".join(lines)
+
+
+def _format_payout_freezes(rows: list[dict], currency: str) -> str:
+    if not rows:
+        return "暂无冻结派彩。"
+    lines = ["冻结派彩"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} bet={row.get('bet_id') or '-'} "
+            f"amount={_money(row.get('amount'))} {currency} status={row.get('status')} unlock_at={row.get('unlock_at')}"
+        )
+    return "\n".join(lines)
+
+
+def _format_wallet_freezes(rows: list[dict], currency: str) -> str:
+    if not rows:
+        return "暂无余额冻结记录。"
+    lines = ["余额冻结记录"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} user={row.get('user_id')} amount={_money(row.get('amount'))} {currency} "
+            f"type={row.get('freeze_type')} status={row.get('status')} reason={row.get('reason') or '-'}"
+        )
+    return "\n".join(lines)
+
+
 def _deposit_status_hint(status: str) -> str:
     normalized = status.lower()
     if normalized == "pending":
@@ -2803,6 +3161,21 @@ def _format_admin_deposit_order(order: dict | None) -> str:
         f"raw_callback_json={_short_json(order.get('raw_callback_json'))}\n"
         f"created_at={order.get('created_at')}\n"
         f"paid_at={order.get('paid_at') or '-'}"
+    )
+
+
+def _format_deposit_order(order: dict, currency: str) -> str:
+    status = str(order.get("status") or "")
+    return (
+        "充值订单已创建\n\n"
+        f"订单号：{order.get('order_id')}\n"
+        f"状态：{status}\n"
+        f"金额：{_money(order.get('amount_requested'))} {currency}\n"
+        f"实际需支付：{_money(order.get('actual_amount') or order.get('amount_requested'))} {currency}\n\n"
+        "请点击下方按钮打开收银台完成支付。\n"
+        "请以收银台页面显示的链、地址和实际金额为准。\n\n"
+        "如果页面异常，请点击右上角选择在浏览器打开，不要点击页面内返回首页。\n\n"
+        f"{_deposit_status_hint(status)}"
     )
 
 
@@ -3446,6 +3819,45 @@ def _log_api_failure(key: str, message: str, *args: Any) -> None:
         return
     _api_failure_log_times[key] = now
     logger.warning(message, *args)
+
+
+# M12 payment safety overrides: only expose the vetted public cashier URL.
+def _deposit_order_keyboard(order: dict | None) -> InlineKeyboardMarkup:
+    rows = []
+    if order:
+        payment_url = str(order.get("final_payment_url") or order.get("payment_url") or "")
+        if payment_url and _safe_final_payment_url(payment_url):
+            rows.append([InlineKeyboardButton(text="打开收银台", url=payment_url)])
+        rows.append([InlineKeyboardButton(text="刷新充值状态", callback_data=f"deposit:refresh:{order['order_id']}")])
+    rows.append([InlineKeyboardButton(text="返回钱包", callback_data="wallet")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_admin_deposit_order(order: dict | None) -> str:
+    if not order:
+        return "订单不存在。"
+    return (
+        "充值订单详情\n\n"
+        f"order_id={order.get('order_id')}\n"
+        f"user_id={order.get('user_id')}\n"
+        f"amount_requested={_money(order.get('amount_requested'))}\n"
+        f"actual_amount={_money(order.get('actual_amount'))}\n"
+        f"status={order.get('status')}\n"
+        f"manual_review_required={order.get('manual_review_required')}\n"
+        f"manual_review_note={order.get('manual_review_note') or '-'}\n"
+        f"error_message={order.get('error_message') or '-'}\n"
+        f"trade_id={order.get('trade_id') or '-'}\n"
+        f"chain_tx_id={order.get('chain_tx_id') or '-'}\n"
+        f"network={order.get('network') or '-'}\n"
+        f"payment_url={order.get('payment_url') or '-'}\n"
+        f"original_payment_url={order.get('original_payment_url') or '-'}\n"
+        f"final_payment_url={order.get('final_payment_url') or '-'}\n"
+        f"payment_url_check_status={order.get('payment_url_check_status') or '-'}\n"
+        f"raw_response_json={_short_json(order.get('raw_response_json'))}\n"
+        f"raw_callback_json={_short_json(order.get('raw_callback_json'))}\n"
+        f"created_at={order.get('created_at')}\n"
+        f"paid_at={order.get('paid_at') or '-'}"
+    )
 
 
 def _format_bet_placeholder(fixture: dict[str, Any], selection: str, odds: str) -> str:

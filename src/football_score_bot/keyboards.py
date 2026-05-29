@@ -484,3 +484,34 @@ def bet_detail_keyboard(
         rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="查看开奖", callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text="联系客服", callback_data="support")],
+            [InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text="返回首页", callback_data="home")],
+        ]
+    )
+
+
+def bet_detail_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
+        rows.append([InlineKeyboardButton(text="联系客服", callback_data="support")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

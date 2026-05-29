@@ -39,6 +39,7 @@ class Settings:
     gmpay_sign_type: str
     gmpay_notify_url: str
     gmpay_redirect_url: str | None
+    gmpay_public_cashier_base_url: str
     gmpay_default_currency: str
     gmpay_default_token: str
     gmpay_default_network: str
@@ -60,6 +61,10 @@ class Settings:
     withdraw_enabled: bool
     real_betting_enabled: bool
     bet_require_balance_for_simulation: bool
+    user_cancel_after_confirm_enabled: bool
+    admin_cancel_before_start_minutes: int
+    payout_freeze_hours: int
+    payout_freeze_enabled: bool
     bet_settlement_admin_only: bool
     bet_auto_settlement_enabled: bool
     bet_settlement_interval_seconds: int
@@ -143,6 +148,10 @@ def load_settings() -> Settings:
         gmpay_sign_type=os.getenv("GMPAY_SIGN_TYPE", "md5").lower(),
         gmpay_notify_url=os.getenv("GMPAY_NOTIFY_URL", ""),
         gmpay_redirect_url=os.getenv("GMPAY_REDIRECT_URL") or None,
+        gmpay_public_cashier_base_url=os.getenv(
+            "GMPAY_PUBLIC_CASHIER_BASE_URL",
+            "https://pay.hosea.cc.cd",
+        ).rstrip("/"),
         gmpay_default_currency=os.getenv("GMPAY_DEFAULT_CURRENCY", "cny"),
         gmpay_default_token=os.getenv("GMPAY_DEFAULT_TOKEN", "usdt"),
         gmpay_default_network=os.getenv("GMPAY_DEFAULT_NETWORK", "tron"),
@@ -164,6 +173,10 @@ def load_settings() -> Settings:
         withdraw_enabled=_parse_bool(os.getenv("WITHDRAW_ENABLED", "false")),
         real_betting_enabled=_parse_bool(os.getenv("REAL_BETTING_ENABLED", "false")),
         bet_require_balance_for_simulation=_parse_bool(os.getenv("BET_REQUIRE_BALANCE_FOR_SIMULATION", "true")),
+        user_cancel_after_confirm_enabled=_parse_bool(os.getenv("USER_CANCEL_AFTER_CONFIRM_ENABLED", "false")),
+        admin_cancel_before_start_minutes=int(os.getenv("ADMIN_CANCEL_BEFORE_START_MINUTES", "5")),
+        payout_freeze_hours=max(0, int(os.getenv("PAYOUT_FREEZE_HOURS", "24"))),
+        payout_freeze_enabled=_parse_bool(os.getenv("PAYOUT_FREEZE_ENABLED", "true")),
         bet_settlement_admin_only=_parse_bool(os.getenv("BET_SETTLEMENT_ADMIN_ONLY", "false")),
         bet_auto_settlement_enabled=_parse_bool(os.getenv("BET_AUTO_SETTLEMENT_ENABLED", "true")),
         bet_settlement_interval_seconds=max(10, int(os.getenv("BET_SETTLEMENT_INTERVAL_SECONDS", "60"))),

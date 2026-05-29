@@ -14,6 +14,7 @@ from football_score_bot.database import Database
 from football_score_bot.handlers import build_router
 from football_score_bot.workers.score_cache_worker import ScoreCacheWorker
 from football_score_bot.workers.settlement_worker import SettlementWorker
+from football_score_bot.workers.payout_unlock_worker import PayoutUnlockWorker
 
 
 async def main() -> None:
@@ -52,6 +53,8 @@ async def main() -> None:
         bot_username=bot_info.username,
     )
     settlement_worker_task = asyncio.create_task(settlement_worker.run())
+    payout_unlock_worker = PayoutUnlockWorker(database, settings, bot=bot)
+    payout_unlock_worker_task = asyncio.create_task(payout_unlock_worker.run())
 
     try:
         await setup_bot_commands(bot)
@@ -59,8 +62,10 @@ async def main() -> None:
     finally:
         worker.stop()
         settlement_worker.stop()
+        payout_unlock_worker.stop()
         await worker_task
         await settlement_worker_task
+        await payout_unlock_worker_task
         await api_client.close()
         await database.close()
         await redis.aclose()

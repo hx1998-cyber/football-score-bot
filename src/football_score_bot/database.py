@@ -90,6 +90,11 @@ class Database:
             """
         )
         for statement in (
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS bet_restricted BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS withdraw_restricted BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_reason TEXT",
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS risk_note TEXT",
             "ALTER TABLE wallets ADD COLUMN IF NOT EXISTS telegram_user_id BIGINT",
             "ALTER TABLE wallets ADD COLUMN IF NOT EXISTS user_id BIGINT",
             "ALTER TABLE wallets ADD COLUMN IF NOT EXISTS balance NUMERIC(18, 6) NOT NULL DEFAULT 0",
@@ -145,6 +150,9 @@ class Database:
             "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS error_message TEXT",
             "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS manual_review_required BOOLEAN NOT NULL DEFAULT FALSE",
             "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS manual_review_note TEXT",
+            "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS original_payment_url TEXT",
+            "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS final_payment_url TEXT",
+            "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS payment_url_check_status TEXT",
         ):
             await self._pool.execute(statement)
         await self._pool.execute(
@@ -245,6 +253,37 @@ class Database:
             await self._pool.execute(statement)
         await self._pool.execute(
             """
+            CREATE TABLE IF NOT EXISTS payout_freezes (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                bet_id BIGINT,
+                amount NUMERIC(18, 6) NOT NULL,
+                status TEXT NOT NULL DEFAULT 'frozen',
+                unlock_at TIMESTAMPTZ NOT NULL,
+                unlocked_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                note TEXT
+            )
+            """
+        )
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS wallet_freezes (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                amount NUMERIC(18, 6) NOT NULL,
+                freeze_type TEXT NOT NULL DEFAULT 'admin',
+                status TEXT NOT NULL DEFAULT 'frozen',
+                reason TEXT,
+                created_by_admin_id BIGINT,
+                unlock_at TIMESTAMPTZ,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                unlocked_at TIMESTAMPTZ
+            )
+            """
+        )
+        await self._pool.execute(
+            """
             CREATE TABLE IF NOT EXISTS rebate_rules (
                 id BIGSERIAL PRIMARY KEY,
                 name TEXT NOT NULL,
@@ -307,6 +346,12 @@ class Database:
             )
             """
         )
+        for statement in (
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS approved_amount NUMERIC(18, 6)",
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS review_reason TEXT",
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
+        ):
+            await self._pool.execute(statement)
 
     async def _ensure_betting_schema(self) -> None:
         await self._pool.execute(
@@ -830,6 +875,8 @@ class Database:
             "SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout FROM bets WHERE id = $1",
             int(bet_id),
         )
+        if not row and isinstance(bet_id, str):
+            return await self.get_bet_by_no(bet_id)
         return dict(row) if row else None
 
     async def get_bet_by_no(self, bet_no: str) -> dict | None:
@@ -1033,6 +1080,9 @@ class Database:
         token: str,
         network: str | None = None,
         payment_url: str,
+        original_payment_url: str | None = None,
+        final_payment_url: str | None = None,
+        payment_url_check_status: str | None = None,
         expires_at: Any,
         raw_response: dict[str, Any],
     ) -> dict | None:
@@ -1047,6 +1097,9 @@ class Database:
                 expires_at = $6,
                 network = COALESCE($7, network),
                 raw_response_json = $8::jsonb,
+                original_payment_url = $9,
+                final_payment_url = $10,
+                payment_url_check_status = $11,
                 updated_at = NOW()
             WHERE order_id = $1
             RETURNING *
@@ -1059,14 +1112,26 @@ class Database:
             expires_at,
             network,
             json.dumps(raw_response),
+            original_payment_url or payment_url,
+            final_payment_url or payment_url,
+            payment_url_check_status,
         )
         return dict(row) if row else None
 
-    async def fail_deposit_order(self, order_id: str, raw_response: dict[str, Any]) -> dict | None:
+    async def fail_deposit_order(
+        self,
+        order_id: str,
+        raw_response: dict[str, Any],
+        *,
+        error_message: str | None = None,
+        payment_url_check_status: str | None = None,
+    ) -> dict | None:
         row = await self._pool.fetchrow(
             """
             UPDATE deposit_orders
             SET status = 'failed',
+                error_message = COALESCE($3, error_message),
+                payment_url_check_status = COALESCE($4, payment_url_check_status),
                 raw_response_json = $2::jsonb,
                 updated_at = NOW()
             WHERE order_id = $1 AND status = 'pending'
@@ -1074,6 +1139,8 @@ class Database:
             """,
             order_id,
             json.dumps(raw_response),
+            error_message,
+            payment_url_check_status,
         )
         return dict(row) if row else None
 
@@ -1551,6 +1618,107 @@ class Database:
                 user_id,
                 limit,
             )
+        return [dict(row) for row in rows]
+
+    async def get_rebate_request(self, request_id: int) -> dict | None:
+        row = await self._pool.fetchrow("SELECT * FROM rebate_requests WHERE id = $1", request_id)
+        return dict(row) if row else None
+
+    async def update_rebate_request_status(
+        self,
+        request_id: int,
+        status: str,
+        *,
+        approved_amount: Decimal | None = None,
+        reason: str | None = None,
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE rebate_requests
+            SET status = $2,
+                approved_amount = COALESCE($3, approved_amount),
+                review_reason = COALESCE($4, review_reason),
+                reviewed_at = NOW()
+            WHERE id = $1
+              AND status = ANY($5::TEXT[])
+            RETURNING *
+            """,
+            request_id,
+            status,
+            approved_amount,
+            reason,
+            ["pending"] if status in {"approved", "rejected"} else ["approved"],
+        )
+        return dict(row) if row else None
+
+    async def mark_rebate_request_paid(self, request_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE rebate_requests
+            SET status = 'paid', paid_at = NOW()
+            WHERE id = $1 AND status = 'approved'
+            RETURNING *
+            """,
+            request_id,
+        )
+        return dict(row) if row else None
+
+    async def update_user_risk_status(
+        self,
+        user_id: int,
+        *,
+        status: str | None = None,
+        bet_restricted: bool | None = None,
+        withdraw_restricted: bool | None = None,
+        ban_reason: str | None = None,
+        risk_note: str | None = None,
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE users
+            SET status = COALESCE($2, status),
+                bet_restricted = COALESCE($3, bet_restricted),
+                withdraw_restricted = COALESCE($4, withdraw_restricted),
+                ban_reason = COALESCE($5, ban_reason),
+                risk_note = COALESCE($6, risk_note),
+                updated_at = NOW()
+            WHERE telegram_user_id = $1
+            RETURNING *
+            """,
+            user_id,
+            status,
+            bet_restricted,
+            withdraw_restricted,
+            ban_reason,
+            risk_note,
+        )
+        return dict(row) if row else None
+
+    async def get_user_risk_status(self, user_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT telegram_user_id, status, bet_restricted, withdraw_restricted, ban_reason, risk_note
+            FROM users
+            WHERE telegram_user_id = $1
+            """,
+            user_id,
+        )
+        return dict(row) if row else None
+
+    async def list_payout_freezes(self, status: str = "frozen", limit: int = 50) -> list[dict]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM payout_freezes WHERE status = $1 ORDER BY unlock_at, id LIMIT $2",
+            status,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_wallet_freezes(self, user_id: int, limit: int = 50) -> list[dict]:
+        rows = await self._pool.fetch(
+            "SELECT * FROM wallet_freezes WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
+            user_id,
+            limit,
+        )
         return [dict(row) for row in rows]
 
     async def close(self) -> None:

@@ -4,6 +4,7 @@ import json
 import random
 import string
 import time
+from datetime import timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -18,11 +19,15 @@ class WalletService:
         currency: str = "USDT",
         referral_deposit_commission_rate: Decimal = Decimal("0.00"),
         referral_agent_enabled: bool = True,
+        payout_freeze_enabled: bool = True,
+        payout_freeze_hours: int = 24,
     ) -> None:
         self._database = database
         self._currency = currency
         self._commission_rate = referral_deposit_commission_rate
         self._referral_agent_enabled = referral_agent_enabled
+        self._payout_freeze_enabled = payout_freeze_enabled
+        self._payout_freeze_hours = payout_freeze_hours
 
     async def get_or_create_wallet(self, user_id: int) -> dict:
         async with self._database.pool.acquire() as conn:
@@ -528,9 +533,17 @@ class WalletService:
                 if bool(bet["balance_frozen"]) and frozen_before < stake:
                     raise ValueError("insufficient frozen balance")
                 frozen_after = frozen_before - stake if bet["balance_frozen"] else frozen_before
+                payout_to_balance = Decimal("0")
+                payout_to_frozen = Decimal("0")
                 if outcome == "won":
-                    balance_delta = payout
-                    ledger_type = "bet_win_payout"
+                    if self._payout_freeze_enabled:
+                        balance_delta = Decimal("0")
+                        payout_to_frozen = payout
+                        ledger_type = "bet_win_payout_frozen"
+                    else:
+                        balance_delta = payout
+                        payout_to_balance = payout
+                        ledger_type = "bet_win_payout"
                 elif outcome == "lost":
                     balance_delta = Decimal("0")
                     ledger_type = "bet_loss"
@@ -538,6 +551,7 @@ class WalletService:
                     balance_delta = stake if bet["balance_frozen"] else Decimal("0")
                     ledger_type = "bet_cancel_refund" if outcome == "cancelled" else "bet_void_refund"
                 balance_after = balance_before + balance_delta
+                frozen_after = frozen_after + payout_to_frozen
                 await conn.execute(
                     """
                     UPDATE wallets
@@ -549,7 +563,7 @@ class WalletService:
                     balance_after,
                     frozen_after,
                 )
-                amount = balance_delta if outcome != "lost" else Decimal("0")
+                amount = payout if outcome == "won" else balance_delta if outcome != "lost" else Decimal("0")
                 await conn.execute(
                     """
                     INSERT INTO wallet_ledger (
@@ -569,6 +583,18 @@ class WalletService:
                     str(bet_id),
                     f"Admin bet settlement: {outcome}",
                 )
+                if outcome == "won" and payout_to_frozen > 0:
+                    await conn.execute(
+                        """
+                        INSERT INTO payout_freezes (user_id, bet_id, amount, status, unlock_at, note)
+                        VALUES ($1, $2, $3, 'frozen', NOW() + $4::INTERVAL, $5)
+                        """,
+                        user_id,
+                        bet_id,
+                        payout_to_frozen,
+                        f"{self._payout_freeze_hours} hours",
+                        "Bet win payout freeze",
+                    )
                 await conn.execute(
                     """
                     UPDATE bets
@@ -606,6 +632,168 @@ class WalletService:
                     source,
                 )
                 return {"bet_id": bet_id, "user_id": user_id, "status": outcome, "balance_after": balance_after}
+
+    async def unlock_payout_freeze(self, freeze_id: int, *, reason: str = "manual unlock") -> dict | None:
+        async with self._database.pool.acquire() as conn:
+            async with conn.transaction():
+                freeze = await conn.fetchrow("SELECT * FROM payout_freezes WHERE id = $1 FOR UPDATE", freeze_id)
+                if not freeze or freeze["status"] not in {"frozen", "extended"}:
+                    return None
+                user_id = int(freeze["user_id"])
+                amount = Decimal(str(freeze["amount"]))
+                wallet = await self._locked_wallet(conn, user_id)
+                balance_before = Decimal(str(wallet["balance"]))
+                frozen_before = Decimal(str(wallet["frozen_balance"]))
+                if frozen_before < amount:
+                    raise ValueError("insufficient frozen balance")
+                balance_after = balance_before + amount
+                frozen_after = frozen_before - amount
+                await conn.execute(
+                    "UPDATE wallets SET balance = $3, frozen_balance = $4, updated_at = NOW() WHERE user_id = $1 AND currency = $2",
+                    user_id,
+                    self._currency,
+                    balance_after,
+                    frozen_after,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO wallet_ledger (
+                        user_id, currency, type, amount, balance_before, balance_after,
+                        frozen_before, frozen_after, ref_type, ref_id, description
+                    )
+                    VALUES ($1, $2, 'payout_unfreeze', $3, $4, $5, $6, $7, 'payout_freeze', $8, $9)
+                    """,
+                    user_id,
+                    self._currency,
+                    amount,
+                    balance_before,
+                    balance_after,
+                    frozen_before,
+                    frozen_after,
+                    str(freeze_id),
+                    reason,
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE payout_freezes
+                    SET status = 'unlocked', unlocked_at = NOW(), note = COALESCE(note || '; ', '') || $2
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    freeze_id,
+                    reason,
+                )
+                return dict(row) if row else None
+
+    async def extend_payout_freeze(self, freeze_id: int, hours: int, reason: str) -> dict | None:
+        row = await self._database.pool.fetchrow(
+            """
+            UPDATE payout_freezes
+            SET status = 'extended',
+                unlock_at = unlock_at + $2::INTERVAL,
+                note = COALESCE(note || '; ', '') || $3
+            WHERE id = $1 AND status IN ('frozen', 'extended')
+            RETURNING *
+            """,
+            freeze_id,
+            f"{hours} hours",
+            reason,
+        )
+        return dict(row) if row else None
+
+    async def freeze_balance(self, user_id: int, amount: Decimal, reason: str, admin_user_id: int) -> dict | None:
+        async with self._database.pool.acquire() as conn:
+            async with conn.transaction():
+                wallet = await self._locked_wallet(conn, user_id)
+                balance_before = Decimal(str(wallet["balance"]))
+                frozen_before = Decimal(str(wallet["frozen_balance"]))
+                if balance_before < amount:
+                    return None
+                balance_after = balance_before - amount
+                frozen_after = frozen_before + amount
+                await conn.execute(
+                    "UPDATE wallets SET balance = $3, frozen_balance = $4, updated_at = NOW() WHERE user_id = $1 AND currency = $2",
+                    user_id,
+                    self._currency,
+                    balance_after,
+                    frozen_after,
+                )
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO wallet_freezes (user_id, amount, freeze_type, status, reason, created_by_admin_id)
+                    VALUES ($1, $2, 'admin', 'frozen', $3, $4)
+                    RETURNING *
+                    """,
+                    user_id,
+                    amount,
+                    reason,
+                    admin_user_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO wallet_ledger (
+                        user_id, currency, type, amount, balance_before, balance_after,
+                        frozen_before, frozen_after, ref_type, ref_id, description
+                    )
+                    VALUES ($1, $2, 'admin_freeze', $3, $4, $5, $6, $7, 'wallet_freeze', $8, $9)
+                    """,
+                    user_id,
+                    self._currency,
+                    -amount,
+                    balance_before,
+                    balance_after,
+                    frozen_before,
+                    frozen_after,
+                    str(row["id"]),
+                    reason,
+                )
+                return dict(row)
+
+    async def unfreeze_balance(self, freeze_id: int, reason: str) -> dict | None:
+        async with self._database.pool.acquire() as conn:
+            async with conn.transaction():
+                freeze = await conn.fetchrow("SELECT * FROM wallet_freezes WHERE id = $1 FOR UPDATE", freeze_id)
+                if not freeze or freeze["status"] != "frozen":
+                    return None
+                user_id = int(freeze["user_id"])
+                amount = Decimal(str(freeze["amount"]))
+                wallet = await self._locked_wallet(conn, user_id)
+                balance_before = Decimal(str(wallet["balance"]))
+                frozen_before = Decimal(str(wallet["frozen_balance"]))
+                if frozen_before < amount:
+                    raise ValueError("insufficient frozen balance")
+                balance_after = balance_before + amount
+                frozen_after = frozen_before - amount
+                await conn.execute(
+                    "UPDATE wallets SET balance = $3, frozen_balance = $4, updated_at = NOW() WHERE user_id = $1 AND currency = $2",
+                    user_id,
+                    self._currency,
+                    balance_after,
+                    frozen_after,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO wallet_ledger (
+                        user_id, currency, type, amount, balance_before, balance_after,
+                        frozen_before, frozen_after, ref_type, ref_id, description
+                    )
+                    VALUES ($1, $2, 'admin_unfreeze', $3, $4, $5, $6, $7, 'wallet_freeze', $8, $9)
+                    """,
+                    user_id,
+                    self._currency,
+                    amount,
+                    balance_before,
+                    balance_after,
+                    frozen_before,
+                    frozen_after,
+                    str(freeze_id),
+                    reason,
+                )
+                row = await conn.fetchrow(
+                    "UPDATE wallet_freezes SET status = 'unlocked', unlocked_at = NOW() WHERE id = $1 RETURNING *",
+                    freeze_id,
+                )
+                return dict(row) if row else None
 
     async def create_withdraw_request(self, user_id: int, amount: Decimal, address: str, network: str) -> dict | None:
         async with self._database.pool.acquire() as conn:
