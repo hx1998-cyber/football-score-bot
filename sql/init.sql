@@ -231,6 +231,18 @@ CREATE TABLE IF NOT EXISTS admin_audit_logs (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS cancel_requests (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL,
+    bet_id BIGINT NOT NULL REFERENCES bets(id),
+    status TEXT NOT NULL DEFAULT 'pending',
+    reason TEXT,
+    admin_id BIGINT,
+    admin_reason TEXT,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reviewed_at TIMESTAMPTZ
+);
+
 CREATE TABLE IF NOT EXISTS withdraw_requests (
     id BIGSERIAL PRIMARY KEY,
     user_id BIGINT NOT NULL,
@@ -277,3 +289,4 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_deposit_orders_chain_tx ON deposit_orders 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_wallet_ledger_ref ON wallet_ledger (ref_type, ref_id, type) WHERE ref_type IS NOT NULL AND ref_id IS NOT NULL;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_commission_source ON commission_records (user_id, source_type, source_ref_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rebate_records_period ON rebate_records (user_id, period_start, period_end, rule_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cancel_requests_pending_bet ON cancel_requests (bet_id) WHERE status = 'pending';

@@ -153,6 +153,19 @@ def build_router(
         order_expire_minutes=settings.gmpay_order_expire_minutes,
     )
 
+    async def _require_private_role(message: Message, allowed_roles: set[str]) -> bool:
+        if message.chat.type != "private" or not message.from_user:
+            await message.answer("当前权限不足，请联系超级管理员。")
+            return False
+        role = await permission_service.get_user_role(message.from_user.id)
+        if role not in allowed_roles:
+            await message.answer("当前权限不足，请联系超级管理员。")
+            return False
+        return True
+
+    async def _require_super_admin(message: Message) -> bool:
+        return await _require_private_role(message, {"super_admin"})
+
     @router.callback_query(F.data.startswith("fsm_cancel:"))
     async def fsm_cancel(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
@@ -600,7 +613,7 @@ def build_router(
         bet = await database.get_bet(bet_id)
         await callback.message.answer(
             _format_bet_created(bet or {"id": bet_id}, settings.wallet_currency),
-            reply_markup=bet_detail_keyboard(
+            reply_markup=_bet_action_keyboard(
                 str((bet or {}).get("bet_no") or bet_id),
                 str((bet or {}).get("status") or "pending"),
                 "pending",
@@ -980,7 +993,7 @@ def build_router(
             return
         await callback.message.answer(
             _format_bet_detail(bet, settings.wallet_currency),
-            reply_markup=bet_detail_keyboard(
+            reply_markup=_bet_action_keyboard(
                 str(bet.get("bet_no") or bet.get("id")),
                 str(bet.get("status")),
                 status_group,
@@ -991,6 +1004,31 @@ def build_router(
 
     @router.callback_query(F.data.startswith("bet_cancel:"))
     async def bet_cancel(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        bet_key = _clean_command_token(callback.data.split(":", 1)[1])
+        bet = await database.get_user_bet(callback.from_user.id, bet_key)
+        if not bet:
+            await callback.message.answer("注单不存在。")
+            return
+        if bet.get("status") != "pending":
+            await callback.message.answer("该注单已开奖或已处理，不能申请退单。")
+            return
+        start_time = bet.get("fixture_start_time")
+        if isinstance(start_time, datetime) and datetime.now(start_time.tzinfo) >= start_time - timedelta(minutes=settings.bet_cancel_before_start_minutes):
+            await callback.message.answer("当前已超过可申请退单时间，如有争议请联系人工客服。")
+            return
+        request = await database.create_cancel_request(callback.from_user.id, int(bet["id"]), "user_request")
+        await database.add_admin_audit_log(
+            callback.from_user.id,
+            "user_cancel_request",
+            "bet",
+            str(bet.get("bet_no") or bet.get("id")),
+            {"cancel_request_id": (request or {}).get("id"), "reason": "user_request"},
+        )
+        await callback.message.answer("已提交退单申请，需超级管理员审核。审核前注单仍然有效。")
+        return
         await _safe_callback_answer(callback)
         if not callback.from_user:
             return
@@ -1032,7 +1070,7 @@ def build_router(
             detail = fresh or bet
             await callback.message.answer(
                 _format_bet_detail(detail, settings.wallet_currency),
-                reply_markup=bet_detail_keyboard(
+                reply_markup=_bet_action_keyboard(
                     str(detail.get("bet_no") or detail.get("id")),
                     str(detail.get("status")),
                     fixture_id=int(detail["fixture_id"]) if detail.get("fixture_id") else None,
@@ -1299,6 +1337,8 @@ def build_router(
 
     @router.message(Command("admin_markets"))
     async def admin_markets(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _is_admin(message.from_user.id if message.from_user else None, settings):
             await message.answer("无管理员权限。")
             return
@@ -1313,6 +1353,8 @@ def build_router(
 
     @router.message(Command("admin_suspend"))
     async def admin_suspend(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _is_admin(message.from_user.id if message.from_user else None, settings):
             await message.answer("无管理员权限。")
             return
@@ -1325,6 +1367,8 @@ def build_router(
 
     @router.message(Command("admin_resume"))
     async def admin_resume(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _is_admin(message.from_user.id if message.from_user else None, settings):
             await message.answer("无管理员权限。")
             return
@@ -1337,6 +1381,8 @@ def build_router(
 
     @router.message(Command("admin_set_cutoff"))
     async def admin_set_cutoff(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _is_admin(message.from_user.id if message.from_user else None, settings):
             await message.answer("无管理员权限。")
             return
@@ -1350,6 +1396,8 @@ def build_router(
 
     @router.message(Command("admin_wallet"))
     async def admin_wallet(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1363,6 +1411,8 @@ def build_router(
 
     @router.message(Command("admin_deposits"))
     async def admin_deposits(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1370,6 +1420,8 @@ def build_router(
 
     @router.message(Command("admin_deposit"))
     async def admin_deposit(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1382,6 +1434,8 @@ def build_router(
 
     @router.message(Command("admin_mark_deposit_paid"))
     async def admin_mark_deposit_paid(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1438,6 +1492,8 @@ def build_router(
 
     @router.message(Command("admin_reject_deposit"))
     async def admin_reject_deposit(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1462,6 +1518,37 @@ def build_router(
 
     @router.message(Command("admin_adjust_balance"))
     async def admin_adjust_balance(message: Message, command: CommandObject, state: FSMContext) -> None:
+        await state.clear()
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split(maxsplit=2)
+        if len(parts) != 3:
+            await message.answer("用法：/admin_adjust_balance <telegram_user_id> <amount> <reason>")
+            return
+        try:
+            target_user_id = int(_clean_command_token(parts[0]))
+            amount = Decimal(parts[1])
+        except Exception:
+            await message.answer("参数格式错误：telegram_user_id 必须是数字，amount 必须是数字。")
+            return
+        if amount == 0:
+            await message.answer("调整金额不能为 0。")
+            return
+        try:
+            ledger = await wallet_service.manual_adjust(target_user_id, amount, parts[2], message.from_user.id)
+        except ValueError:
+            await message.answer("余额不足，不能扣成负数。")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_adjust_balance",
+            "wallet",
+            str(target_user_id),
+            {"amount": str(amount), "reason": parts[2], "ledger_id": ledger["id"]},
+        )
+        await state.clear()
+        await message.answer(f"调整完成，ledger_id={ledger['id']}")
+        return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1557,6 +1644,16 @@ def build_router(
 
     @router.message(Command("admin_commissions"))
     async def admin_commissions(message: Message) -> None:
+        if message.chat.type != "private" or not message.from_user:
+            await message.answer("当前权限不足，请联系超级管理员。")
+            return
+        role = await permission_service.get_user_role(message.from_user.id)
+        if role not in {"super_admin", "admin", "agent"}:
+            await message.answer("当前权限不足，请联系超级管理员。")
+            return
+        user_scope = None if role in {"super_admin", "admin"} else message.from_user.id
+        await message.answer(_format_commissions(await database.list_commissions(user_scope, 20)))
+        return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1583,6 +1680,8 @@ def build_router(
 
     @router.message(Command("admin_bets"))
     async def admin_bets(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1590,6 +1689,18 @@ def build_router(
 
     @router.message(Command("admin_bet"))
     async def admin_bet(message: Message, command: CommandObject) -> None:
+        if not await _require_private_role(message, {"super_admin", "admin"}):
+            return
+        bet_key = _clean_command_token((command.args or "").strip().split(maxsplit=1)[0]) if (command.args or "").strip() else ""
+        if not bet_key:
+            await message.answer("用法：/admin_bet <注单号或ID>")
+            return
+        bet = await database.get_bet(bet_key)
+        if not bet:
+            await message.answer(f"未找到该注单：{bet_key}\n请使用 /admin_bets 查看待开奖注单。")
+            return
+        await message.answer(_format_admin_bet(bet))
+        return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1631,6 +1742,40 @@ def build_router(
         await message.answer(_format_admin_bet(await database.get_bet(bet_id)))
 
     async def _admin_settle_bet(message: Message, command: CommandObject, status: str, action: str) -> None:
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        bet_key = _clean_command_token(parts[0]) if parts else ""
+        note = parts[1].strip() if len(parts) > 1 else None
+        if not bet_key:
+            await message.answer(f"用法：/{action} <注单号或ID>")
+            return
+        bet = await database.get_bet(bet_key)
+        if not bet:
+            await message.answer(f"未找到该注单：{bet_key}\n请使用 /admin_bets 查看待开奖注单。")
+            return
+        try:
+            result = await wallet_service.settle_bet(int(bet["id"]), message.from_user.id, status, note=note)
+        except ValueError as exc:
+            await message.answer(f"结算失败：{exc}")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            action,
+            "bet",
+            str(bet.get("bet_no") or bet.get("id")),
+            {"status": status, "settled": bool(result), "note": note, "ledger_id": (result or {}).get("ledger_id")},
+        )
+        if not result:
+            await message.answer("注单不存在、已开奖或状态不允许。")
+            return
+        if status == "won" and settings.payout_freeze_enabled:
+            try:
+                await message.bot.send_message(int(result["user_id"]), "注单中奖，派彩已冻结，预计24小时后解冻。")
+            except Exception:
+                logger.info("failed to notify settled win user_id=%s", result.get("user_id"), exc_info=True)
+        await message.answer(f"注单已开奖：{status}，ledger_id={result.get('ledger_id')}")
+        return
         parts = (command.args or "").strip().split(maxsplit=1)
         bet_key = parts[0] if parts else ""
         note = parts[1] if len(parts) > 1 else None
@@ -1698,6 +1843,8 @@ def build_router(
 
     @router.message(Command("admin_withdrawals"))
     async def admin_withdrawals(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1705,6 +1852,8 @@ def build_router(
 
     @router.message(Command("admin_withdraw"))
     async def admin_withdraw(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1716,6 +1865,8 @@ def build_router(
 
     @router.message(Command("admin_approve_withdraw"))
     async def admin_approve_withdraw(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1729,6 +1880,8 @@ def build_router(
 
     @router.message(Command("admin_reject_withdraw"))
     async def admin_reject_withdraw(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1742,6 +1895,8 @@ def build_router(
 
     @router.message(Command("admin_mark_withdraw_paid"))
     async def admin_mark_withdraw_paid(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -1808,6 +1963,23 @@ def build_router(
 
     @router.message(Command("admin_referrals"))
     async def admin_referrals(message: Message, command: CommandObject) -> None:
+        if message.chat.type != "private" or not message.from_user:
+            await message.answer("当前权限不足，请联系超级管理员。")
+            return
+        role = await permission_service.get_user_role(message.from_user.id)
+        if role not in {"super_admin", "admin", "agent"}:
+            await message.answer("当前权限不足，请联系超级管理员。")
+            return
+        requested_user_id = _first_int_arg(command)
+        user_id = requested_user_id if role in {"super_admin", "admin"} and requested_user_id is not None else message.from_user.id
+        summary = await database.get_referral_summary(user_id)
+        rows = await database.list_referrals(user_id, 50)
+        await message.answer(
+            _format_referrals(f"user_id={user_id}", summary, settings.wallet_currency)
+            + "\n\n"
+            + _format_referral_children(rows)
+        )
+        return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -2006,8 +2178,68 @@ def build_router(
         await database.add_admin_audit_log(message.from_user.id, "admin_pay_rebate_request", "rebate_request", str(request_id), {"paid": bool(row), "amount": str(amount), "ledger_id": ledger["id"]})
         await message.answer("返水已派发到账。" if row else "返水派发状态更新失败。")
 
+    @router.message(Command("admin_cancel_requests"))
+    async def admin_cancel_requests(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
+        await message.answer(_format_cancel_requests(await database.list_cancel_requests("pending", 50)))
+
+    @router.message(Command("admin_approve_cancel"))
+    async def admin_approve_cancel(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_approve_cancel <request_id> <reason>")
+            return
+        request_id = _parse_id_token(parts[0])
+        if request_id is None:
+            await message.answer("request_id 必须是真实数字ID。")
+            return
+        request = await database.get_cancel_request(request_id)
+        if not request or request.get("status") != "pending":
+            await message.answer("退单申请不存在或已处理。")
+            return
+        result = await wallet_service.settle_bet(int(request["bet_id"]), message.from_user.id, "cancelled", note=parts[1])
+        if not result:
+            await message.answer("注单已开奖或状态不允许退单。")
+            return
+        row = await database.review_cancel_request(request_id, "approved", message.from_user.id, parts[1])
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_approve_cancel",
+            "cancel_request",
+            str(request_id),
+            {"approved": bool(row), "bet_id": int(request["bet_id"]), "ledger_id": result.get("ledger_id"), "reason": parts[1]},
+        )
+        await message.answer(f"退单已批准，ledger_id={result.get('ledger_id')}")
+
+    @router.message(Command("admin_reject_cancel"))
+    async def admin_reject_cancel(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_reject_cancel <request_id> <reason>")
+            return
+        request_id = _parse_id_token(parts[0])
+        if request_id is None:
+            await message.answer("request_id 必须是真实数字ID。")
+            return
+        row = await database.review_cancel_request(request_id, "rejected", message.from_user.id, parts[1])
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_reject_cancel",
+            "cancel_request",
+            str(request_id),
+            {"rejected": bool(row), "reason": parts[1]},
+        )
+        await message.answer("退单申请已拒绝。" if row else "退单申请不存在或已处理。")
+
     @router.message(Command("admin_payout_freezes"))
     async def admin_payout_freezes(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -2015,6 +2247,8 @@ def build_router(
 
     @router.message(Command("admin_unlock_payout"))
     async def admin_unlock_payout(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -2028,6 +2262,8 @@ def build_router(
 
     @router.message(Command("admin_extend_payout_freeze"))
     async def admin_extend_payout_freeze(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -2054,6 +2290,37 @@ def build_router(
 
     @router.message(Command("admin_unfreeze_balance"))
     async def admin_unfreeze_balance(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_unfreeze_balance <freeze_id> <reason>")
+            return
+        raw_id = parts[0].strip()
+        if raw_id == "<freeze_id>":
+            await message.answer("请把 <freeze_id> 替换为真实冻结记录ID，例如 /admin_unfreeze_balance 1 test_unfreeze")
+            return
+        freeze_id = _parse_id_token(raw_id)
+        if freeze_id is None:
+            await message.answer("freeze_id 必须是真实数字ID，例如 /admin_unfreeze_balance 1 test_unfreeze")
+            return
+        try:
+            row = await wallet_service.unfreeze_balance(freeze_id, parts[1])
+        except ValueError as exc:
+            await message.answer(f"解冻失败：{exc}")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_unfreeze_balance",
+            "wallet_freeze",
+            str(freeze_id),
+            {"unfrozen": bool(row), "reason": parts[1], "ledger_id": (row or {}).get("ledger_id")},
+        )
+        if not row:
+            await message.answer("冻结记录不存在或状态不允许。")
+            return
+        await message.answer(f"解冻完成，ledger_id={row.get('ledger_id')}")
+        return
         if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
             await message.answer("只有超级管理员可解冻余额。")
             return
@@ -2067,6 +2334,8 @@ def build_router(
 
     @router.message(Command("admin_user_freezes"))
     async def admin_user_freezes(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
@@ -2142,6 +2411,19 @@ def build_router(
             await callback.message.answer("无管理员权限。")
             return
         data = callback.data
+        super_only_panels = {
+            "admin:stats",
+            "admin:markets",
+            "admin:bets",
+            "admin:wallets",
+            "admin:withdrawals",
+            "admin:deposits",
+            "admin:users",
+            "admin:settings",
+        }
+        if data in super_only_panels and role != "super_admin":
+            await callback.message.answer("当前权限不足，请联系超级管理员。")
+            return
         if data == "admin:stats":
             await callback.message.answer(_format_admin_dashboard(await database.admin_dashboard(), settings.wallet_currency))
         elif data == "admin:markets":
@@ -2170,6 +2452,11 @@ def build_router(
                 f"测试下注余额校验：{'开启' if settings.bet_require_balance_for_simulation else '关闭'}\n"
                 f"提现：{'开启' if settings.withdraw_enabled else '关闭'}"
             )
+
+    @router.callback_query(F.data == "support")
+    async def support_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        await callback.message.answer("请从注单详情点击“申请退单/联系客服”，系统会按注单状态和开赛时间判断是否可提交退单申请。")
 
     @router.callback_query()
     async def unknown_callback(callback: CallbackQuery) -> None:
@@ -2655,9 +2942,25 @@ def _admin_private_allowed(message: Message, settings: Settings) -> bool:
 
 def _first_int_arg(command: CommandObject) -> int | None:
     try:
-        return int((command.args or "").strip().split()[0])
+        return int(_clean_command_token((command.args or "").strip().split()[0]))
     except (IndexError, TypeError, ValueError):
         return None
+
+
+def _clean_command_token(value: str) -> str:
+    token = " ".join(str(value or "").strip().split())
+    if token.startswith("<") and token.endswith(">") and len(token) >= 2:
+        token = token[1:-1].strip()
+    return token
+
+
+def _parse_command_parts(args: str | None, maxsplit: int = -1) -> list[str]:
+    return (args or "").strip().split(maxsplit=maxsplit)
+
+
+def _parse_id_token(raw: str) -> int | None:
+    token = _clean_command_token(raw)
+    return int(token) if token.isdigit() else None
 
 
 def _command_fixture_id(command: CommandObject) -> int | None:
@@ -3096,6 +3399,19 @@ def _format_rebate_requests(rows: list[dict | None]) -> str:
             f"active_referrals={row.get('active_referrals') or 0} requested={_money(row.get('requested_amount'))} "
             f"status={row.get('status')} note={row.get('note') or '-'} created_at={row.get('created_at')}"
         )
+    return "\n".join(lines)
+
+
+def _format_cancel_requests(rows: list[dict]) -> str:
+    if not rows:
+        return "暂无待审核退单申请。"
+    lines = ["待审核退单申请"]
+    for row in rows:
+        lines.append(
+            f"#{row.get('id')} bet={row.get('bet_no') or row.get('bet_id')} "
+            f"user={row.get('user_id')} stake={row.get('stake')} status={row.get('bet_status')}"
+        )
+    lines.append("命令：/admin_approve_cancel <request_id> <reason> 或 /admin_reject_cancel <request_id> <reason>")
     return "\n".join(lines)
 
 
@@ -3596,6 +3912,26 @@ def _insufficient_balance_keyboard(fixture_id: int | None = None) -> InlineKeybo
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _bet_action_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
+        rows.append([InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _bet_unavailable_message(reason: str) -> str:
     if reason in {"cutoff_reached", "suspended_by_admin"}:
         return "本场比赛已封盘，无法下注。"
@@ -3758,6 +4094,15 @@ def _bet_mode_notice(settings: Settings) -> str:
 def _admin_menu_text(role: str) -> str:
     if role == "super_admin":
         return (
+            "超级管理员面板\n\n"
+            "高风险功能仅超级管理员可用：注单开奖、提现审核、充值订单、用户钱包/调账、用户风控、冻结余额、退单审批。"
+        )
+    if role == "admin":
+        return "管理员面板\n\n当前仅开放返水管理、佣金管理、下级/代理数据。"
+    if role == "agent":
+        return "代理面板\n\n只能查看自己的下级、佣金、推广和返水申请信息，不能进行资金操作。"
+    if role == "super_admin":
+        return (
             "🛡 超级管理员面板\n\n"
             "当前身份：超级管理员\n\n"
             "常用功能：\n"
@@ -3783,6 +4128,28 @@ def _admin_menu_text(role: str) -> str:
 
 
 def _admin_panel_keyboard(role: str) -> InlineKeyboardMarkup:
+    if role == "super_admin":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎫 注单开奖 仅超管", callback_data="admin:bets")],
+                [InlineKeyboardButton(text="🏧 提现审核 仅超管", callback_data="admin:withdrawals")],
+                [InlineKeyboardButton(text="💳 充值订单 仅超管", callback_data="admin:deposits")],
+                [InlineKeyboardButton(text="💰 用户钱包/调账 仅超管", callback_data="admin:wallets")],
+                [InlineKeyboardButton(text="🚫 用户风控 仅超管", callback_data="admin:users")],
+                [InlineKeyboardButton(text="🎁 返水管理", callback_data="admin:rebates")],
+                [InlineKeyboardButton(text="💸 佣金管理", callback_data="admin:commissions")],
+                [InlineKeyboardButton(text="返回首页", callback_data="home")],
+            ]
+        )
+    if role == "admin":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🎁 返水管理", callback_data="admin:rebates")],
+                [InlineKeyboardButton(text="💸 佣金管理", callback_data="admin:commissions")],
+                [InlineKeyboardButton(text="👥 下级/代理数据", callback_data="referrals:children")],
+                [InlineKeyboardButton(text="返回首页", callback_data="home")],
+            ]
+        )
     if role == "super_admin":
         rows = [
             [InlineKeyboardButton(text="📊 平台统计", callback_data="admin:stats")],

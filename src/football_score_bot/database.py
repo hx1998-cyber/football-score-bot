@@ -431,6 +431,28 @@ class Database:
         )
         await self._pool.execute(
             """
+            CREATE TABLE IF NOT EXISTS cancel_requests (
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                bet_id BIGINT NOT NULL REFERENCES bets(id),
+                status TEXT NOT NULL DEFAULT 'pending',
+                reason TEXT,
+                admin_id BIGINT,
+                admin_reason TEXT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                reviewed_at TIMESTAMPTZ
+            )
+            """
+        )
+        await self._pool.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_cancel_requests_pending_bet
+            ON cancel_requests (bet_id)
+            WHERE status = 'pending'
+            """
+        )
+        await self._pool.execute(
+            """
             CREATE TABLE IF NOT EXISTS admin_market_overrides (
                 id BIGSERIAL PRIMARY KEY,
                 fixture_id BIGINT NOT NULL UNIQUE,
@@ -869,6 +891,8 @@ class Database:
         )
 
     async def get_bet(self, bet_id: int | str) -> dict | None:
+        if isinstance(bet_id, str):
+            bet_id = _clean_lookup_token(bet_id)
         if isinstance(bet_id, str) and not bet_id.isdigit():
             return await self.get_bet_by_no(bet_id)
         row = await self._pool.fetchrow(
@@ -880,6 +904,7 @@ class Database:
         return dict(row) if row else None
 
     async def get_bet_by_no(self, bet_no: str) -> dict | None:
+        bet_no = _clean_lookup_token(bet_no)
         row = await self._pool.fetchrow(
             """
             SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout,
@@ -892,6 +917,7 @@ class Database:
         return dict(row) if row else None
 
     async def get_user_bet(self, telegram_user_id: int, bet_id_or_no: str) -> dict | None:
+        bet_id_or_no = _clean_lookup_token(bet_id_or_no)
         if bet_id_or_no.isdigit():
             where = "id = $2"
             value: int | str = int(bet_id_or_no)
@@ -941,6 +967,72 @@ class Database:
             limit,
         )
         return [dict(row) for row in rows]
+
+    async def create_cancel_request(self, user_id: int, bet_id: int, reason: str) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO cancel_requests (user_id, bet_id, status, reason)
+            VALUES ($1, $2, 'pending', $3)
+            ON CONFLICT (bet_id) WHERE status = 'pending'
+            DO UPDATE SET reason = EXCLUDED.reason
+            RETURNING *
+            """,
+            user_id,
+            bet_id,
+            reason,
+        )
+        return dict(row) if row else None
+
+    async def list_cancel_requests(self, status: str = "pending", limit: int = 50) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT cr.*, b.bet_no, b.fixture_label, b.stake::TEXT AS stake, b.status AS bet_status
+            FROM cancel_requests cr
+            JOIN bets b ON b.id = cr.bet_id
+            WHERE cr.status = $1
+            ORDER BY cr.created_at DESC
+            LIMIT $2
+            """,
+            status,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_cancel_request(self, request_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            SELECT cr.*, b.bet_no, b.status AS bet_status
+            FROM cancel_requests cr
+            JOIN bets b ON b.id = cr.bet_id
+            WHERE cr.id = $1
+            """,
+            request_id,
+        )
+        return dict(row) if row else None
+
+    async def review_cancel_request(
+        self,
+        request_id: int,
+        status: str,
+        admin_user_id: int,
+        reason: str,
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE cancel_requests
+            SET status = $2,
+                admin_id = $3,
+                admin_reason = $4,
+                reviewed_at = NOW()
+            WHERE id = $1 AND status = 'pending'
+            RETURNING *
+            """,
+            request_id,
+            status,
+            admin_user_id,
+            reason,
+        )
+        return dict(row) if row else None
 
     async def list_pending_bets_for_settlement(self, limit: int = 200) -> list[dict]:
         rows = await self._pool.fetch(
@@ -1742,6 +1834,13 @@ def _decode_referral_code(code: str) -> int | None:
         return int(code.lower(), 36)
     except ValueError:
         return None
+
+
+def _clean_lookup_token(value: str) -> str:
+    token = " ".join(str(value or "").strip().split())
+    if token.startswith("<") and token.endswith(">") and len(token) >= 2:
+        token = token[1:-1].strip()
+    return token
 
 
 def _command_count(result: str) -> int:

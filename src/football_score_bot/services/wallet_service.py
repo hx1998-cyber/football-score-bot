@@ -564,13 +564,14 @@ class WalletService:
                     frozen_after,
                 )
                 amount = payout if outcome == "won" else balance_delta if outcome != "lost" else Decimal("0")
-                await conn.execute(
+                ledger = await conn.fetchrow(
                     """
                     INSERT INTO wallet_ledger (
                         user_id, currency, type, amount, balance_before, balance_after,
                         frozen_before, frozen_after, ref_type, ref_id, description
                     )
                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'bet', $9, $10)
+                    RETURNING *
                     """,
                     user_id,
                     self._currency,
@@ -583,11 +584,13 @@ class WalletService:
                     str(bet_id),
                     f"Admin bet settlement: {outcome}",
                 )
+                payout_freeze_id = None
                 if outcome == "won" and payout_to_frozen > 0:
-                    await conn.execute(
+                    payout_freeze_id = await conn.fetchval(
                         """
                         INSERT INTO payout_freezes (user_id, bet_id, amount, status, unlock_at, note)
                         VALUES ($1, $2, $3, 'frozen', NOW() + $4::INTERVAL, $5)
+                        RETURNING id
                         """,
                         user_id,
                         bet_id,
@@ -631,7 +634,15 @@ class WalletService:
                     amount,
                     source,
                 )
-                return {"bet_id": bet_id, "user_id": user_id, "status": outcome, "balance_after": balance_after}
+                return {
+                    "bet_id": bet_id,
+                    "user_id": user_id,
+                    "status": outcome,
+                    "balance_after": balance_after,
+                    "ledger_id": ledger["id"] if ledger else None,
+                    "payout_freeze_id": payout_freeze_id,
+                    "payout": amount,
+                }
 
     async def unlock_payout_freeze(self, freeze_id: int, *, reason: str = "manual unlock") -> dict | None:
         async with self._database.pool.acquire() as conn:
@@ -771,13 +782,14 @@ class WalletService:
                     balance_after,
                     frozen_after,
                 )
-                await conn.execute(
+                ledger = await conn.fetchrow(
                     """
                     INSERT INTO wallet_ledger (
                         user_id, currency, type, amount, balance_before, balance_after,
                         frozen_before, frozen_after, ref_type, ref_id, description
                     )
                     VALUES ($1, $2, 'admin_unfreeze', $3, $4, $5, $6, $7, 'wallet_freeze', $8, $9)
+                    RETURNING *
                     """,
                     user_id,
                     self._currency,
@@ -793,7 +805,11 @@ class WalletService:
                     "UPDATE wallet_freezes SET status = 'unlocked', unlocked_at = NOW() WHERE id = $1 RETURNING *",
                     freeze_id,
                 )
-                return dict(row) if row else None
+                if not row:
+                    return None
+                result = dict(row)
+                result["ledger_id"] = ledger["id"] if ledger else None
+                return result
 
     async def create_withdraw_request(self, user_id: int, amount: Decimal, address: str, network: str) -> dict | None:
         async with self._database.pool.acquire() as conn:

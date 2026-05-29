@@ -52,22 +52,28 @@ class PermissionService:
         return operator_id == target_user_id
 
     async def can_settle_bets(self, operator_id: int | None) -> bool:
-        return await self.get_user_role(operator_id) in {"super_admin", "admin"}
+        return await self.is_super_admin(operator_id)
 
     async def can_review_withdrawals(self, operator_id: int | None) -> bool:
-        return await self.get_user_role(operator_id) in {"super_admin", "admin"}
+        return await self.is_super_admin(operator_id)
 
     async def can_review_deposits(self, operator_id: int | None) -> bool:
-        return await self.get_user_role(operator_id) in {"super_admin", "admin"}
+        return await self.is_super_admin(operator_id)
 
     async def can_manage_rebates(self, operator_id: int | None) -> bool:
         return await self.get_user_role(operator_id) in {"super_admin", "admin", "agent"}
 
     async def can_modify_odds(self, operator_id: int | None) -> bool:
-        return await self.get_user_role(operator_id) in {"super_admin", "admin"}
+        return await self.is_super_admin(operator_id)
 
     async def can_invite_admin(self, operator_id: int | None) -> bool:
         return await self.is_super_admin(operator_id)
 
     async def can_reopen_settled_bet(self, operator_id: int | None) -> bool:
+        return await self.is_super_admin(operator_id)
+
+    async def can_manage_money(self, operator_id: int | None) -> bool:
+        return await self.is_super_admin(operator_id)
+
+    async def can_review_cancel_requests(self, operator_id: int | None) -> bool:
         return await self.is_super_admin(operator_id)
