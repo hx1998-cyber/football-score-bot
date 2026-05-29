@@ -120,6 +120,9 @@ class Database:
                 status TEXT NOT NULL DEFAULT 'pending',
                 block_transaction_id TEXT,
                 chain_tx_id TEXT,
+                error_message TEXT,
+                manual_review_required BOOLEAN NOT NULL DEFAULT FALSE,
+                manual_review_note TEXT,
                 raw_response_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 raw_callback_json JSONB NOT NULL DEFAULT '{}'::jsonb,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -139,6 +142,9 @@ class Database:
             "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS network TEXT",
             "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
             "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS chain_tx_id TEXT",
+            "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS error_message TEXT",
+            "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS manual_review_required BOOLEAN NOT NULL DEFAULT FALSE",
+            "ALTER TABLE deposit_orders ADD COLUMN IF NOT EXISTS manual_review_note TEXT",
         ):
             await self._pool.execute(statement)
         await self._pool.execute(
@@ -1028,6 +1034,68 @@ class Database:
             order_id,
             json.dumps(raw_response),
         )
+        return dict(row) if row else None
+
+    async def mark_deposit_manual_review(
+        self,
+        order_id: str,
+        *,
+        note: str,
+        callback_payload: dict[str, Any] | None = None,
+        actual_amount: Decimal | None = None,
+        trade_id: str | None = None,
+        chain_tx_id: str | None = None,
+        error_message: str | None = None,
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE deposit_orders
+            SET status = 'manual_review',
+                manual_review_required = TRUE,
+                manual_review_note = $2,
+                error_message = COALESCE($7, error_message),
+                actual_amount = COALESCE($3, actual_amount),
+                trade_id = COALESCE($4, trade_id),
+                chain_tx_id = COALESCE($5, chain_tx_id),
+                block_transaction_id = COALESCE($5, block_transaction_id),
+                raw_callback_json = COALESCE($6::jsonb, raw_callback_json),
+                updated_at = NOW()
+            WHERE order_id = $1 AND status <> 'paid'
+            RETURNING *
+            """,
+            order_id,
+            note,
+            actual_amount,
+            trade_id,
+            chain_tx_id,
+            json.dumps(callback_payload) if callback_payload is not None else None,
+            error_message,
+        )
+        return dict(row) if row else None
+
+    async def reject_deposit_order(self, order_id: str, *, reason: str, admin_user_id: int) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE deposit_orders
+            SET status = 'failed',
+                manual_review_required = FALSE,
+                manual_review_note = $2,
+                error_message = $2,
+                updated_at = NOW()
+            WHERE order_id = $1 AND status <> 'paid'
+            RETURNING *
+            """,
+            order_id,
+            reason,
+        )
+        if row:
+            await self.add_admin_audit_log(
+                admin_user_id,
+                "admin_reject_deposit",
+                "deposit_order",
+                order_id,
+                {"reason": reason, "status": "failed"},
+            )
         return dict(row) if row else None
 
     async def get_deposit_order(self, order_id: str) -> dict | None:

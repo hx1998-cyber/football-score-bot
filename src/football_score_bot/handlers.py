@@ -679,18 +679,6 @@ def build_router(
     async def wallet_recharge(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
         await state.clear()
-        await state.set_state(RechargeStates.choosing_network)
-        await callback.message.answer("请选择充值网络：", reply_markup=_network_keyboard("recharge_network"))
-
-    @router.callback_query(F.data.startswith("recharge_network:"))
-    async def recharge_network(callback: CallbackQuery, state: FSMContext) -> None:
-        await _safe_callback_answer(callback)
-        network = callback.data.split(":", 1)[1]
-        if network == "cancel":
-            await state.clear()
-            await callback.message.answer("已取消充值。", reply_markup=_wallet_keyboard())
-            return
-        await state.update_data(network=network)
         await state.set_state(RechargeStates.choosing_amount)
         await callback.message.answer("请选择充值金额：", reply_markup=_recharge_amount_keyboard())
 
@@ -741,7 +729,6 @@ def build_router(
             database,
             settings,
             gmpay_client,
-            network=str(data.get("network") or settings.gmpay_default_network),
         )
         await state.clear()
 
@@ -1109,6 +1096,8 @@ def build_router(
             "/admin_wallet <telegram_user_id>\n"
             "/admin_deposits\n"
             "/admin_deposit <order_id>\n"
+            "/admin_mark_deposit_paid <order_id> <amount> <txid> <reason>\n"
+            "/admin_reject_deposit <order_id> <reason>\n"
             "/admin_adjust_balance <telegram_user_id> <amount> <reason>\n"
             "/admin_bets\n"
             "/admin_bet <bet_id>\n"
@@ -1208,14 +1197,14 @@ def build_router(
 
     @router.message(Command("admin_deposits"))
     async def admin_deposits(message: Message) -> None:
-        if not _admin_private_allowed(message, settings):
+        if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
         await message.answer(_format_deposit_records(await database.list_deposit_orders(20)))
 
     @router.message(Command("admin_deposit"))
     async def admin_deposit(message: Message, command: CommandObject) -> None:
-        if not _admin_private_allowed(message, settings):
+        if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
         order_id = (command.args or "").strip()
@@ -1224,6 +1213,85 @@ def build_router(
             return
         order = await database.get_deposit_order(order_id)
         await message.answer(_format_admin_deposit_order(order) if order else "订单不存在。")
+
+    @router.message(Command("admin_mark_deposit_paid"))
+    async def admin_mark_deposit_paid(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=3)
+        if len(parts) != 4:
+            await message.answer("用法：/admin_mark_deposit_paid <order_id> <amount> <txid> <reason>")
+            return
+        order_id, amount_text, txid, reason = parts
+        try:
+            amount = Decimal(amount_text)
+        except Exception:
+            await message.answer("金额格式不正确。")
+            return
+        if amount <= 0 or not txid.strip() or not reason.strip():
+            await message.answer("amount、txid 和 reason 都必须填写。")
+            return
+        order = await database.get_deposit_order(order_id)
+        if not order:
+            await message.answer("订单不存在。")
+            return
+        if str(order.get("status")) not in {"manual_review", "pending", "failed"}:
+            await message.answer("该订单状态不允许人工标记到账。")
+            return
+        paid = await wallet_service.credit_deposit(
+            int(order["user_id"]),
+            order,
+            {
+                "actual_amount": amount,
+                "chain_tx_id": txid,
+                "txid": txid,
+                "manual_review_note": reason,
+                "admin_user_id": message.from_user.id,
+            },
+            ledger_type="deposit_manual",
+            description=f"Manual deposit: {reason}",
+        )
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_mark_deposit_paid",
+            "deposit_order",
+            order_id,
+            {"paid": paid, "amount": str(amount), "txid": txid, "reason": reason},
+        )
+        if paid:
+            try:
+                await message.bot.send_message(
+                    int(order["user_id"]),
+                    f"充值人工核查已通过，已到账：{_money(amount)} {settings.wallet_currency}\n订单号：{order_id}",
+                )
+            except Exception:
+                logger.info("failed to notify manual deposit paid user_id=%s order_id=%s", order["user_id"], order_id, exc_info=True)
+        await message.answer("已人工标记充值到账。" if paid else "订单未处理，可能已到账或存在重复 txid。")
+
+    @router.message(Command("admin_reject_deposit"))
+    async def admin_reject_deposit(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.can_review_deposits(message.from_user.id):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if len(parts) != 2:
+            await message.answer("用法：/admin_reject_deposit <order_id> <reason>")
+            return
+        order_id, reason = parts
+        if not reason.strip():
+            await message.answer("reason 必须填写。")
+            return
+        row = await database.reject_deposit_order(order_id, reason=reason, admin_user_id=message.from_user.id)
+        if row:
+            try:
+                await message.bot.send_message(
+                    int(row["user_id"]),
+                    f"充值订单人工核查未通过。\n订单号：{order_id}\n原因：{reason}",
+                )
+            except Exception:
+                logger.info("failed to notify deposit rejection user_id=%s order_id=%s", row["user_id"], order_id, exc_info=True)
+        await message.answer("已拒绝充值订单。" if row else "订单不存在或已到账，无法拒绝。")
 
     @router.message(Command("admin_adjust_balance"))
     async def admin_adjust_balance(message: Message, command: CommandObject, state: FSMContext) -> None:
@@ -2122,6 +2190,7 @@ async def _create_recharge_order(
     gmpay_client: GMPayClient,
     network: str | None = None,
 ) -> None:
+    deposit_network = network or settings.gmpay_default_network
     if amount < settings.min_recharge_amount:
         await message.answer(f"最低充值金额：{_money(settings.min_recharge_amount)} {settings.wallet_currency}")
         return
@@ -2136,7 +2205,7 @@ async def _create_recharge_order(
                 order_id,
                 amount,
                 settings.wallet_currency,
-                network or settings.gmpay_default_network,
+                deposit_network,
             )
             break
         except asyncpg.UniqueViolationError:
@@ -2150,7 +2219,7 @@ async def _create_recharge_order(
         order_id,
         len(order_id),
         amount,
-        network or settings.gmpay_default_network,
+        deposit_network,
     )
     try:
         transaction = await gmpay_client.create_transaction(
@@ -2159,7 +2228,7 @@ async def _create_recharge_order(
             user_id=user_id,
             notify_url=settings.gmpay_notify_url,
             redirect_url=settings.gmpay_redirect_url,
-            network=network,
+            network=deposit_network,
         )
     except Exception as exc:
         raw_response = _gmpay_create_failure_response(exc)
@@ -2338,12 +2407,11 @@ def _format_wallet(wallet: dict, currency: str) -> str:
 
 
 def _format_recharge_confirm(data: dict[str, Any], settings: Settings) -> str:
-    network = _network_label(str(data.get("network") or settings.gmpay_default_network))
     return (
         "确认充值\n\n"
         f"金额：{_money(data.get('amount'))} {settings.wallet_currency}\n"
-        f"网络：{network}\n"
-        "到账方式：GMPay\n"
+        "支付方式：GMPay 收银台\n"
+        "链/代币：请在收银台页面选择\n"
         f"有效期：{settings.gmpay_order_expire_minutes} 分钟"
     )
 
@@ -2396,17 +2464,41 @@ def _network_label(network: str) -> str:
 
 
 def _format_deposit_order(order: dict, currency: str) -> str:
+    status = str(order.get("status") or "")
     return (
         "充值订单已创建\n\n"
         f"订单号：{order.get('order_id')}\n"
-        f"状态：{order.get('status')}\n"
+        f"状态：{status}\n"
         f"金额：{_money(order.get('amount_requested'))} {currency}\n"
         f"实际需支付：{_money(order.get('actual_amount') or order.get('amount_requested'))} {currency}\n"
-        f"网络：{order.get('network') or '-'}\n"
+        "链/代币：请在收银台页面选择\n"
         "有效期：30 分钟\n\n"
         "请点击下方按钮打开收银台完成支付。\n"
-        "到账后系统会自动入账。"
+        "请以收银台页面显示的链、地址和实际金额为准。\n\n"
+        "支付须知\n"
+        "1. 请按收银台页面显示的实际金额支付。\n"
+        "2. 请勿少付、多付或分多笔支付。\n"
+        "3. 如果金额不一致，可能不会自动到账。\n"
+        "4. 如已付款但未到账，请保存 txid 并联系管理员核查。\n\n"
+        f"{_deposit_status_hint(status)}"
     )
+
+
+def _deposit_status_hint(status: str) -> str:
+    normalized = status.lower()
+    if normalized == "pending":
+        return "订单待支付或等待链上确认。\n请以收银台页面显示的实际金额为准。"
+    if normalized == "paid":
+        return "充值已到账。"
+    if normalized == "manual_review":
+        return "订单金额或状态异常，已进入人工核查。\n请准备 txid 联系管理员。"
+    if normalized == "expired":
+        return "订单已过期，请重新创建充值订单。"
+    if normalized == "failed":
+        return "订单创建失败或已被拒绝，请重新尝试。"
+    if normalized == "cancelled":
+        return "订单已取消。"
+    return "请打开收银台查看订单状态。"
 
 
 def _format_admin_deposit_order(order: dict | None) -> str:
@@ -2419,7 +2511,11 @@ def _format_admin_deposit_order(order: dict | None) -> str:
         f"amount_requested={_money(order.get('amount_requested'))}\n"
         f"actual_amount={_money(order.get('actual_amount'))}\n"
         f"status={order.get('status')}\n"
+        f"manual_review_required={order.get('manual_review_required')}\n"
+        f"manual_review_note={order.get('manual_review_note') or '-'}\n"
+        f"error_message={order.get('error_message') or '-'}\n"
         f"trade_id={order.get('trade_id') or '-'}\n"
+        f"chain_tx_id={order.get('chain_tx_id') or '-'}\n"
         f"network={order.get('network') or '-'}\n"
         f"payment_url={order.get('payment_url') or '-'}\n"
         f"raw_response_json={_short_json(order.get('raw_response_json'))}\n"

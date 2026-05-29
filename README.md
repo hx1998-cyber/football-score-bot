@@ -156,6 +156,7 @@ GMPAY_SIGN_TYPE=md5
 GMPAY_DEFAULT_PAYMENT_TYPE=
 GMPAY_MIN_RECHARGE_USDT=10
 GMPAY_ORDER_EXPIRE_MINUTES=30
+PAYMENT_AMOUNT_TOLERANCE_USDT=0.01
 APP_PUBLIC_BASE_URL=
 ADMIN_USER_IDS=
 REFERRAL_DEPOSIT_COMMISSION_RATE=0.00
@@ -192,6 +193,7 @@ The project calls:
 
 ```text
 POST {GMPAY_BASE_URL}{GMPAY_CREATE_ORDER_PATH}
+GET {GMPAY_BASE_URL}/payments/gmpay/v1/config
 ```
 
 The create-order request includes `pid`; `GMPAY_SECRET` is only used to sign and is never sent in the request body. The signing logic is isolated in `football_score_bot.payments.gmpay.sign_payload`: keep all non-empty fields, exclude `signature`, sort by ASCII key, join as `key=value&key=value`, append `GMPAY_SECRET` directly at the end, then compute lower-case MD5.
@@ -215,6 +217,10 @@ GMPay limits `order_id` to a maximum length of 32 characters. Recharge orders us
 
 Do not put `GMPAY_SECRET` in logs, request bodies, or README examples. It belongs only in `.env` and is used for both create-order signing and webhook verification.
 
+The bot no longer asks users to choose a recharge chain. It creates a GMPay order with the default `GMPAY_DEFAULT_TOKEN=usdt` and `GMPAY_DEFAULT_NETWORK=tron` configuration, then sends the user to the GMPay cashier. Chain and token selection must happen on the GMPay payment page.
+
+Users must pay the exact amount shown by the cashier page. Underpayment, overpayment, wrong-chain payment, or split payments may not be credited automatically. Abnormal orders enter manual review and require an admin to check the txid.
+
 Webhook behavior:
 
 - `POST /webhooks/gmpay` accepts JSON and `application/x-www-form-urlencoded` callback bodies.
@@ -223,6 +229,9 @@ Webhook behavior:
 - `success`, `paid`, `2`, and `TRADE_SUCCESS` style statuses are treated as successful payment.
 - `order_id`, `trade_id`, `actual_amount`, and `chain_tx_id`/`block_transaction_id`/`txid` are parsed compatibly.
 - `order_id`, `trade_id`, `chain_tx_id`, and `wallet_ledger` references are unique/idempotent, so repeat callbacks do not add balance twice.
+- Automatic credit requires a successful signed callback with `actual_amount`.
+- The credited amount is the callback `actual_amount`.
+- If `actual_amount` is missing, or the difference from `amount_requested` is greater than `PAYMENT_AMOUNT_TOLERANCE_USDT`, the order becomes `manual_review` and is not credited automatically.
 - Successful callbacks return plain text `ok` with `text/plain`.
 - Wallet balances are changed only through `wallet_ledger` entries inside database transactions.
 - The bot never stores user private keys and does not implement automatic withdrawal.
@@ -454,7 +463,7 @@ Before any real launch or paid trial, complete local legal compliance review, ri
 
 Telegram user input flows now use aiogram FSM state:
 
-- Recharge: `/wallet` -> `充值 USDT` -> choose network -> choose fixed or custom amount -> confirm -> create GMPay order.
+- Recharge: `/wallet` -> `充值 USDT` -> choose fixed or custom amount -> confirm -> create GMPay order -> open GMPay cashier.
 - Custom recharge amounts are validated as numeric, 2 decimal places max, and within `MIN_RECHARGE_AMOUNT` / `MAX_RECHARGE_AMOUNT`.
 - Bet amount changes support fixed amounts and custom stake input. The confirmation page recalculates potential payout before submission.
 - Withdrawal: `/wallet` -> withdrawal request -> amount -> network -> address -> confirmation. Withdrawals still require admin review and never auto-pay.
@@ -481,7 +490,17 @@ Unknown orders log `gmpay callback order not found`. Duplicate paid callbacks re
 Admin recharge diagnostics:
 
 - `/admin_deposits` shows the latest 20 deposit orders.
-- `/admin_deposit <order_id>` shows order amount, status, trade id, network, payment URL, raw create response, raw callback payload, and timestamps.
+- `/admin_deposit <order_id>` shows order amount, status, manual review fields, trade id, txid, network, payment URL, raw create response, raw callback payload, and timestamps.
+- `/admin_mark_deposit_paid <order_id> <amount> <txid> <reason>` manually credits an abnormal deposit and writes `wallet_ledger.type=deposit_manual`.
+- `/admin_reject_deposit <order_id> <reason>` rejects an abnormal deposit and writes an admin audit log.
+
+GMPay config diagnostics:
+
+```bash
+python -m football_score_bot.tools.gmpay_config_probe
+```
+
+The probe prints public `supported_assets` and site info only. It does not print `GMPAY_SECRET`.
 
 Before deploying a server, run:
 

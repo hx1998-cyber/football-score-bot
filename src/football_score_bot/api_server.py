@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
 import uvicorn
@@ -109,6 +109,18 @@ async def gmpay_webhook(request: Request) -> Response:
             order.get("status"),
         )
         return Response("ok", media_type="text/plain")
+    if order.get("status") == "manual_review":
+        logger.info(
+            "duplicate manual review callback ignored order_id=%s trade_id=%s status=%s actual_amount=%s signature_valid=%s matched_order=true deposit_status_before=%s deposit_status_after=%s",
+            order_id,
+            normalized["trade_id"],
+            normalized["status"],
+            normalized["actual_amount"],
+            signature_valid,
+            status_before,
+            order.get("status"),
+        )
+        return Response("ok", media_type="text/plain")
     if not _is_success_status(normalized["status"]):
         logger.info(
             "gmpay callback ignored non-paid order_id=%s trade_id=%s status=%s actual_amount=%s signature_valid=%s matched_order=true deposit_status_before=%s deposit_status_after=%s",
@@ -125,17 +137,58 @@ async def gmpay_webhook(request: Request) -> Response:
     if normalized["trade_id"] and order.get("trade_id") and normalized["trade_id"] != str(order["trade_id"]):
         logger.warning("gmpay webhook trade_id mismatch order_id=%s", order_id)
         raise HTTPException(status_code=400, detail="trade_id mismatch")
-    if normalized["actual_amount"] and order.get("actual_amount"):
-        if Decimal(str(normalized["actual_amount"])) != Decimal(str(order["actual_amount"])):
-            logger.warning("gmpay webhook actual_amount mismatch order_id=%s", order_id)
-            raise HTTPException(status_code=400, detail="actual_amount mismatch")
-
     callback_payload = {
         **payload,
         "trade_id": normalized["trade_id"],
-        "actual_amount": normalized["actual_amount"] or order.get("actual_amount"),
+        "actual_amount": normalized["actual_amount"],
         "chain_tx_id": normalized["chain_tx_id"],
     }
+    actual_amount = _parse_decimal(normalized["actual_amount"])
+    requested_amount = _parse_decimal(order.get("amount_requested"))
+    if actual_amount is None:
+        note = "GMPay success callback missing actual_amount"
+        updated_order = await database.mark_deposit_manual_review(
+            order_id,
+            note=note,
+            callback_payload=callback_payload,
+            trade_id=normalized["trade_id"],
+            chain_tx_id=normalized["chain_tx_id"],
+            error_message=note,
+        )
+        await _notify_deposit_manual_review(bot, settings, order, updated_order or order, note)
+        return Response("ok", media_type="text/plain")
+    if requested_amount is None:
+        note = "Deposit order amount_requested is invalid"
+        updated_order = await database.mark_deposit_manual_review(
+            order_id,
+            note=note,
+            callback_payload=callback_payload,
+            actual_amount=actual_amount,
+            trade_id=normalized["trade_id"],
+            chain_tx_id=normalized["chain_tx_id"],
+            error_message=note,
+        )
+        await _notify_deposit_manual_review(bot, settings, order, updated_order or order, note)
+        return Response("ok", media_type="text/plain")
+    amount_diff = abs(actual_amount - requested_amount)
+    if amount_diff > settings.payment_amount_tolerance_usdt:
+        note = (
+            f"Payment amount mismatch: requested={requested_amount} actual={actual_amount} "
+            f"tolerance={settings.payment_amount_tolerance_usdt}"
+        )
+        updated_order = await database.mark_deposit_manual_review(
+            order_id,
+            note=note,
+            callback_payload=callback_payload,
+            actual_amount=actual_amount,
+            trade_id=normalized["trade_id"],
+            chain_tx_id=normalized["chain_tx_id"],
+            error_message=note,
+        )
+        await _notify_deposit_manual_review(bot, settings, order, updated_order or order, note)
+        logger.warning("gmpay callback moved to manual_review order_id=%s %s", order_id, note)
+        return Response("ok", media_type="text/plain")
+
     paid = await wallets.credit_deposit(int(order["user_id"]), order, callback_payload)
     updated_order = await database.get_deposit_order(order_id)
     status_after = str(updated_order.get("status")) if updated_order else status_before
@@ -195,8 +248,50 @@ def _optional_text(value: Any) -> str | None:
     return text or None
 
 
+def _parse_decimal(value: Any) -> Decimal | None:
+    if value is None or value == "":
+        return None
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError):
+        return None
+
+
 def _amount_text(value: Any) -> str:
     return str(value or "0").rstrip("0").rstrip(".") if "." in str(value or "") else str(value or "0")
+
+
+async def _notify_deposit_manual_review(
+    bot: Bot,
+    settings: Settings,
+    original_order: dict[str, Any],
+    order: dict[str, Any],
+    note: str,
+) -> None:
+    order_id = str(order.get("order_id") or original_order.get("order_id"))
+    user_id = int(order.get("user_id") or original_order["user_id"])
+    try:
+        await bot.send_message(
+            user_id,
+            "充值订单金额或状态异常，已进入人工核查。\n"
+            f"订单号：{order_id}\n"
+            "请准备 txid 联系管理员。",
+        )
+    except Exception:
+        logger.info("failed to notify manual review user_id=%s order_id=%s", user_id, order_id, exc_info=True)
+    admin_text = (
+        "充值订单进入人工核查\n"
+        f"order_id={order_id}\n"
+        f"user_id={user_id}\n"
+        f"amount_requested={order.get('amount_requested') or original_order.get('amount_requested')}\n"
+        f"actual_amount={order.get('actual_amount') or '-'}\n"
+        f"note={note}"
+    )
+    for admin_id in settings.super_admin_user_ids | settings.admin_user_ids:
+        try:
+            await bot.send_message(admin_id, admin_text)
+        except Exception:
+            logger.info("failed to notify deposit admin_id=%s order_id=%s", admin_id, order_id, exc_info=True)
 
 
 def _build_gmpay_client(settings: Settings) -> GMPayClient:

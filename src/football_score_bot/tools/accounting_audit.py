@@ -94,7 +94,7 @@ async def _check_paid_deposits_have_ledger(conn: asyncpg.Connection, failures: l
         SELECT d.order_id
         FROM deposit_orders d
         LEFT JOIN wallet_ledger l
-          ON l.ref_type = 'deposit_order' AND l.ref_id = d.order_id AND l.type = 'deposit'
+          ON l.ref_type = 'deposit_order' AND l.ref_id = d.order_id AND l.type IN ('deposit', 'deposit_manual')
         WHERE d.status = 'paid' AND l.id IS NULL
         """
     )

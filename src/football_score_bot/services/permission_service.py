@@ -57,6 +57,9 @@ class PermissionService:
     async def can_review_withdrawals(self, operator_id: int | None) -> bool:
         return await self.get_user_role(operator_id) in {"super_admin", "admin"}
 
+    async def can_review_deposits(self, operator_id: int | None) -> bool:
+        return await self.get_user_role(operator_id) in {"super_admin", "admin"}
+
     async def can_manage_rebates(self, operator_id: int | None) -> bool:
         return await self.get_user_role(operator_id) in {"super_admin", "admin", "agent"}
 

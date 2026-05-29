@@ -153,6 +153,14 @@ class GMPayClient:
             raw_json=body,
         )
 
+    async def get_gmpay_config(self) -> dict[str, Any]:
+        if not self._base_url:
+            raise RuntimeError("GMPAY_BASE_URL is required")
+        response = await self._client.get(f"{self._base_url}/payments/gmpay/v1/config")
+        response.raise_for_status()
+        body = response.json()
+        return body if isinstance(body, dict) else {"data": body}
+
     def unsigned_create_payload(self, *, order_id: str, amount: Decimal, notify_url: str, redirect_url: str | None) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "pid": self._pid,

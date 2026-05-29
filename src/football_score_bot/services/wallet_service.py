@@ -42,7 +42,15 @@ class WalletService:
     async def get_balance(self, user_id: int) -> dict:
         return await self.get_or_create_wallet(user_id)
 
-    async def credit_deposit(self, user_id: int, deposit_order: dict, callback_payload: dict[str, Any] | None = None) -> bool:
+    async def credit_deposit(
+        self,
+        user_id: int,
+        deposit_order: dict,
+        callback_payload: dict[str, Any] | None = None,
+        *,
+        ledger_type: str = "deposit",
+        description: str = "GMPay deposit",
+    ) -> bool:
         order_id = str(deposit_order["order_id"])
         trade_id = _optional_text((callback_payload or {}).get("trade_id") or deposit_order.get("trade_id"))
         chain_tx_id = _optional_text(
@@ -105,7 +113,7 @@ class WalletService:
                         user_id, currency, type, amount, balance_before, balance_after,
                         ref_type, ref_id, description
                     )
-                    VALUES ($1, $2, 'deposit', $3, $4, $5, 'deposit_order', $6, 'GMPay deposit')
+                    VALUES ($1, $2, $7, $3, $4, $5, 'deposit_order', $6, $8)
                     ON CONFLICT DO NOTHING
                     RETURNING id
                     """,
@@ -115,6 +123,8 @@ class WalletService:
                     balance_before,
                     balance_after,
                     order_id,
+                    ledger_type,
+                    description,
                 )
                 if not ledger_id:
                     return False
@@ -135,6 +145,7 @@ class WalletService:
                     """
                     UPDATE deposit_orders
                     SET status = 'paid',
+                        manual_review_required = FALSE,
                         actual_amount = COALESCE($2, actual_amount),
                         trade_id = COALESCE($3, trade_id),
                         chain_tx_id = COALESCE($4, chain_tx_id),

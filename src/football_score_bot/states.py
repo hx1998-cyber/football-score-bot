@@ -4,7 +4,6 @@ from aiogram.fsm.state import State, StatesGroup
 
 
 class RechargeStates(StatesGroup):
-    choosing_network = State()
     choosing_amount = State()
     waiting_custom_amount = State()
     confirming_recharge = State()

@@ -45,6 +45,7 @@ class Settings:
     gmpay_default_payment_type: str | None
     gmpay_min_recharge_usdt: Decimal
     gmpay_order_expire_minutes: int
+    payment_amount_tolerance_usdt: Decimal
     epusdt_base_url: str
     epusdt_api_secret: str
     epusdt_notify_url: str
@@ -147,6 +148,7 @@ def load_settings() -> Settings:
         gmpay_default_payment_type=os.getenv("GMPAY_DEFAULT_PAYMENT_TYPE") or None,
         gmpay_min_recharge_usdt=Decimal(os.getenv("GMPAY_MIN_RECHARGE_USDT", "2")),
         gmpay_order_expire_minutes=int(os.getenv("GMPAY_ORDER_EXPIRE_MINUTES", "30")),
+        payment_amount_tolerance_usdt=Decimal(os.getenv("PAYMENT_AMOUNT_TOLERANCE_USDT", "0.01")),
         epusdt_base_url=os.getenv("EPUSDT_BASE_URL", "").rstrip("/"),
         epusdt_api_secret=os.getenv("EPUSDT_API_SECRET", ""),
         epusdt_notify_url=os.getenv("EPUSDT_NOTIFY_URL", ""),
