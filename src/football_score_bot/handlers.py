@@ -492,7 +492,7 @@ def build_router(
             is_suspended_by_admin=bool(override and override.get("is_suspended")),
         )
         if not bet_status.is_bettable:
-            await callback.message.answer(f"当前不可投注：{reason_label(bet_status.reason)}")
+            await callback.message.answer(_bet_unavailable_message(bet_status.reason))
             return
         raw_stake = parts[5] if len(parts) > 5 else str(settings.default_bet_amount)
         try:
@@ -505,6 +505,15 @@ def build_router(
                 f"下注金额超出限制：{_money(settings.min_bet_amount)}-{_money(settings.max_bet_amount)} {settings.wallet_currency}"
             )
             return
+        if settings.real_betting_enabled or settings.bet_require_balance_for_simulation:
+            wallet_row = await wallet_service.get_balance(callback.from_user.id)
+            balance = Decimal(str(wallet_row.get("balance") or 0))
+            if balance < stake_decimal:
+                await callback.message.answer(
+                    _format_insufficient_balance(stake_decimal, balance, settings.wallet_currency),
+                    reply_markup=_insufficient_balance_keyboard(fixture_id),
+                )
+                return
         stake = str(stake_decimal)
         odds = str(outcome.odds)
         try:
@@ -531,12 +540,22 @@ def build_router(
             fixture_start_time=_fixture_start_time(fixture),
         )
         if bet_id is None:
-            await callback.message.answer("余额不足，无法提交真实下注。")
+            wallet_row = await wallet_service.get_balance(callback.from_user.id)
+            await callback.message.answer(
+                _format_insufficient_balance(stake_decimal, Decimal(str(wallet_row.get("balance") or 0)), settings.wallet_currency),
+                reply_markup=_insufficient_balance_keyboard(fixture_id),
+            )
             return
         bet = await database.get_bet(bet_id)
         await callback.message.answer(
             _format_bet_created(bet or {"id": bet_id}, settings.wallet_currency),
-            reply_markup=bet_created_keyboard(str((bet or {}).get("bet_no") or bet_id), fixture_id),
+            reply_markup=bet_detail_keyboard(
+                str((bet or {}).get("bet_no") or bet_id),
+                str((bet or {}).get("status") or "pending"),
+                "pending",
+                0,
+                fixture_id=fixture_id,
+            ),
         )
         return
         if settings.real_betting_enabled:
@@ -877,7 +896,7 @@ def build_router(
         parts = callback.data.split(":")
         status_group = parts[1] if len(parts) > 1 else "pending"
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
-        await _send_bets_page(callback.message, callback.from_user.id, status_group, page, database)
+        await _send_bets_page(callback.message, callback.from_user.id, status_group, page, database, settings)
 
     @router.message(F.text.in_(_translated_texts("betting_center") | _translated_texts("my_bets") | {"📊 我的注单"}))
     @router.message(Command("bets"))
@@ -886,7 +905,7 @@ def build_router(
         if not message.from_user:
             await message.answer("请先打开机器人后再查看注单。", reply_markup=my_bets_keyboard())
             return
-        await _send_bets_page(message, message.from_user.id, "pending", 0, database)
+        await _send_bets_page(message, message.from_user.id, "pending", 0, database, settings)
 
     @router.callback_query(F.data.startswith("bet_detail:"))
     async def bet_detail(callback: CallbackQuery) -> None:
@@ -903,7 +922,13 @@ def build_router(
             return
         await callback.message.answer(
             _format_bet_detail(bet, settings.wallet_currency),
-            reply_markup=bet_detail_keyboard(str(bet.get("bet_no") or bet.get("id")), str(bet.get("status")), status_group, page),
+            reply_markup=bet_detail_keyboard(
+                str(bet.get("bet_no") or bet.get("id")),
+                str(bet.get("status")),
+                status_group,
+                page,
+                fixture_id=int(bet["fixture_id"]) if bet.get("fixture_id") else None,
+            ),
         )
 
     @router.callback_query(F.data.startswith("bet_cancel:"))
@@ -943,7 +968,15 @@ def build_router(
         result = await settlement_service.settle_bet_from_fixture(bet, fixture, source="auto")
         if result.get("settled"):
             fresh = await database.get_user_bet(callback.from_user.id, bet_key)
-            await callback.message.answer(_format_bet_detail(fresh or bet, settings.wallet_currency))
+            detail = fresh or bet
+            await callback.message.answer(
+                _format_bet_detail(detail, settings.wallet_currency),
+                reply_markup=bet_detail_keyboard(
+                    str(detail.get("bet_no") or detail.get("id")),
+                    str(detail.get("status")),
+                    fixture_id=int(detail["fixture_id"]) if detail.get("fixture_id") else None,
+                ),
+            )
         elif result.get("reason") == "not_final":
             await callback.message.answer("比赛尚未结束，系统将在赛果确认后自动结算。")
         elif result.get("reason") == "unsupported_market":
@@ -1098,6 +1131,8 @@ def build_router(
             "/admin_deposit <order_id>\n"
             "/admin_mark_deposit_paid <order_id> <amount> <txid> <reason>\n"
             "/admin_reject_deposit <order_id> <reason>\n"
+            "/admin_clear_my_test_bets\n"
+            "/admin_clear_user_test_bets <telegram_user_id>\n"
             "/admin_adjust_balance <telegram_user_id> <amount> <reason>\n"
             "/admin_bets\n"
             "/admin_bet <bet_id>\n"
@@ -1633,6 +1668,40 @@ def build_router(
             return
         await message.answer(_format_admin_user(await database.get_user_admin_view(user_id)))
 
+    @router.message(Command("admin_clear_my_test_bets"))
+    async def admin_clear_my_test_bets(message: Message) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可以清理测试注单。")
+            return
+        count = await database.clear_user_test_bets(message.from_user.id)
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_clear_my_test_bets",
+            "bets",
+            str(message.from_user.id),
+            {"cleared": count, "is_simulated": True},
+        )
+        await message.answer(f"已清理模拟测试注单：{count} 张。")
+
+    @router.message(Command("admin_clear_user_test_bets"))
+    async def admin_clear_user_test_bets(message: Message, command: CommandObject) -> None:
+        if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
+            await message.answer("只有超级管理员可以清理测试注单。")
+            return
+        user_id = _first_int_arg(command)
+        if user_id is None:
+            await message.answer("用法：/admin_clear_user_test_bets <telegram_user_id>")
+            return
+        count = await database.clear_user_test_bets(user_id)
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_clear_user_test_bets",
+            "bets",
+            str(user_id),
+            {"cleared": count, "is_simulated": True},
+        )
+        await message.answer(f"已清理用户 {user_id} 的模拟测试注单：{count} 张。")
+
     @router.message(Command("admin_agent_applications"))
     async def admin_agent_applications(message: Message) -> None:
         if not _admin_private_allowed(message, settings) or not await permission_service.is_super_admin(message.from_user.id):
@@ -1688,13 +1757,22 @@ async def _start_text(
     tomorrow = date.today() + timedelta(days=1)
     tomorrow_matches, _ = await get_bettable_matches_for_date(cache, api_client, database, settings, tomorrow)
     live = await _get_live(cache, api_client)
-    pending = await database.count_user_pending_bets(telegram_user_id) if telegram_user_id else 0
+    stats = await database.get_user_bet_stats(telegram_user_id) if telegram_user_id else {}
+    pending = int(stats.get("pending_count") or 0)
+    simulated_pending = int(stats.get("simulated_pending_count") or 0)
+    mode_lines = []
+    if not settings.real_betting_enabled:
+        mode_lines.append("当前为模拟下注模式，不扣真实余额。")
+        if settings.bet_require_balance_for_simulation:
+            mode_lines.append("模拟下注仍需钱包余额覆盖下注金额。")
     return (
         "WorldCupTop Bot\n\n"
         f"今日可投注：{_count_by_date(today_matches, date.today())} 场\n"
         f"明日可投注：{len(tomorrow_matches)} 场\n"
         f"实时比赛：{len(live)} 场\n"
-        f"我的待结算注单：{pending} 张"
+        f"我的待结算注单：{pending} 张\n"
+        f"其中模拟注单：{simulated_pending} 张"
+        + (("\n" + "\n".join(mode_lines)) if mode_lines else "")
     )
 
 
@@ -2773,15 +2851,23 @@ def _format_agent_applications(rows: list[dict]) -> str:
     return "\n".join(lines)
 
 
-async def _send_bets_page(message: Message, user_id: int, status_group: str, page: int, database: Database) -> None:
+async def _send_bets_page(
+    message: Message,
+    user_id: int,
+    status_group: str,
+    page: int,
+    database: Database,
+    settings: Settings,
+) -> None:
     page = max(page, 0)
     per_page = 5
-    pending_count = await database.count_user_bets_by_group(user_id, "pending")
-    settled_count = await database.count_user_bets_by_group(user_id, "settled")
+    stats = await database.get_user_bet_stats(user_id)
     rows = await database.list_user_bets(user_id, status_group=status_group, limit=per_page, offset=page * per_page)
-    total = settled_count if status_group == "settled" else pending_count
+    total = int(stats.get("settled_count") or 0) if status_group == "settled" else (
+        int(stats.get("pending_count") or 0) + int(stats.get("manual_required_count") or 0)
+    )
     await message.answer(
-        _format_bets_page(rows, pending_count, settled_count, status_group),
+        _format_bets_page(rows, stats, status_group, settings),
         reply_markup=my_bets_keyboard(
             rows,
             status_group,
@@ -2843,9 +2929,25 @@ async def _notify_user(bot: Any, user_id: int | None, text: str) -> None:
         logger.info("failed to send notification user_id=%s", user_id, exc_info=True)
 
 
-def _format_bets_page(rows: list[dict], pending_count: int, settled_count: int, status_group: str) -> str:
+def _format_bets_page(rows: list[dict], stats: dict, status_group: str, settings: Settings) -> str:
     title = "📊 我的注单"
-    lines = [title, "", f"待结算：{pending_count} 张", f"已结算：{settled_count} 张", ""]
+    pending_count = int(stats.get("pending_count") or 0)
+    manual_required_count = int(stats.get("manual_required_count") or 0)
+    settled_count = int(stats.get("settled_count") or 0)
+    simulated_pending_count = int(stats.get("simulated_pending_count") or 0)
+    lines = [
+        title,
+        "",
+        f"我的待结算注单：{pending_count} 张",
+        f"其中模拟注单：{simulated_pending_count} 张",
+        f"待人工结算：{manual_required_count} 张",
+        f"已结算：{settled_count} 张",
+    ]
+    if not settings.real_betting_enabled:
+        lines.append("当前为模拟下注模式，不扣真实余额。")
+        if settings.bet_require_balance_for_simulation:
+            lines.append("模拟下注仍需钱包余额覆盖下注金额。")
+    lines.append("")
     if not rows:
         lines.append("暂无注单。")
         return "\n".join(lines)
@@ -2869,6 +2971,33 @@ def _format_bet_created(bet: dict, currency: str) -> str:
         f"预计返还：{_money(bet.get('potential_payout'))} {currency}\n"
         "状态：待结算"
     )
+
+
+def _format_insufficient_balance(stake: Decimal, balance: Decimal, currency: str) -> str:
+    return (
+        "💰 钱包余额不足\n\n"
+        f"本次下注：{_money(stake)} {currency}\n"
+        f"当前余额：{_money(balance)} {currency}\n\n"
+        "请先充值后再下注。"
+    )
+
+
+def _insufficient_balance_keyboard(fixture_id: int | None = None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text="充值 USDT", callback_data="wallet:recharge")]]
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _bet_unavailable_message(reason: str) -> str:
+    if reason in {"cutoff_reached", "suspended_by_admin"}:
+        return "本场比赛已封盘，无法下注。"
+    if reason == "already_started":
+        return "本场比赛已开始，当前暂不支持滚球下注。"
+    if reason in {"no_odds", "no_market"}:
+        return "赔率已更新，请返回赛事重新选择。"
+    return f"当前不可投注：{reason_label(reason)}"
 
 
 def _format_bet_detail(bet: dict, currency: str) -> str:

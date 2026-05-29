@@ -59,6 +59,7 @@ class Settings:
     wallet_currency: str
     withdraw_enabled: bool
     real_betting_enabled: bool
+    bet_require_balance_for_simulation: bool
     bet_settlement_admin_only: bool
     bet_auto_settlement_enabled: bool
     bet_settlement_interval_seconds: int
@@ -162,6 +163,7 @@ def load_settings() -> Settings:
         wallet_currency=os.getenv("WALLET_CURRENCY", "USDT"),
         withdraw_enabled=_parse_bool(os.getenv("WITHDRAW_ENABLED", "false")),
         real_betting_enabled=_parse_bool(os.getenv("REAL_BETTING_ENABLED", "false")),
+        bet_require_balance_for_simulation=_parse_bool(os.getenv("BET_REQUIRE_BALANCE_FOR_SIMULATION", "true")),
         bet_settlement_admin_only=_parse_bool(os.getenv("BET_SETTLEMENT_ADMIN_ONLY", "false")),
         bet_auto_settlement_enabled=_parse_bool(os.getenv("BET_AUTO_SETTLEMENT_ENABLED", "true")),
         bet_settlement_interval_seconds=max(10, int(os.getenv("BET_SETTLEMENT_INTERVAL_SECONDS", "60"))),

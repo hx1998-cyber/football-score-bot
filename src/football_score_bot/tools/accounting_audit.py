@@ -11,6 +11,13 @@ DATABASE_URL = os.getenv(
     "DATABASE_URL",
     "postgresql://football:football_password@postgres:5432/football_score_bot",
 )
+REAL_BETTING_ENABLED = os.getenv("REAL_BETTING_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+BET_REQUIRE_BALANCE_FOR_SIMULATION = os.getenv("BET_REQUIRE_BALANCE_FOR_SIMULATION", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 async def main() -> None:
@@ -19,6 +26,8 @@ async def main() -> None:
     try:
         await _check_non_negative_wallets(conn, failures)
         await _check_pending_bets_frozen(conn, failures)
+        await _check_simulated_bets_do_not_freeze(conn, failures)
+        await _check_simulation_balance_gate(conn, failures)
         await _check_ledger_running_balances(conn, failures)
         await _check_paid_deposits_have_ledger(conn, failures)
         await _check_settled_bets_have_ledger(conn, failures)
@@ -46,11 +55,22 @@ async def _check_non_negative_wallets(conn: asyncpg.Connection, failures: list[s
 
 
 async def _check_pending_bets_frozen(conn: asyncpg.Connection, failures: list[str]) -> None:
+    if not REAL_BETTING_ENABLED:
+        return
+    rows = await conn.fetch(
+        """
+        SELECT id
+        FROM bets
+        WHERE status = 'pending' AND COALESCE(is_simulated, TRUE) = FALSE AND balance_frozen = FALSE
+        """
+    )
+    for row in rows:
+        failures.append(f"real pending bet not marked frozen bet_id={row['id']}")
     rows = await conn.fetch(
         """
         SELECT COALESCE(user_id, telegram_user_id) AS user_id, COALESCE(SUM(stake), 0) AS pending_stake
         FROM bets
-        WHERE status = 'pending' AND balance_frozen = TRUE
+        WHERE status = 'pending' AND COALESCE(is_simulated, TRUE) = FALSE AND balance_frozen = TRUE
         GROUP BY COALESCE(user_id, telegram_user_id)
         """
     )
@@ -61,6 +81,38 @@ async def _check_pending_bets_frozen(conn: asyncpg.Connection, failures: list[st
                 f"pending bet stake exceeds frozen balance user={row['user_id']} "
                 f"stake={row['pending_stake']} frozen={frozen}"
             )
+
+
+async def _check_simulated_bets_do_not_freeze(conn: asyncpg.Connection, failures: list[str]) -> None:
+    rows = await conn.fetch(
+        """
+        SELECT id
+        FROM bets
+        WHERE COALESCE(is_simulated, TRUE) = TRUE AND COALESCE(balance_frozen, FALSE) = TRUE
+        """
+    )
+    for row in rows:
+        failures.append(f"simulated bet has frozen balance flag bet_id={row['id']}")
+
+
+async def _check_simulation_balance_gate(conn: asyncpg.Connection, failures: list[str]) -> None:
+    if not BET_REQUIRE_BALANCE_FOR_SIMULATION:
+        return
+    rows = await conn.fetch(
+        """
+        SELECT b.id, COALESCE(b.user_id, b.telegram_user_id) AS user_id, b.stake, COALESCE(w.balance, 0) AS balance
+        FROM bets b
+        LEFT JOIN wallets w ON w.user_id = COALESCE(b.user_id, b.telegram_user_id)
+        WHERE b.status = 'pending'
+          AND COALESCE(b.is_simulated, TRUE) = TRUE
+          AND COALESCE(w.balance, 0) < b.stake
+        """
+    )
+    for row in rows:
+        failures.append(
+            f"simulated pending bet exceeds current wallet balance bet_id={row['id']} "
+            f"user={row['user_id']} stake={row['stake']} balance={row['balance']}"
+        )
 
 
 async def _check_ledger_running_balances(conn: asyncpg.Connection, failures: list[str]) -> None:
@@ -105,12 +157,14 @@ async def _check_paid_deposits_have_ledger(conn: asyncpg.Connection, failures: l
 async def _check_settled_bets_have_ledger(conn: asyncpg.Connection, failures: list[str]) -> None:
     rows = await conn.fetch(
         """
-        SELECT b.id, b.status
+        SELECT b.id, b.status, COALESCE(b.is_simulated, TRUE) AS is_simulated
         FROM bets b
         LEFT JOIN wallet_ledger l
           ON l.ref_type = 'bet' AND l.ref_id = b.id::TEXT
-         AND l.type IN ('bet_win_payout', 'bet_loss', 'bet_void_refund')
-        WHERE b.status IN ('won', 'lost', 'void', 'cancelled') AND l.id IS NULL
+         AND l.type IN ('bet_win_payout', 'bet_loss', 'bet_void_refund', 'bet_cancel_refund')
+        WHERE b.status IN ('won', 'lost', 'void', 'cancelled')
+          AND COALESCE(b.is_simulated, TRUE) = FALSE
+          AND l.id IS NULL
         """
     )
     for row in rows:

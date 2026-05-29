@@ -351,6 +351,15 @@ class WalletService:
     ) -> int | None:
         async with self._database.pool.acquire() as conn:
             async with conn.transaction():
+                wallet = None
+                balance_before = Decimal("0")
+                frozen_before = Decimal("0")
+                if real_betting_enabled:
+                    wallet = await self._locked_wallet(conn, user_id)
+                    balance_before = Decimal(str(wallet["balance"]))
+                    frozen_before = Decimal(str(wallet["frozen_balance"]))
+                    if balance_before < stake:
+                        return None
                 bet_id = None
                 bet_no = ""
                 for _ in range(8):
@@ -397,15 +406,6 @@ class WalletService:
                 if not real_betting_enabled:
                     return int(bet_id)
 
-                wallet = await self._locked_wallet(conn, user_id)
-                balance_before = Decimal(str(wallet["balance"]))
-                frozen_before = Decimal(str(wallet["frozen_balance"]))
-                if balance_before < stake:
-                    await conn.execute(
-                        "UPDATE bets SET status = 'cancelled', settlement_note = 'insufficient balance', updated_at = NOW() WHERE id = $1",
-                        bet_id,
-                    )
-                    return None
                 balance_after = balance_before - stake
                 frozen_after = frozen_before + stake
                 await conn.execute(

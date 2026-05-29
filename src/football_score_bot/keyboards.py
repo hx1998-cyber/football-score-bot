@@ -393,3 +393,21 @@ def bet_detail_keyboard(bet_id_or_no: str, status: str, status_group: str = "pen
     rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+def bet_detail_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status == "pending":
+        rows.append([InlineKeyboardButton(text="去结算", callback_data=f"bet_settle:{bet_id_or_no}")])
+        rows.append([InlineKeyboardButton(text="删除本单", callback_data=f"bet_cancel:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

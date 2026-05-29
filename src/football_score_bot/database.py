@@ -763,7 +763,7 @@ class Database:
                 fixture_start_time, market_key, market_title, selection,
                 odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout,
                 payout::TEXT AS payout, status, result_score, settlement_source, settlement_note,
-                settled_at, bettable_status_at_submit, created_at
+                settled_at, bettable_status_at_submit, balance_frozen, is_simulated, created_at
             FROM bets
             WHERE COALESCE(user_id, telegram_user_id) = $1 AND status = ANY($2::TEXT[])
             ORDER BY created_at DESC
@@ -789,6 +789,30 @@ class Database:
             )
             or 0
         )
+
+    async def get_user_bet_stats(self, telegram_user_id: int) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'pending') AS pending_count,
+                COUNT(*) FILTER (WHERE status = 'manual_required') AS manual_required_count,
+                COUNT(*) FILTER (WHERE status IN ('won', 'lost', 'void', 'cancelled')) AS settled_count,
+                COUNT(*) FILTER (WHERE COALESCE(is_simulated, TRUE) = FALSE) AS real_bet_count,
+                COUNT(*) FILTER (WHERE COALESCE(is_simulated, TRUE) = TRUE) AS simulated_bet_count,
+                COUNT(*) FILTER (WHERE status = 'pending' AND COALESCE(is_simulated, TRUE) = TRUE) AS simulated_pending_count
+            FROM bets
+            WHERE COALESCE(user_id, telegram_user_id) = $1
+            """,
+            telegram_user_id,
+        )
+        return dict(row) if row else {
+            "pending_count": 0,
+            "manual_required_count": 0,
+            "settled_count": 0,
+            "real_bet_count": 0,
+            "simulated_bet_count": 0,
+            "simulated_pending_count": 0,
+        }
 
     async def count_user_pending_bets(self, telegram_user_id: int) -> int:
         return int(
@@ -838,6 +862,23 @@ class Database:
             value,
         )
         return dict(row) if row else None
+
+    async def clear_user_test_bets(self, telegram_user_id: int) -> int:
+        result = await self._pool.execute(
+            """
+            UPDATE bets
+            SET status = 'cancelled',
+                settlement_source = 'admin',
+                settlement_note = 'cleared simulated test bet',
+                settled_at = COALESCE(settled_at, NOW()),
+                updated_at = NOW()
+            WHERE COALESCE(user_id, telegram_user_id) = $1
+              AND COALESCE(is_simulated, TRUE) = TRUE
+              AND status <> 'cancelled'
+            """,
+            telegram_user_id,
+        )
+        return _command_count(result)
 
     async def list_admin_bets(self, status: str = "pending", limit: int = 20) -> list[dict]:
         statuses = ("pending", "manual_required") if status == "pending" else (status,)
@@ -1520,3 +1561,10 @@ def _decode_referral_code(code: str) -> int | None:
         return int(code.lower(), 36)
     except ValueError:
         return None
+
+
+def _command_count(result: str) -> int:
+    try:
+        return int(result.rsplit(" ", 1)[1])
+    except (IndexError, ValueError):
+        return 0

@@ -166,6 +166,7 @@ MAX_REFERRAL_LEVEL=1
 WALLET_CURRENCY=USDT
 WITHDRAW_ENABLED=false
 REAL_BETTING_ENABLED=false
+BET_REQUIRE_BALANCE_FOR_SIMULATION=true
 BET_SETTLEMENT_ADMIN_ONLY=true
 MIN_BET_AMOUNT=1
 MAX_BET_AMOUNT=100
@@ -421,7 +422,25 @@ M10 moves betting to a single-ticket lifecycle. Each submitted bet gets a short 
 
 Normal users can only cancel a pending bet before kickoff and before the configured lock window (`BET_CANCEL_BEFORE_START_MINUTES`). Deleting a ticket never removes the database row; it marks the bet `cancelled`. Settled tickets cannot be cancelled or reopened by normal users.
 
-`REAL_BETTING_ENABLED=false` keeps local and trial betting simulated: bets are created with `is_simulated=true` and no real wallet balance is changed. When `REAL_BETTING_ENABLED=true`, placing a bet moves stake from `wallets.balance` to `wallets.frozen_balance` and writes `wallet_ledger type=bet_freeze`. Settlement, void refunds, and user cancellations also write `wallet_ledger`.
+`REAL_BETTING_ENABLED=false` keeps local and trial betting simulated: bets are created with `is_simulated=true` and no real wallet balance is changed. When `BET_REQUIRE_BALANCE_FOR_SIMULATION=true`, simulated bets still require `wallets.balance >= stake`, but the stake is not deducted or frozen. This is the recommended local and trial setting:
+
+```env
+REAL_BETTING_ENABLED=false
+BET_REQUIRE_BALANCE_FOR_SIMULATION=true
+```
+
+When `REAL_BETTING_ENABLED=true`, placing a bet requires available balance, moves stake from `wallets.balance` to `wallets.frozen_balance`, creates `is_simulated=false`, `balance_frozen=true`, and writes `wallet_ledger type=bet_freeze`. Settlement, void refunds, and user cancellations also write `wallet_ledger`. Enable real betting only after operational, legal, and accounting checks are complete.
+
+If `REAL_BETTING_ENABLED=false` and `BET_REQUIRE_BALANCE_FOR_SIMULATION=false`, betting is fully simulated and does not check wallet balance; the UI must treat these tickets as simulated.
+
+After confirmation succeeds, the bot opens the bet detail card directly. Pending tickets show settlement check and delete actions; settled tickets are read-only for normal users. `/bets` separates pending, manual review, settled, real, and simulated ticket counts.
+
+Super admins can cancel local simulated test tickets without affecting real tickets:
+
+```text
+/admin_clear_my_test_bets
+/admin_clear_user_test_bets <telegram_user_id>
+```
 
 Automatic settlement is controlled by:
 
