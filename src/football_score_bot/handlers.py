@@ -84,6 +84,15 @@ from football_score_bot.time_utils import now_hhmm
 logger = logging.getLogger(__name__)
 _api_failure_log_times: dict[str, datetime] = {}
 
+MENU_BETTABLE_TEXTS = {"🎯 可投注赛事", "可投注赛事"}
+MENU_BETS_TEXTS = {"📊 我的注单", "我的注单"}
+MENU_WALLET_TEXTS = {"💰 钱包", "钱包", "充值 USDT", "充值与钱包"}
+MENU_REFERRALS_TEXTS = {"👥 推广", "推广", "推广邀请", "邀请返佣"}
+MENU_WORLDCUP_TEXTS = {"🏆 世界杯", "世界杯", "World Cup"}
+MENU_LANGUAGE_TEXTS = {"🌐 语言", "语言", "Language"}
+MENU_SETTINGS_TEXTS = {"设置", "⚙️ 设置", "Settings"}
+MENU_HELP_TEXTS = {"帮助", "❓ 帮助", "Help"}
+
 
 def build_router(
     api_client: ApiFootballClient,
@@ -150,8 +159,12 @@ def build_router(
         )
 
     @router.message(Command("help"))
-    async def help_command(message: Message) -> None:
-        lang = await _remember_user_and_lang(message, database, settings)
+    @router.message(F.text.in_(MENU_HELP_TEXTS))
+    @router.callback_query(F.data == "menu:help")
+    async def help_command(event: Message | CallbackQuery) -> None:
+        await _answer_callback(event)
+        message = _message(event)
+        lang = await _event_lang(event, database, settings)
         await message.answer(
             "/live - " + t(lang, "live_scores") + "\n"
             "/today - " + t(lang, "today_matches") + "\n"
@@ -201,7 +214,8 @@ def build_router(
 
     @router.message(Command("today"))
     @router.message(F.text.in_({"📅 " + text for text in _translated_texts("today_matches")}))
-    @router.message(F.text == "🎯 可投注赛事")
+    @router.message(F.text.in_(MENU_BETTABLE_TEXTS))
+    @router.callback_query(F.data == "menu:bettable")
     @router.callback_query(F.data == "today_featured")
     async def today(event: Message | CallbackQuery) -> None:
         await _answer_callback(event, "加载中...")
@@ -226,8 +240,8 @@ def build_router(
         )
 
     @router.message(Command("worldcup"))
-    @router.message(F.text.in_(_translated_texts("worldcup")))
-    @router.callback_query(F.data == "worldcup")
+    @router.message(F.text.in_(_translated_texts("worldcup") | MENU_WORLDCUP_TEXTS))
+    @router.callback_query(F.data.in_({"worldcup", "menu:worldcup"}))
     async def worldcup(event: Message | CallbackQuery) -> None:
         await _answer_callback(event, "加载中...")
         message = _message(event)
@@ -625,7 +639,11 @@ def build_router(
 
     @router.message(Command("language"))
     @router.message(F.text.in_({"🌐 " + text for text in _translated_texts("language_settings")}))
-    async def language_settings(message: Message) -> None:
+    @router.message(F.text.in_(MENU_LANGUAGE_TEXTS))
+    @router.callback_query(F.data == "menu:language")
+    async def language_settings(event: Message | CallbackQuery) -> None:
+        await _answer_callback(event)
+        message = _message(event)
         await _remember_chat(message, database)
         await message.answer("请选择语言 / Choose language:", reply_markup=language_keyboard())
 
@@ -677,22 +695,18 @@ def build_router(
         await database.set_group_subscription(message.chat, False)
         await message.answer("已取消重点实时比分播报。")
 
-    @router.message(F.text.in_(_translated_texts("wallet")))
+    @router.message(F.text.in_(_translated_texts("wallet") | MENU_WALLET_TEXTS))
     @router.message(Command("wallet"))
-    async def wallet(message: Message) -> None:
+    @router.callback_query(F.data.in_({"wallet", "menu:wallet", "nav:wallet"}))
+    async def wallet(event: Message | CallbackQuery) -> None:
+        await _answer_callback(event)
+        message = _message(event)
         await _remember_user_and_lang(message, database, settings)
-        if not message.from_user:
+        user = event.from_user if isinstance(event, CallbackQuery) else message.from_user
+        if not user:
             return
-        wallet_row = await wallet_service.get_balance(message.from_user.id)
+        wallet_row = await wallet_service.get_balance(user.id)
         await message.answer(_format_wallet(wallet_row, settings.wallet_currency), reply_markup=_wallet_keyboard())
-
-    @router.callback_query(F.data == "wallet")
-    async def wallet_callback(callback: CallbackQuery) -> None:
-        await _safe_callback_answer(callback)
-        if not callback.from_user:
-            return
-        wallet_row = await wallet_service.get_balance(callback.from_user.id)
-        await callback.message.answer(_format_wallet(wallet_row, settings.wallet_currency), reply_markup=_wallet_keyboard())
 
     @router.callback_query(F.data == "wallet:recharge")
     async def wallet_recharge(callback: CallbackQuery, state: FSMContext) -> None:
@@ -887,6 +901,13 @@ def build_router(
             return
         await callback.message.answer(_format_deposit_order(order, settings.wallet_currency), reply_markup=_deposit_order_keyboard(order))
 
+    @router.callback_query(F.data == "menu:bets")
+    async def menu_bets(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        await _send_bets_page(callback.message, callback.from_user.id, "pending", 0, database, settings)
+
     @router.callback_query(F.data.startswith("bets:"))
     async def bets_callback(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback, "加载中...")
@@ -898,7 +919,7 @@ def build_router(
         page = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
         await _send_bets_page(callback.message, callback.from_user.id, status_group, page, database, settings)
 
-    @router.message(F.text.in_(_translated_texts("betting_center") | _translated_texts("my_bets") | {"📊 我的注单"}))
+    @router.message(F.text.in_(_translated_texts("betting_center") | _translated_texts("my_bets") | MENU_BETS_TEXTS))
     @router.message(Command("bets"))
     async def bets(message: Message) -> None:
         await _remember_user_and_lang(message, database, settings)
@@ -984,17 +1005,25 @@ def build_router(
         else:
             await callback.message.answer("赛果暂未确认，请稍后再试。")
 
-    @router.message(F.text.in_(_translated_texts("referrals")))
+    @router.message(F.text.in_(_translated_texts("referrals") | MENU_REFERRALS_TEXTS))
     @router.message(Command("referrals"))
-    async def referrals(message: Message) -> None:
+    @router.callback_query(F.data.in_({"referrals", "menu:referrals", "nav:referrals"}))
+    async def referrals(event: Message | CallbackQuery) -> None:
+        await _answer_callback(event)
+        message = _message(event)
         await _remember_user_and_lang(message, database, settings)
-        if not message.from_user:
+        user = event.from_user if isinstance(event, CallbackQuery) else message.from_user
+        if not user:
             return
-        code = await database.get_referral_code(message.from_user.id)
+        code = await database.get_referral_code(user.id)
         bot_info = await message.bot.get_me()
         link = f"https://t.me/{bot_info.username}?start=ref_{code}"
-        summary = await database.get_referral_summary(message.from_user.id)
-        await message.answer(_format_referrals(link, summary, settings.wallet_currency), reply_markup=_referral_keyboard())
+        summary = await database.get_referral_summary(user.id)
+        role = await permission_service.get_user_role(user.id)
+        await message.answer(
+            _format_referrals(link, summary, settings.wallet_currency),
+            reply_markup=_referral_keyboard(role),
+        )
 
     @router.callback_query(F.data == "referrals:children")
     async def referral_children(callback: CallbackQuery) -> None:
@@ -1109,10 +1138,58 @@ def build_router(
         bot_info = await callback.bot.get_me()
         await callback.message.answer(f"https://t.me/{bot_info.username}?start=ref_{code}")
 
-    @router.message(F.text.in_(_translated_texts("settings")))
+    @router.callback_query(F.data.in_({"referrals:sub_deposits", "referrals:sub_bets", "referrals:sub_rebates"}))
+    async def referral_agent_views(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        role = await permission_service.get_user_role(callback.from_user.id)
+        if role not in {"agent", "admin", "super_admin"}:
+            await callback.message.answer("无代理或管理员权限。", reply_markup=_referral_keyboard(role))
+            return
+        summary = await database.get_referral_summary(callback.from_user.id)
+        title = {
+            "referrals:sub_deposits": "下级充值",
+            "referrals:sub_bets": "下级投注",
+            "referrals:sub_rebates": "下级返水",
+        }.get(callback.data, "下级数据")
+        text = (
+            f"{title}\n\n"
+            f"直属下级：{summary.get('direct_count') or 0} 人\n"
+            f"有效下级：{summary.get('active_count') or 0} 人\n"
+            f"下级累计充值：{_money(summary.get('total_deposit'))} {settings.wallet_currency}\n"
+            f"下级累计投注：{_money(summary.get('total_turnover'))} {settings.wallet_currency}\n"
+            f"待结算返水：{_money(summary.get('pending_rebate'))} {settings.wallet_currency}"
+        )
+        await callback.message.answer(text, reply_markup=_referral_keyboard(role))
+
+    @router.message(F.text.in_(_translated_texts("settings") | MENU_SETTINGS_TEXTS))
     @router.message(Command("settings"))
-    async def settings_command(message: Message) -> None:
-        await language_settings(message)
+    @router.callback_query(F.data == "menu:settings")
+    async def settings_command(event: Message | CallbackQuery) -> None:
+        await language_settings(event)
+
+    @router.message(Command("whoami"))
+    async def whoami(message: Message) -> None:
+        if not message.from_user:
+            return
+        role = await permission_service.get_user_role(message.from_user.id)
+        await message.answer(f"Telegram ID: {message.from_user.id}\nrole: {role}")
+
+    @router.message(Command("admin"))
+    @router.callback_query(F.data == "menu:admin")
+    async def admin_entry(event: Message | CallbackQuery) -> None:
+        await _answer_callback(event)
+        message = _message(event)
+        user_id = event.from_user.id if isinstance(event, CallbackQuery) and event.from_user else (message.from_user.id if message.from_user else None)
+        if not settings.super_admin_user_ids:
+            await message.answer("未配置超级管理员，请在 .env 设置 SUPER_ADMIN_USER_IDS。")
+            return
+        role = await permission_service.get_user_role(user_id)
+        if role not in {"super_admin", "admin", "agent"}:
+            await message.answer("无管理员权限。")
+            return
+        await message.answer(_admin_menu_text(role))
 
     @router.message(Command("admin"))
     async def admin(message: Message) -> None:
@@ -1742,6 +1819,12 @@ def build_router(
             await database.set_user_role(int(row["user_id"]), "agent", message.from_user.id)
         await database.add_admin_audit_log(message.from_user.id, f"admin_{status}_agent", "agent_application", str(application_id), {"reviewed": bool(row)})
         await message.answer("代理申请已处理。" if row else "申请不存在或已处理。")
+
+    @router.callback_query()
+    async def unknown_callback(callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id if callback.from_user else None
+        logger.warning("unhandled callback data=%s user_id=%s", callback.data, user_id)
+        await _safe_callback_answer(callback, "该功能暂未开放或按钮已过期，请返回首页重试。")
 
     return router
 
@@ -2475,6 +2558,34 @@ def _referral_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def _referral_keyboard(role: str = "user") -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="下级管理", callback_data="referrals:children"),
+            InlineKeyboardButton(text="返佣记录", callback_data="referrals:commissions"),
+        ],
+        [
+            InlineKeyboardButton(text="申请返水", callback_data="referrals:rebate_apply"),
+            InlineKeyboardButton(text="申请成为代理", callback_data="referrals:agent_apply"),
+        ],
+    ]
+    if role in {"agent", "admin", "super_admin"}:
+        rows.append(
+            [
+                InlineKeyboardButton(text="下级充值", callback_data="referrals:sub_deposits"),
+                InlineKeyboardButton(text="下级投注", callback_data="referrals:sub_bets"),
+                InlineKeyboardButton(text="下级返水", callback_data="referrals:sub_rebates"),
+            ]
+        )
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="复制邀请链接", callback_data="referrals:copy")],
+            [InlineKeyboardButton(text="返回首页", callback_data="home")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def _format_wallet(wallet: dict, currency: str) -> str:
     return (
         "💰 钱包\n"
@@ -2729,6 +2840,18 @@ def _format_admin_referral_summary(summary: dict, currency: str) -> str:
         f"待结算返佣：{_money(summary.get('pending_commission'))} {currency}\n"
         f"已结算返佣：{_money(summary.get('settled_commission'))} {currency}\n"
         f"待结算返水：{_money(summary.get('pending_rebate'))} {currency}"
+    )
+
+
+def _format_referrals(link: str, summary: dict, currency: str) -> str:
+    return (
+        "👥 推广邀请\n"
+        "我的邀请链接：\n"
+        f"{link}\n\n"
+        f"直属下级：{summary.get('direct_count') or 0} 人\n"
+        f"有效下级：{summary.get('active_count') or 0} 人\n"
+        f"累计返佣：{_money(summary.get('settled_commission'))} {currency}\n"
+        f"待结算返佣：{_money(summary.get('pending_commission'))} {currency}"
     )
 
 
@@ -3111,6 +3234,44 @@ def _outcome_button_label(outcome: object) -> str:
 
 def _translated_texts(key: str) -> set[str]:
     return {t(lang, key) for lang in SUPPORTED_LANGUAGES}
+
+
+def _admin_menu_text(role: str) -> str:
+    title = "超级管理员面板" if role == "super_admin" else "管理员面板"
+    return (
+        f"{title}\nrole={role}\n\n"
+        "/admin_stats\n"
+        "/admin_markets\n"
+        "/admin_suspend <fixture_id>\n"
+        "/admin_resume <fixture_id>\n"
+        "/admin_set_cutoff <minutes>\n"
+        "/admin_wallet <telegram_user_id>\n"
+        "/admin_deposits\n"
+        "/admin_deposit <order_id>\n"
+        "/admin_mark_deposit_paid <order_id> <amount> <txid> <reason>\n"
+        "/admin_reject_deposit <order_id> <reason>\n"
+        "/admin_clear_my_test_bets\n"
+        "/admin_clear_user_test_bets <telegram_user_id>\n"
+        "/admin_adjust_balance <telegram_user_id> <amount> <reason>\n"
+        "/admin_bets\n"
+        "/admin_bet <bet_id>\n"
+        "/admin_settle_win <bet_id>\n"
+        "/admin_settle_loss <bet_id>\n"
+        "/admin_settle_void <bet_id>\n"
+        "/admin_cancel_bet\n"
+        "/admin_withdrawals\n"
+        "/admin_withdraw <withdraw_id>\n"
+        "/admin_approve_withdraw <withdraw_id>\n"
+        "/admin_reject_withdraw <withdraw_id> <reason>\n"
+        "/admin_mark_withdraw_paid <withdraw_id> <txid>\n"
+        "/admin_commissions\n"
+        "/admin_settle_commission <commission_id>\n"
+        "/admin_rebate_rules\n"
+        "/admin_rebate_preview <user_id>\n"
+        "/admin_generate_rebates\n"
+        "/admin_settle_rebate <rebate_record_id>\n"
+        "/admin_referrals <telegram_user_id>"
+    )
 
 
 def _now_hhmm() -> str:

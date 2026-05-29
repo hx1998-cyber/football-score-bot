@@ -466,6 +466,13 @@ Unsupported markets such as handicaps, HT/FT, corners, and unknown markets are m
 
 Roles are configured through `SUPER_ADMIN_USER_IDS`, `ADMIN_USER_IDS`, `AGENT_USER_IDS`, and persisted in `user_roles`. Super admins can invite/remove admins and agents. Admins and agents are restricted to their own downstream users for management views. Reopening or reversing settled bets is reserved for the super admin path. Admin actions must write `admin_audit_logs`.
 
+Current deployment uses single bot mode:
+
+- Normal users only see the user menu.
+- Admins enter the hidden admin menu with `/admin`.
+- `SUPER_ADMIN_USER_IDS` has the highest permission level.
+- A separate `ADMIN_BOT_TOKEN` can be introduced later, but this stage keeps admin controls inside the same bot.
+
 Withdrawals remain manual. Users can create withdrawal requests only when `WITHDRAW_ENABLED=true`; approval does not send funds automatically. Operators must mark a withdrawal as paid after external transfer. Rejecting a withdrawal returns frozen funds through wallet ledger entries.
 
 Rebate support is request-first. Users can request rebates, agents/admins can view downstream rebate context, and super admins approve payout. Rebate payout must write `wallet_ledger type=rebate`.

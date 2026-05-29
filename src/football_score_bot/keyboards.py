@@ -411,3 +411,16 @@ def bet_detail_keyboard(
         rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# M11-Fix-2 override: expose stable ReplyKeyboard labels that match handlers.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 可投注赛事"), KeyboardButton(text="📊 我的注单")],
+            [KeyboardButton(text="💰 钱包"), KeyboardButton(text="👥 推广")],
+            [KeyboardButton(text="🏆 世界杯"), KeyboardButton(text="🌐 语言")],
+            [KeyboardButton(text="设置"), KeyboardButton(text="帮助")],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )

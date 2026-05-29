@@ -15,6 +15,7 @@ async def main() -> None:
     database_url = os.getenv("DATABASE_URL", "postgresql://football:football_password@localhost:5432/football_score_bot")
     redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
     app_public_base_url = os.getenv("APP_PUBLIC_BASE_URL", "")
+    super_admin_ids = _parse_int_set(os.getenv("SUPER_ADMIN_USER_IDS", ""))
     checks: list[tuple[str, bool]] = [
         ("TELEGRAM_BOT_TOKEN present", bool(os.getenv("TELEGRAM_BOT_TOKEN"))),
         ("API_FOOTBALL_KEY present", bool(os.getenv("API_FOOTBALL_KEY"))),
@@ -22,13 +23,27 @@ async def main() -> None:
         ("GMPAY_PID present", bool(os.getenv("GMPAY_PID"))),
         ("GMPAY_SECRET present", bool(os.getenv("GMPAY_SECRET"))),
         ("GMPAY_NOTIFY_URL is https", _valid_notify_url(os.getenv("GMPAY_NOTIFY_URL", ""))),
-        ("super_admin configured", bool(os.getenv("SUPER_ADMIN_USER_IDS", "").strip())),
+        ("super_admin configured", bool(super_admin_ids)),
     ]
     checks.append(("DATABASE_URL works", await _check_database(database_url)))
     checks.append(("REDIS_URL works", await _check_redis(redis_url)))
     checks.append(("api /health works", await _check_health(app_public_base_url)))
     for name, ok in checks:
         print(f"{name}: {'ok' if ok else 'missing'}")
+    print(f"super_admin count: {len(super_admin_ids)}")
+
+
+def _parse_int_set(value: str) -> set[int]:
+    result: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            result.add(int(item))
+        except ValueError:
+            continue
+    return result
 
 
 def _valid_notify_url(value: str) -> bool:
