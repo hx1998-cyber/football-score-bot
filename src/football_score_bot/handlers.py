@@ -11,7 +11,7 @@ from time import time
 from urllib.parse import parse_qs, urlparse
 
 import asyncpg
-from aiogram import F, Router
+from aiogram import BaseMiddleware, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -20,6 +20,12 @@ from football_score_bot.api_football import ApiFootballClient
 from football_score_bot.betting import BettableStatus, is_bettable_fixture, reason_label
 from football_score_bot.cache import RedisCache
 from football_score_bot.config import Settings
+from football_score_bot.command_routing import (
+    clean_command_token,
+    parse_admin_adjust_args,
+    parse_command_name,
+    resolve_bet_by_id_or_no,
+)
 from football_score_bot.database import Database
 from football_score_bot.featured import filter_featured_fixtures
 from football_score_bot.futures import (
@@ -86,6 +92,32 @@ from football_score_bot.time_utils import now_hhmm
 logger = logging.getLogger(__name__)
 _api_failure_log_times: dict[str, datetime] = {}
 
+
+class SlashCommandStateMiddleware(BaseMiddleware):
+    async def __call__(self, handler: Any, event: Message, data: dict[str, Any]) -> Any:
+        if not isinstance(event, Message):
+            return await handler(event, data)
+        command_name = parse_command_name(event.text)
+        if not command_name:
+            return await handler(event, data)
+        state = data.get("state")
+        if state is None:
+            return await handler(event, data)
+        current_state = await state.get_state()
+        if not current_state:
+            return await handler(event, data)
+        await state.clear()
+        logger.info(
+            "slash_command_cleared_fsm command_name=%s telegram_user_id=%s previous_state=%s",
+            command_name,
+            event.from_user.id if event.from_user else None,
+            current_state,
+        )
+        if command_name == "cancel":
+            await event.answer("已取消当前操作。")
+            return None
+        return await handler(event, data)
+
 MENU_BETTABLE_TEXTS = {"🎯 可投注赛事", "可投注赛事"}
 MENU_BETS_TEXTS = {"📊 我的注单", "我的注单"}
 MENU_WALLET_TEXTS = {"💰 钱包", "钱包", "充值 USDT", "充值与钱包"}
@@ -126,6 +158,7 @@ def build_router(
     settings: Settings,
 ) -> Router:
     router = Router()
+    router.message.outer_middleware(SlashCommandStateMiddleware())
     wallet_service = WalletService(
         database,
         currency=settings.wallet_currency,
@@ -661,8 +694,11 @@ def build_router(
             return
         await _send_bet_confirm_for_amount(callback.message, fixture_id, market_key, page, outcome_index, amount, cache, api_client, settings)
 
-    @router.message(BetStates.waiting_custom_stake)
+    @router.message(BetStates.waiting_custom_stake, ~F.text.startswith("/"))
     async def bet_custom_stake_input(message: Message, state: FSMContext) -> None:
+        if parse_command_name(message.text):
+            await state.clear()
+            return
         data = await state.get_data()
         try:
             amount = _validated_amount(message.text or "", settings.min_bet_amount, settings.max_bet_amount)
@@ -782,8 +818,11 @@ def build_router(
         await state.set_state(RechargeStates.confirming_recharge)
         await callback.message.answer(_format_recharge_confirm(await state.get_data(), settings), reply_markup=_recharge_confirm_keyboard())
 
-    @router.message(RechargeStates.waiting_custom_amount)
+    @router.message(RechargeStates.waiting_custom_amount, ~F.text.startswith("/"))
     async def recharge_custom_amount_input(message: Message, state: FSMContext) -> None:
+        if parse_command_name(message.text):
+            await state.clear()
+            return
         try:
             amount = _validated_amount(message.text or "", settings.min_recharge_amount, settings.max_recharge_amount)
         except ValueError as exc:
@@ -858,8 +897,11 @@ def build_router(
             reply_markup=_cancel_keyboard("wallet"),
         )
 
-    @router.message(WithdrawStates.waiting_amount)
+    @router.message(WithdrawStates.waiting_amount, ~F.text.startswith("/"))
     async def withdraw_amount_input(message: Message, state: FSMContext) -> None:
+        if parse_command_name(message.text):
+            await state.clear()
+            return
         try:
             amount = _validated_amount(message.text or "", settings.min_withdraw_amount, Decimal("999999999"))
         except ValueError as exc:
@@ -881,8 +923,11 @@ def build_router(
         await state.set_state(WithdrawStates.waiting_address)
         await callback.message.answer("请输入提现地址：", reply_markup=_cancel_keyboard("wallet"))
 
-    @router.message(WithdrawStates.waiting_address)
+    @router.message(WithdrawStates.waiting_address, ~F.text.startswith("/"))
     async def withdraw_address_input(message: Message, state: FSMContext) -> None:
+        if parse_command_name(message.text):
+            await state.clear()
+            return
         address = (message.text or "").strip()
         if len(address) < 10:
             await message.answer("地址格式看起来不完整，请重新输入。", reply_markup=_cancel_keyboard("wallet"))
@@ -1137,9 +1182,16 @@ def build_router(
             reply_markup=_cancel_keyboard("referrals"),
         )
 
-    @router.message(RebateStates.waiting_note)
+    @router.message(RebateStates.waiting_note, ~F.text.startswith("/"))
     async def rebate_note_input(message: Message, state: FSMContext) -> None:
         if not message.from_user:
+            return
+        if parse_command_name(message.text):
+            await state.clear()
+            return
+        role = await permission_service.get_user_role(message.from_user.id)
+        if role == "super_admin":
+            await state.clear()
             return
         note = (message.text or "").strip()
         if len(note) < 2:
@@ -1203,9 +1255,12 @@ def build_router(
         await _safe_callback_answer(callback)
         await callback.message.answer("代理申请审核中，请等待管理员处理。")
 
-    @router.message(AgentApplicationStates.waiting_note)
+    @router.message(AgentApplicationStates.waiting_note, ~F.text.startswith("/"))
     async def agent_note_input(message: Message, state: FSMContext) -> None:
         if not message.from_user:
+            return
+        if parse_command_name(message.text):
+            await state.clear()
             return
         note = (message.text or "").strip()
         if len(note) < 2:
@@ -1440,6 +1495,11 @@ def build_router(
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
         parts = (command.args or "").strip().split(maxsplit=3)
+        logger.info(
+            "admin_command command_name=admin_mark_deposit_paid telegram_user_id=%s parsed_args=%s",
+            message.from_user.id if message.from_user else None,
+            {"argc": len(parts), "order_id": parts[0] if parts else None},
+        )
         if len(parts) != 4:
             await message.answer("用法：/admin_mark_deposit_paid <order_id> <amount> <txid> <reason>")
             return
@@ -1454,9 +1514,22 @@ def build_router(
             return
         order = await database.get_deposit_order(order_id)
         if not order:
+            logger.info(
+                "admin_command_result command_name=admin_mark_deposit_paid telegram_user_id=%s result=failure reason=order_not_found order_id=%s",
+                message.from_user.id if message.from_user else None,
+                order_id,
+            )
+            await message.answer("未找到充值订单。")
+            return
+        if not order:
             await message.answer("订单不存在。")
             return
+        if str(order.get("status")) == "paid":
+            await message.answer("订单已入账，不能重复入账。")
+            return
         if str(order.get("status")) not in {"manual_review", "pending", "failed", "rejected"}:
+            await message.answer("该订单状态不允许人工入账。")
+            return
             await message.answer("该订单状态不允许人工标记到账。")
             return
         paid = await wallet_service.credit_deposit(
@@ -1481,6 +1554,15 @@ def build_router(
             {"paid": paid, "amount": str(amount), "txid": txid, "reason": reason},
         )
         if paid:
+            ledger_id = await database.pool.fetchval(
+                """
+                SELECT id FROM wallet_ledger
+                WHERE ref_type = 'deposit_order' AND ref_id = $1 AND type = 'deposit_manual'
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                order_id,
+            )
             try:
                 await message.bot.send_message(
                     int(order["user_id"]),
@@ -1488,6 +1570,22 @@ def build_router(
                 )
             except Exception:
                 logger.info("failed to notify manual deposit paid user_id=%s order_id=%s", order["user_id"], order_id, exc_info=True)
+            logger.info(
+                "admin_command_result command_name=admin_mark_deposit_paid telegram_user_id=%s result=success order_id=%s target_user_id=%s ledger_id=%s",
+                message.from_user.id if message.from_user else None,
+                order_id,
+                order["user_id"],
+                ledger_id,
+            )
+            await message.answer(f"人工入账完成，ledger_id={ledger_id}")
+            return
+        logger.info(
+            "admin_command_result command_name=admin_mark_deposit_paid telegram_user_id=%s result=failure reason=not_processed order_id=%s",
+            message.from_user.id if message.from_user else None,
+            order_id,
+        )
+        await message.answer("订单未处理，可能已入账或存在重复 txid。")
+        return
         await message.answer("已人工标记充值到账。" if paid else "订单未处理，可能已到账或存在重复 txid。")
 
     @router.message(Command("admin_reject_deposit"))
@@ -1521,6 +1619,59 @@ def build_router(
         await state.clear()
         if not await _require_super_admin(message):
             return
+        try:
+            target_user_id, amount, reason = parse_admin_adjust_args(command.args)
+        except ValueError as exc:
+            logger.info(
+                "admin_command_result command_name=admin_adjust_balance telegram_user_id=%s result=failure reason=%s",
+                message.from_user.id if message.from_user else None,
+                str(exc),
+            )
+            await message.answer("用法：/admin_adjust_balance <telegram_user_id> <amount> <reason>")
+            return
+        logger.info(
+            "admin_command command_name=admin_adjust_balance telegram_user_id=%s parsed_args=%s",
+            message.from_user.id if message.from_user else None,
+            {"target_user_id": target_user_id, "amount": str(amount)},
+        )
+        if amount == 0:
+            await message.answer("调整金额不能为 0。")
+            return
+        try:
+            ledger = await wallet_service.manual_adjust(target_user_id, amount, reason, message.from_user.id)
+        except ValueError:
+            logger.info(
+                "admin_command_result command_name=admin_adjust_balance telegram_user_id=%s result=failure reason=insufficient_balance target_user_id=%s",
+                message.from_user.id if message.from_user else None,
+                target_user_id,
+            )
+            await message.answer("余额不足，不能扣成负数。")
+            return
+        except Exception:
+            logger.info(
+                "admin_command_result command_name=admin_adjust_balance telegram_user_id=%s result=failure reason=exception target_user_id=%s",
+                message.from_user.id if message.from_user else None,
+                target_user_id,
+                exc_info=True,
+            )
+            await message.answer("调账失败，请查看后台日志。")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            "admin_adjust_balance",
+            "wallet",
+            str(target_user_id),
+            {"amount": str(amount), "reason": reason, "ledger_id": ledger["id"]},
+        )
+        logger.info(
+            "admin_command_result command_name=admin_adjust_balance telegram_user_id=%s result=success target_user_id=%s ledger_id=%s",
+            message.from_user.id if message.from_user else None,
+            target_user_id,
+            ledger["id"],
+        )
+        await state.clear()
+        await message.answer(f"调整完成，ledger_id={ledger['id']}")
+        return
         parts = (command.args or "").strip().split(maxsplit=2)
         if len(parts) != 3:
             await message.answer("用法：/admin_adjust_balance <telegram_user_id> <amount> <reason>")
@@ -1585,8 +1736,11 @@ def build_router(
         )
         await message.answer(f"调整完成，ledger_id={ledger['id']}")
 
-    @router.message(AdminAdjustStates.waiting_user)
+    @router.message(AdminAdjustStates.waiting_user, ~F.text.startswith("/"))
     async def admin_adjust_user_input(message: Message, state: FSMContext) -> None:
+        if parse_command_name(message.text):
+            await state.clear()
+            return
         if not message.from_user or not await permission_service.is_super_admin(message.from_user.id):
             return
         try:
@@ -1598,8 +1752,11 @@ def build_router(
         await state.set_state(AdminAdjustStates.waiting_amount)
         await message.answer("请输入调整金额，正数加钱，负数扣钱：", reply_markup=_cancel_keyboard("admin"))
 
-    @router.message(AdminAdjustStates.waiting_amount)
+    @router.message(AdminAdjustStates.waiting_amount, ~F.text.startswith("/"))
     async def admin_adjust_amount_input(message: Message, state: FSMContext) -> None:
+        if parse_command_name(message.text):
+            await state.clear()
+            return
         try:
             amount = Decimal((message.text or "").strip())
         except Exception:
@@ -1612,8 +1769,11 @@ def build_router(
         await state.set_state(AdminAdjustStates.waiting_reason)
         await message.answer("请输入调账原因：", reply_markup=_cancel_keyboard("admin"))
 
-    @router.message(AdminAdjustStates.waiting_reason)
+    @router.message(AdminAdjustStates.waiting_reason, ~F.text.startswith("/"))
     async def admin_adjust_reason_input(message: Message, state: FSMContext) -> None:
+        if parse_command_name(message.text):
+            await state.clear()
+            return
         reason = (message.text or "").strip()
         if len(reason) < 3:
             await message.answer("必须填写明确调账原因。", reply_markup=_cancel_keyboard("admin"))
@@ -1691,6 +1851,27 @@ def build_router(
     async def admin_bet(message: Message, command: CommandObject) -> None:
         if not await _require_private_role(message, {"super_admin", "admin"}):
             return
+        bet_key = (command.args or "").strip().split(maxsplit=1)[0] if (command.args or "").strip() else ""
+        if not bet_key:
+            await message.answer("用法：/admin_bet <注单号或ID>")
+            return
+        try:
+            bet = await resolve_bet_by_id_or_no(database, bet_key)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        logger.info(
+            "admin_command command_name=admin_bet telegram_user_id=%s parsed_args=%s resolved_target_id=%s result=%s",
+            message.from_user.id if message.from_user else None,
+            {"bet_key": clean_command_token(bet_key)},
+            (bet or {}).get("id"),
+            "success" if bet else "failure",
+        )
+        if not bet:
+            await message.answer(f"未找到该注单：{clean_command_token(bet_key)}\n请使用 /admin_bets 查看待开奖注单。")
+            return
+        await message.answer(_format_admin_bet(bet))
+        return
         bet_key = _clean_command_token((command.args or "").strip().split(maxsplit=1)[0]) if (command.args or "").strip() else ""
         if not bet_key:
             await message.answer("用法：/admin_bet <注单号或ID>")
@@ -1744,6 +1925,79 @@ def build_router(
     async def _admin_settle_bet(message: Message, command: CommandObject, status: str, action: str) -> None:
         if not await _require_super_admin(message):
             return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        bet_key = parts[0] if parts else ""
+        note = parts[1].strip() if len(parts) > 1 else None
+        if not bet_key:
+            await message.answer(f"用法：/{action} <注单号或ID>")
+            return
+        try:
+            bet = await resolve_bet_by_id_or_no(database, bet_key)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        logger.info(
+            "admin_command command_name=%s telegram_user_id=%s parsed_args=%s resolved_target_id=%s",
+            action,
+            message.from_user.id if message.from_user else None,
+            {"bet_key": clean_command_token(bet_key), "status": status, "has_note": bool(note)},
+            (bet or {}).get("id"),
+        )
+        if not bet:
+            logger.info(
+                "admin_command_result command_name=%s telegram_user_id=%s result=failure reason=bet_not_found bet_key=%s",
+                action,
+                message.from_user.id if message.from_user else None,
+                clean_command_token(bet_key),
+            )
+            await message.answer(f"未找到该注单：{clean_command_token(bet_key)}\n请使用 /admin_bets 查看待开奖注单。")
+            return
+        if str(bet.get("status")) not in {"pending", "manual_required"}:
+            logger.info(
+                "admin_command_result command_name=%s telegram_user_id=%s result=failure reason=already_processed resolved_target_id=%s current_status=%s",
+                action,
+                message.from_user.id if message.from_user else None,
+                bet.get("id"),
+                bet.get("status"),
+            )
+            await message.answer("该注单已开奖/已处理，不能重复开奖。")
+            return
+        try:
+            result = await wallet_service.settle_bet(int(bet["id"]), message.from_user.id, status, note=note)
+        except ValueError as exc:
+            logger.info(
+                "admin_command_result command_name=%s telegram_user_id=%s result=failure reason=%s resolved_target_id=%s",
+                action,
+                message.from_user.id if message.from_user else None,
+                str(exc),
+                bet.get("id"),
+            )
+            await message.answer(f"结算失败：{exc}")
+            return
+        await database.add_admin_audit_log(
+            message.from_user.id,
+            action,
+            "bet",
+            str(bet.get("bet_no") or bet.get("id")),
+            {"status": status, "settled": bool(result), "note": note, "ledger_id": (result or {}).get("ledger_id")},
+        )
+        if not result:
+            await message.answer("该注单已开奖/已处理，不能重复开奖。")
+            return
+        logger.info(
+            "admin_command_result command_name=%s telegram_user_id=%s result=success resolved_target_id=%s ledger_id=%s",
+            action,
+            message.from_user.id if message.from_user else None,
+            bet.get("id"),
+            result.get("ledger_id"),
+        )
+        if status == "won" and settings.payout_freeze_enabled:
+            try:
+                await message.bot.send_message(int(result["user_id"]), "注单中奖，派彩已冻结，预计 4 小时后解冻。")
+            except Exception:
+                logger.info("failed to notify settled win user_id=%s", result.get("user_id"), exc_info=True)
+        await message.answer(f"注单已开奖：{status}，ledger_id={result.get('ledger_id')}")
+        return
         parts = (command.args or "").strip().split(maxsplit=1)
         bet_key = _clean_command_token(parts[0]) if parts else ""
         note = parts[1].strip() if len(parts) > 1 else None
@@ -2200,7 +2454,14 @@ def build_router(
         if not request or request.get("status") != "pending":
             await message.answer("退单申请不存在或已处理。")
             return
-        result = await wallet_service.settle_bet(int(request["bet_id"]), message.from_user.id, "cancelled", note=parts[1])
+        try:
+            bet = await resolve_bet_by_id_or_no(database, str(request["bet_id"]))
+        except ValueError:
+            bet = None
+        if not bet:
+            await message.answer("未找到该注单。")
+            return
+        result = await wallet_service.settle_bet(int(bet["id"]), message.from_user.id, "cancelled", note=parts[1])
         if not result:
             await message.answer("注单已开奖或状态不允许退单。")
             return
