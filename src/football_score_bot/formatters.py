@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from football_score_bot.betting import BettableStatus, reason_label
+from football_score_bot.i18n_football import format_match_title, zh_league_name, zh_team_name
 from football_score_bot.odds_normalizer import NormalizedFixtureOdds, OddsMarket, OddsOutcome
 from football_score_bot.time_utils import now_hhmm
 
@@ -25,16 +26,16 @@ def format_featured_matches(
         fixture_id = _fixture_id(item)
         league = item.get("league", {})
         teams = item.get("teams", {})
-        league_name = league.get("name") or "赛事"
+        league_name = zh_league_name(league.get("name")) if league.get("name") else "赛事"
         if league_name != current_league:
             lines.append(f"\n【{league_name}】")
             current_league = league_name
 
         kickoff = _fixture_time(item)
-        home = teams.get("home", {}).get("name", "主队")
-        away = teams.get("away", {}).get("name", "客队")
+        home = zh_team_name(teams.get("home", {}).get("name"))
+        away = zh_team_name(teams.get("away", {}).get("name"))
         odds = _odds_for(odds_by_fixture, fixture_id)
-        lines.append(f"{kickoff} {home} vs {away}")
+        lines.append(f"{kickoff} {format_match_title(item)}")
         lines.append(
             f"主 {_odd_value(odds, 'home_odds')} ｜ 和 {_odd_value(odds, 'draw_odds')} ｜ 客 {_odd_value(odds, 'away_odds')}"
         )
@@ -61,17 +62,17 @@ def format_bettable_matches(
             current_day = day_label
             current_league = None
 
-        league_name = (item.get("league") or {}).get("name") or "赛事"
+        league_name = zh_league_name((item.get("league") or {}).get("name")) if (item.get("league") or {}).get("name") else "赛事"
         if league_name != current_league:
             lines.append(f"【{league_name}】")
             current_league = league_name
 
         fixture_id = _fixture_id(item)
         teams = item.get("teams", {})
-        home = teams.get("home", {}).get("name", "主队")
-        away = teams.get("away", {}).get("name", "客队")
+        home = zh_team_name(teams.get("home", {}).get("name"))
+        away = zh_team_name(teams.get("away", {}).get("name"))
         odds = _odds_for(odds_by_fixture, fixture_id)
-        lines.append(f"{_fixture_time(item)} {home} vs {away}")
+        lines.append(f"{_fixture_time(item)} {format_match_title(item)}")
         lines.append(
             f"主 {_odd_value(odds, 'home_odds')} ｜ 和 {_odd_value(odds, 'draw_odds')} ｜ 客 {_odd_value(odds, 'away_odds')}"
         )
@@ -94,14 +95,14 @@ def format_all_fixtures(
     for item in fixtures[:limit]:
         league = item.get("league", {})
         teams = item.get("teams", {})
-        league_name = league.get("name") or "赛事"
+        league_name = zh_league_name(league.get("name")) if league.get("name") else "赛事"
         if league_name != current_league:
             lines.append(f"\n【{league_name}】")
             current_league = league_name
         kickoff = _fixture_time(item)
-        home = teams.get("home", {}).get("name", "主队")
-        away = teams.get("away", {}).get("name", "客队")
-        lines.append(f"{kickoff} {home} vs {away}")
+        home = zh_team_name(teams.get("home", {}).get("name"))
+        away = zh_team_name(teams.get("away", {}).get("name"))
+        lines.append(f"{kickoff} {format_match_title(item)}")
         lines.append("赔率：暂未开放")
     return "\n".join(lines)
 
@@ -125,7 +126,7 @@ def format_all_schedule(
             current_day = day_label
             current_league = None
 
-        league_name = (item.get("league") or {}).get("name") or "赛事"
+        league_name = zh_league_name((item.get("league") or {}).get("name")) if (item.get("league") or {}).get("name") else "赛事"
         if league_name != current_league:
             lines.append(f"【{league_name}】")
             current_league = league_name
@@ -133,10 +134,10 @@ def format_all_schedule(
         fixture_id = _fixture_id(item)
         teams = item.get("teams", {})
         goals = item.get("goals", {})
-        home = teams.get("home", {}).get("name", "主队")
-        away = teams.get("away", {}).get("name", "客队")
+        home = zh_team_name(teams.get("home", {}).get("name"))
+        away = zh_team_name(teams.get("away", {}).get("name"))
         bet_status = status_by_fixture.get(fixture_id, BettableStatus(False, "no_odds"))
-        lines.append(f"{_fixture_time(item)} {home} vs {away}")
+        lines.append(f"{_fixture_time(item)} {format_match_title(item)}")
         if _is_finished(item):
             lines.append(f"比分：{_score_value(goals.get('home'))}-{_score_value(goals.get('away'))}")
         lines.append(f"状态：{_fixture_status_label(item)}")
@@ -163,14 +164,14 @@ def format_live_matches(
         teams = item.get("teams", {})
         goals = item.get("goals", {})
         status = item.get("fixture", {}).get("status", {})
-        league_name = league.get("name") or "赛事"
+        league_name = zh_league_name(league.get("name")) if league.get("name") else "赛事"
         if league_name != current_league:
             lines.append(f"\n【{league_name}】")
             current_league = league_name
         elapsed = status.get("elapsed")
         minute = f"{elapsed}'" if elapsed is not None else (status.get("short") or "-")
-        home = teams.get("home", {}).get("name", "主队")
-        away = teams.get("away", {}).get("name", "客队")
+        home = zh_team_name(teams.get("home", {}).get("name"))
+        away = zh_team_name(teams.get("away", {}).get("name"))
         odds = _odds_for(odds_by_fixture, fixture_id)
         lines.append(
             f"{minute} {home} {_score_value(goals.get('home'))}-{_score_value(goals.get('away'))} {away}"
@@ -191,15 +192,15 @@ def format_match_detail(
     goals = fixture.get("goals", {})
     fixture_info = fixture.get("fixture", {})
     status = fixture_info.get("status", {})
-    home = teams.get("home", {}).get("name", "主队")
-    away = teams.get("away", {}).get("name", "客队")
+    home = zh_team_name(teams.get("home", {}).get("name"))
+    away = zh_team_name(teams.get("away", {}).get("name"))
     elapsed = status.get("elapsed")
     status_text = status.get("long") or status.get("short") or "-"
     if elapsed is not None:
         status_text = f"{status_text} {elapsed}'"
 
     lines = [
-        f"联赛：{league.get('name') or '-'}",
+        f"联赛：{zh_league_name(league.get('name')) if league.get('name') else '-'}",
         f"时间：{_fixture_time(fixture)}",
         f"比赛：{home} vs {away}",
         f"比分/状态：{_score_value(goals.get('home'))}-{_score_value(goals.get('away'))} / {status_text}",
@@ -226,15 +227,15 @@ def format_odds_match_detail(
     goals = fixture.get("goals", {})
     fixture_info = fixture.get("fixture", {})
     status = fixture_info.get("status", {})
-    home = teams.get("home", {}).get("name", "主队")
-    away = teams.get("away", {}).get("name", "客队")
+    home = zh_team_name(teams.get("home", {}).get("name"))
+    away = zh_team_name(teams.get("away", {}).get("name"))
     market = normalized_odds.markets.get("match_winner") if normalized_odds else None
     home_odds = _market_group_odds(market, "home")
     draw_odds = _market_group_odds(market, "draw")
     away_odds = _market_group_odds(market, "away")
     lines = [
         "比赛详情",
-        f"【{league.get('name') or '-'}】",
+        f"【{zh_league_name(league.get('name')) if league.get('name') else '-'}】",
         f"{home} vs {away}",
         f"时间：{_fixture_month_day_time(fixture)}",
         f"状态：{_fixture_status_label(fixture)}",
@@ -265,8 +266,8 @@ def format_odds_market_page(
     per_page: int = 20,
 ) -> str:
     teams = fixture.get("teams", {})
-    home = teams.get("home", {}).get("name", "主队")
-    away = teams.get("away", {}).get("name", "客队")
+    home = zh_team_name(teams.get("home", {}).get("name"))
+    away = zh_team_name(teams.get("away", {}).get("name"))
     title = _market_title(market_key)
     if not market or not market.outcomes:
         if market_key == "correct_score":
@@ -358,8 +359,8 @@ def format_bet_confirm(
     stake: str = "10",
 ) -> str:
     teams = fixture.get("teams", {})
-    home = teams.get("home", {}).get("name", "主队")
-    away = teams.get("away", {}).get("name", "客队")
+    home = zh_team_name(teams.get("home", {}).get("name"))
+    away = zh_team_name(teams.get("away", {}).get("name"))
     return "\n".join(
         [
             "🎯 确认投注",

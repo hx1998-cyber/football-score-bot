@@ -23,6 +23,10 @@ class ApiFootballClient:
         data = await self._get("/fixtures", params={"date": fixture_date.isoformat()})
         return data.get("response", [])
 
+    async def get_fixtures_by_league_season(self, league_id: int, season: int) -> list[dict[str, Any]]:
+        data = await self._get("/fixtures", params={"league": league_id, "season": season})
+        return data.get("response", [])
+
     async def search_leagues(self, keyword: str) -> list[dict[str, Any]]:
         data = await self._get("/leagues", params={"search": keyword})
         return data.get("response", [])

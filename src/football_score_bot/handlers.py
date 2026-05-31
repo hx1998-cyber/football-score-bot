@@ -82,7 +82,18 @@ from football_score_bot.keyboards import (
     match_detail_keyboard,
     my_bets_keyboard,
     odds_market_keyboard,
+    worldcup_betting_keyboard,
+    worldcup_schedule_keyboard,
     worldcup_zone_keyboard,
+)
+from football_score_bot.i18n_football import (
+    fixture_beijing_datetime,
+    format_match_title,
+    team_flag,
+    worldcup_match_line,
+    worldcup_stage_label,
+    zh_league_name,
+    zh_team_name,
 )
 from football_score_bot.odds import build_odds_first_matches
 from football_score_bot.odds_normalizer import normalized_from_dict, normalize_fixture_odds as normalize_fixture_odds_full
@@ -136,12 +147,12 @@ def format_bet_confirm(
     stake: str = "10",
 ) -> str:
     teams = fixture.get("teams", {})
-    home = teams.get("home", {}).get("name", "主队")
-    away = teams.get("away", {}).get("name", "客队")
+    home = zh_team_name(teams.get("home", {}).get("name"))
+    away = zh_team_name(teams.get("away", {}).get("name"))
     return "\n".join(
         [
             "🎯 确认下注",
-            f"比赛：{home} vs {away}",
+            f"比赛：{format_match_title(fixture) if fixture.get('league') else f'{home} vs {away}'}",
             f"玩法：{market_title}",
             f"选择：{selection}",
             f"赔率：{odds}",
@@ -320,13 +331,47 @@ def build_router(
         message = _message(event)
         lang = await _event_lang(event, database, settings)
         await _remember_chat(message, database)
-        await message.answer(format_worldcup_zone(), reply_markup=worldcup_zone_keyboard(lang))
+        await message.answer("🏆 世界杯 2026\n\n请选择查看：", reply_markup=worldcup_zone_keyboard(lang))
 
     @router.callback_query(F.data == "worldcup_schedule")
     async def worldcup_schedule(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback, "加载中...")
-        lang = await _callback_lang(callback, database, settings)
-        await callback.message.answer("📅 世界杯赛程即将开放\n后续将接入 API-Football 世界杯赛程。", reply_markup=futures_back_keyboard(lang))
+        fixtures = await _get_worldcup_fixtures(cache, api_client)
+        text, total_pages = await _format_worldcup_schedule_page(fixtures, 0, cache, api_client)
+        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(0, total_pages))
+
+    @router.callback_query(F.data.startswith("worldcup:schedule:"))
+    async def worldcup_schedule_page(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback, "加载中...")
+        page = _safe_int(callback.data.rsplit(":", 1)[1], 0)
+        fixtures = await _get_worldcup_fixtures(cache, api_client)
+        text, total_pages = await _format_worldcup_schedule_page(fixtures, page, cache, api_client)
+        page = max(0, min(page, total_pages - 1))
+        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(page, total_pages))
+
+    @router.callback_query(F.data == "worldcup:today")
+    async def worldcup_today(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback, "加载中...")
+        fixtures = [item for item in await _get_worldcup_fixtures(cache, api_client) if _fixture_date(item) == date.today()]
+        text, total_pages = await _format_worldcup_schedule_page(fixtures, 0, cache, api_client, title="🔥 世界杯今日赛事")
+        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(0, total_pages))
+
+    @router.callback_query(F.data == "worldcup:groups")
+    async def worldcup_groups(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback, "加载中...")
+        fixtures = [item for item in await _get_worldcup_fixtures(cache, api_client) if "group" in str((item.get("league") or {}).get("round") or "").lower() or "组" in str((item.get("league") or {}).get("round") or "")]
+        text, total_pages = await _format_worldcup_schedule_page(fixtures, 0, cache, api_client, title="🏟 世界杯 2026 小组赛")
+        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(0, total_pages))
+
+    @router.callback_query(F.data.startswith("worldcup:betting:"))
+    async def worldcup_betting(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback, "加载中...")
+        page = _safe_int(callback.data.rsplit(":", 1)[1], 0)
+        effective_settings = await _effective_settings(cache, settings)
+        fixtures = await _get_worldcup_bettable_fixtures(cache, api_client, database, effective_settings)
+        text, page_fixtures, total_pages = await _format_worldcup_betting_page(fixtures, page, cache, api_client)
+        page = max(0, min(page, total_pages - 1))
+        await callback.message.answer(text, reply_markup=worldcup_betting_keyboard(page_fixtures, page, total_pages))
 
     @router.callback_query(F.data == "worldcup_standings")
     async def worldcup_standings(callback: CallbackQuery) -> None:
@@ -618,7 +663,7 @@ def build_router(
         except Exception:
             potential_payout_decimal = Decimal("0.00")
         teams = fixture.get("teams", {})
-        fixture_label = f"{teams.get('home', {}).get('name', '主队')} vs {teams.get('away', {}).get('name', '客队')}"
+        fixture_label = format_match_title(fixture)
         bet_id = await wallet_service.submit_bet(
             user_id=callback.from_user.id,
             fixture_id=fixture_id,
@@ -1049,50 +1094,8 @@ def build_router(
 
     @router.callback_query(F.data.startswith("bet_cancel:"))
     async def bet_cancel(callback: CallbackQuery) -> None:
-        await _safe_callback_answer(callback)
-        if not callback.from_user:
-            return
-        bet_key = _clean_command_token(callback.data.split(":", 1)[1])
-        bet = await database.get_user_bet(callback.from_user.id, bet_key)
-        if not bet:
-            await callback.message.answer("注单不存在。")
-            return
-        if bet.get("status") != "pending":
-            await callback.message.answer("该注单已开奖或已处理，不能申请退单。")
-            return
-        start_time = bet.get("fixture_start_time")
-        if isinstance(start_time, datetime) and datetime.now(start_time.tzinfo) >= start_time - timedelta(minutes=settings.bet_cancel_before_start_minutes):
-            await callback.message.answer("当前已超过可申请退单时间，如有争议请联系人工客服。")
-            return
-        request = await database.create_cancel_request(callback.from_user.id, int(bet["id"]), "user_request")
-        await database.add_admin_audit_log(
-            callback.from_user.id,
-            "user_cancel_request",
-            "bet",
-            str(bet.get("bet_no") or bet.get("id")),
-            {"cancel_request_id": (request or {}).get("id"), "reason": "user_request"},
-        )
-        await callback.message.answer("已提交退单申请，需超级管理员审核。审核前注单仍然有效。")
+        await callback.answer("下注确认后买定离手，暂不支持退单。", show_alert=True)
         return
-        await _safe_callback_answer(callback)
-        if not callback.from_user:
-            return
-        if not settings.user_cancel_after_confirm_enabled:
-            await callback.message.answer("注单已确认，无法自行取消。如需处理，请联系管理员。")
-            return
-        bet_key = callback.data.split(":", 1)[1]
-        bet = await database.get_user_bet(callback.from_user.id, bet_key)
-        if not bet or bet.get("status") != "pending":
-            await callback.message.answer("本单已进入结算阶段，无法删除。")
-            return
-        start_time = bet.get("fixture_start_time")
-        if isinstance(start_time, datetime) and datetime.now(start_time.tzinfo) >= start_time - timedelta(minutes=settings.bet_cancel_before_start_minutes):
-            await callback.message.answer("本单已进入结算阶段，无法删除。")
-            return
-        row = await wallet_service.cancel_bet(int(bet["id"]), callback.from_user.id, real_betting_enabled=settings.real_betting_enabled)
-        await callback.message.answer(
-            f"注单已取消\n\n注单号：{bet.get('bet_no') or bet.get('id')}\n状态：已取消" if row else "本单已进入结算阶段，无法删除。"
-        )
 
     @router.callback_query(F.data.startswith("bet_settle:"))
     async def bet_settle(callback: CallbackQuery) -> None:
@@ -2717,7 +2720,7 @@ def build_router(
     @router.callback_query(F.data == "support")
     async def support_callback(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
-        await callback.message.answer("请从注单详情点击“申请退单/联系客服”，系统会按注单状态和开赛时间判断是否可提交退单申请。")
+        await callback.message.answer("下注确认后买定离手，暂不支持退单。如遇系统异常，请联系管理员。")
 
     @router.callback_query()
     async def unknown_callback(callback: CallbackQuery) -> None:
@@ -3046,6 +3049,191 @@ async def _get_fixture_odds(
     except Exception as exc:
         cached = await cache.get_json(key)
         return normalized_from_dict(cached) if cached else None
+
+
+async def _get_worldcup_fixtures(cache: RedisCache, api_client: ApiFootballClient) -> list[dict[str, Any]]:
+    key = "football:worldcup:fixtures:2026"
+    cached = await cache.get_json(key, [])
+    if cached:
+        return cached
+    try:
+        fixtures = await api_client.get_fixtures_by_league_season(1, 2026)
+    except Exception as exc:
+        _log_api_failure("worldcup-fixtures", "worldcup fixtures fetch failed; using fallback: %s", exc)
+        fixtures = []
+    if not fixtures:
+        fixtures = _fallback_worldcup_fixtures()
+    fixtures.sort(key=lambda item: int((item.get("fixture") or {}).get("timestamp") or 0))
+    await cache.set_json(key, fixtures, ttl_seconds=3600)
+    return fixtures
+
+
+async def _get_worldcup_bettable_fixtures(
+    cache: RedisCache,
+    api_client: ApiFootballClient,
+    database: Database,
+    settings: Settings,
+) -> list[dict[str, Any]]:
+    fixtures = await _get_worldcup_fixtures(cache, api_client)
+    fixture_ids = [int((item.get("fixture") or {}).get("id")) for item in fixtures if (item.get("fixture") or {}).get("id")]
+    overrides = await database.get_market_overrides(fixture_ids)
+    bettable: list[dict[str, Any]] = []
+    for item in fixtures:
+        fixture_id = (item.get("fixture") or {}).get("id")
+        if fixture_id is None:
+            continue
+        odds = await _get_fixture_odds(cache, api_client, int(fixture_id))
+        override = overrides.get(int(fixture_id))
+        status = is_bettable_fixture(
+            item,
+            odds,
+            settings,
+            is_suspended_by_admin=bool(override and override.get("is_suspended")),
+        )
+        if status.is_bettable:
+            bettable.append(item)
+    return bettable
+
+
+async def _format_worldcup_schedule_page(
+    fixtures: list[dict[str, Any]],
+    page: int,
+    cache: RedisCache,
+    api_client: ApiFootballClient,
+    *,
+    title: str = "🏆 世界杯 2026 赛程",
+) -> tuple[str, int]:
+    per_page = 5
+    total_pages = max((len(fixtures) - 1) // per_page + 1, 1)
+    page = max(0, min(page, total_pages - 1))
+    page_items = fixtures[page * per_page : (page + 1) * per_page]
+    if not page_items:
+        return f"{title}\n\n暂无世界杯赛程。", total_pages
+    lines = [title, ""]
+    current_day = None
+    for item in page_items:
+        dt = fixture_beijing_datetime(item)
+        day_label = _worldcup_day_label(dt)
+        if day_label != current_day:
+            lines.append(f"📅 {day_label}")
+            current_day = day_label
+        fixture_id = (item.get("fixture") or {}).get("id")
+        odds = await _get_fixture_odds(cache, api_client, int(fixture_id)) if fixture_id is not None else None
+        lines.extend(
+            [
+                "",
+                f"【{worldcup_stage_label(item)}】",
+                worldcup_match_line(item),
+                f" {dt.strftime('%H:%M') if dt else '--:--'}",
+                f"🎲 预测赔率：{_match_winner_odds_text(odds)}",
+            ]
+        )
+    lines.append(f"\n第 {page + 1}/{total_pages} 页")
+    return "\n".join(lines), total_pages
+
+
+async def _format_worldcup_betting_page(
+    fixtures: list[dict[str, Any]],
+    page: int,
+    cache: RedisCache,
+    api_client: ApiFootballClient,
+) -> tuple[str, list[dict[str, Any]], int]:
+    per_page = 6
+    total_pages = max((len(fixtures) - 1) // per_page + 1, 1)
+    page = max(0, min(page, total_pages - 1))
+    page_items = fixtures[page * per_page : (page + 1) * per_page]
+    if not page_items:
+        return "🎲 世界杯可投注赛事\n\n当前暂无可投注世界杯赛事。", [], total_pages
+    lines = ["🎲 世界杯可投注赛事", ""]
+    localized_items: list[dict[str, Any]] = []
+    for index, item in enumerate(page_items, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        odds = await _get_fixture_odds(cache, api_client, int(fixture_id)) if fixture_id is not None else None
+        dt = fixture_beijing_datetime(item)
+        teams = item.get("teams") or {}
+        home_raw = (teams.get("home") or {}).get("name")
+        away_raw = (teams.get("away") or {}).get("name")
+        localized = deepcopy(item)
+        localized_teams = localized.get("teams") or {}
+        if isinstance(localized_teams.get("home"), dict):
+            localized_teams["home"]["name"] = zh_team_name(home_raw)
+        if isinstance(localized_teams.get("away"), dict):
+            localized_teams["away"]["name"] = zh_team_name(away_raw)
+        localized_items.append(localized)
+        lines.extend(
+            [
+                f"{index}. 【{worldcup_stage_label(item)}】",
+                f"{team_flag(home_raw)} {zh_team_name(home_raw)} vs {team_flag(away_raw)} {zh_team_name(away_raw)}",
+                f" {dt.strftime('%m月%d日 %H:%M') if dt else '--:--'}",
+                f"赔率：{_match_winner_odds_text(odds)}",
+                "",
+            ]
+        )
+    lines.append(f"第 {page + 1}/{total_pages} 页")
+    return "\n".join(lines).rstrip(), localized_items, total_pages
+
+
+def _match_winner_odds_text(normalized_odds: Any) -> str:
+    market = normalized_odds.markets.get("match_winner") if normalized_odds else None
+    if not market:
+        return "暂无"
+    home = _market_group_value(market, "home")
+    draw = _market_group_value(market, "draw")
+    away = _market_group_value(market, "away")
+    if home == draw == away == "-":
+        return "暂无"
+    return f"主胜 {home}｜平 {draw}｜客胜 {away}"
+
+
+def _market_group_value(market: Any, group: str) -> str:
+    for outcome in getattr(market, "outcomes", []):
+        if getattr(outcome, "group", None) == group:
+            return str(getattr(outcome, "odds", "-") or "-")
+    return "-"
+
+
+def _worldcup_day_label(value: datetime | None) -> str:
+    if not value:
+        return "--"
+    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    return f"{value.month}月{value.day}日 {weekdays[value.weekday()]}"
+
+
+def _fixture_date(item: dict[str, Any]) -> date | None:
+    value = fixture_beijing_datetime(item)
+    return value.date() if value else None
+
+
+def _safe_int(value: str, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _fallback_worldcup_fixtures() -> list[dict[str, Any]]:
+    matches = [
+        (1, "2026-06-12T03:00:00+08:00", "A组", "Mexico", "South Africa"),
+        (2, "2026-06-12T10:00:00+08:00", "A组", "South Korea", "Czech Republic"),
+        (3, "2026-06-13T03:00:00+08:00", "B组", "Canada", "Bosnia and Herzegovina"),
+        (4, "2026-06-13T10:00:00+08:00", "B组", "United States", "Paraguay"),
+        (5, "2026-06-14T03:00:00+08:00", "C组", "Brazil", "Morocco"),
+        (6, "2026-06-14T10:00:00+08:00", "C组", "Qatar", "Haiti"),
+        (7, "2026-06-15T03:00:00+08:00", "D组", "Germany", "Australia"),
+        (8, "2026-06-15T10:00:00+08:00", "D组", "Netherlands", "Japan"),
+    ]
+    fixtures: list[dict[str, Any]] = []
+    for fixture_id, raw_time, group, home, away in matches:
+        dt = datetime.fromisoformat(raw_time)
+        fixtures.append(
+            {
+                "fixture": {"id": 20260000 + fixture_id, "date": raw_time, "timestamp": int(dt.timestamp()), "status": {"short": "NS", "long": "Not Started"}},
+                "league": {"id": 1, "name": "World Cup", "season": 2026, "round": group},
+                "teams": {"home": {"name": home}, "away": {"name": away}},
+                "goals": {"home": None, "away": None},
+            }
+        )
+    return fixtures
 
 
 async def _ensure_odds_markets(cache: RedisCache, api_client: ApiFootballClient) -> list[dict[str, Any]]:
@@ -4184,7 +4372,6 @@ def _bet_action_keyboard(
     rows = []
     if status in {"pending", "manual_required"}:
         rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
-        rows.append([InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")])
     if fixture_id is not None:
         rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
     else:
@@ -4301,11 +4488,15 @@ def _localized_fixture(item: dict[str, Any], lang: str) -> dict[str, Any]:
     copied = deepcopy(item)
     league = copied.get("league") or {}
     if "name" in league:
-        league["name"] = translate_league_name(league.get("name"), lang)
+        original = league.get("name")
+        zh = zh_league_name(original)
+        league["name"] = zh if zh != original else translate_league_name(original, lang)
     teams = copied.get("teams") or {}
     for side in ("home", "away"):
         if isinstance(teams.get(side), dict) and "name" in teams[side]:
-            teams[side]["name"] = translate_team_name(teams[side].get("name"), lang)
+            original = teams[side].get("name")
+            zh = zh_team_name(original)
+            teams[side]["name"] = zh if zh != original else translate_team_name(original, lang)
     return copied
 
 

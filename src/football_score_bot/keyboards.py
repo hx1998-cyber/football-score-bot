@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from aiogram.types import (
     InlineKeyboardButton,
@@ -8,6 +8,7 @@ from aiogram.types import (
 )
 
 from football_score_bot.i18n import LANGUAGE_LABELS, SUPPORTED_LANGUAGES, t
+from football_score_bot.i18n_football import zh_team_name
 
 
 def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
@@ -103,7 +104,6 @@ def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None) -> In
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="查看开奖", callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
-            [InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")],
             [InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
             [InlineKeyboardButton(text="返回首页", callback_data="home")],
         ]
@@ -121,11 +121,63 @@ def bet_detail_keyboard(
     rows = []
     if status in {"pending", "manual_required"}:
         rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
-        rows.append([InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")])
     if fixture_id is not None:
         rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
     else:
         rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard()
+
+
+def worldcup_home_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 赛程", callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🔥 今日赛事", callback_data="worldcup:today")],
+            [InlineKeyboardButton(text="🏟 小组赛", callback_data="worldcup:groups")],
+            [InlineKeyboardButton(text="📊 排名", callback_data="worldcup_standings")],
+            [InlineKeyboardButton(text="🎲 可投注世界杯赛事", callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text="返回首页", callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🎲 选择赛事投注", callback_data="worldcup:betting:0")])
+    rows.append([InlineKeyboardButton(text="返回世界杯首页", callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int) -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or "主队"
+        away = (teams.get("away") or {}).get("name") or "客队"
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="返回世界杯首页", callback_data="worldcup")])
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -169,8 +221,8 @@ def fixture_list_keyboard(fixtures: list[dict], lang: str, mode: str = "today") 
         fixture_id = fixture.get("id")
         if fixture_id is None:
             continue
-        home = teams.get("home", {}).get("name", "主队")
-        away = teams.get("away", {}).get("name", "客队")
+        home = zh_team_name(teams.get("home", {}).get("name"))
+        away = zh_team_name(teams.get("away", {}).get("name"))
         rows.append(
             [InlineKeyboardButton(text=f"详情 {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")]
         )
@@ -411,7 +463,6 @@ def my_bets_keyboard(
 def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="查看本单", callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
-        [InlineKeyboardButton(text="删除本单", callback_data=f"bet_cancel:{bet_id_or_no}")],
         [InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -421,7 +472,6 @@ def bet_detail_keyboard(bet_id_or_no: str, status: str, status_group: str = "pen
     rows = []
     if status == "pending":
         rows.append([InlineKeyboardButton(text="去结算", callback_data=f"bet_settle:{bet_id_or_no}")])
-        rows.append([InlineKeyboardButton(text="删除本单", callback_data=f"bet_cancel:{bet_id_or_no}")])
     rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -436,7 +486,6 @@ def bet_detail_keyboard(
     rows = []
     if status == "pending":
         rows.append([InlineKeyboardButton(text="去结算", callback_data=f"bet_settle:{bet_id_or_no}")])
-        rows.append([InlineKeyboardButton(text="删除本单", callback_data=f"bet_cancel:{bet_id_or_no}")])
     if fixture_id is not None:
         rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
     else:
@@ -509,7 +558,6 @@ def bet_detail_keyboard(
     rows = []
     if status in {"pending", "manual_required"}:
         rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
-        rows.append([InlineKeyboardButton(text="删除本单", callback_data=f"bet_cancel:{bet_id_or_no}")])
     if fixture_id is not None:
         rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
     else:
@@ -522,7 +570,6 @@ def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None) -> In
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="查看开奖", callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
-            [InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")],
             [InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
             [InlineKeyboardButton(text="返回首页", callback_data="home")],
         ]
@@ -540,7 +587,6 @@ def bet_detail_keyboard(
     rows = []
     if status in {"pending", "manual_required"}:
         rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
-        rows.append([InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")])
     if fixture_id is not None:
         rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
     else:
