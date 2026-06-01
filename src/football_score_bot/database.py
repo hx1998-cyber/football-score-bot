@@ -1,12 +1,24 @@
 from __future__ import annotations
 
 import json
+import logging
 from decimal import Decimal
 from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
 from aiogram.types import Chat, User
+
+from football_score_bot.worldcup_futures import (
+    WORLD_CUP_CHAMPION_LEGACY_KEY,
+    WORLD_CUP_CHAMPION_MARKET_KEY,
+    WORLD_CUP_CHAMPION_ODDS,
+    WORLD_CUP_CHAMPION_TITLE,
+    champion_option_label,
+    champion_option_metadata,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -39,6 +51,8 @@ class Database:
         await self._ensure_role_schema()
         await self._ensure_futures_schema()
         await self.ensure_futures_seeded()
+        await self._ensure_referral_reward_schema()
+        await self._ensure_agent_rebate_schema()
 
     async def _ensure_role_schema(self) -> None:
         await self._pool.execute(
@@ -520,7 +534,53 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_user_predictions_user ON user_predictions (user_id, created_at DESC)"
         )
 
+    async def _ensure_referral_reward_schema(self) -> None:
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS referral_rewards (
+                id BIGSERIAL PRIMARY KEY,
+                referrer_user_id BIGINT NOT NULL,
+                referee_user_id BIGINT NOT NULL,
+                threshold_amount NUMERIC(18, 6) NOT NULL DEFAULT 50,
+                reward_amount NUMERIC(18, 6) NOT NULL DEFAULT 8,
+                referee_valid_stake NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                rewarded_ledger_id BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                rewarded_at TIMESTAMPTZ,
+                UNIQUE(referrer_user_id, referee_user_id)
+            )
+            """
+        )
+        await self._pool.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_referral_rewards_referrer_referee ON referral_rewards(referrer_user_id, referee_user_id)"
+        )
+
+    async def _ensure_agent_rebate_schema(self) -> None:
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS admin_profiles (
+                user_id BIGINT PRIMARY KEY,
+                role TEXT NOT NULL DEFAULT 'agent',
+                rebate_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                rebate_rate NUMERIC(8, 4) NOT NULL DEFAULT 0.20,
+                settled_rebate_stake NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        for statement in (
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS stake_amount NUMERIC(18, 6) NOT NULL DEFAULT 0",
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS rebate_rate NUMERIC(8, 4) NOT NULL DEFAULT 0",
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS rebate_amount NUMERIC(18, 6) NOT NULL DEFAULT 0",
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS reviewed_by BIGINT",
+            "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS ledger_id BIGINT",
+        ):
+            await self._pool.execute(statement)
+
     async def ensure_futures_seeded(self) -> None:
+        await self._upsert_worldcup_champion_market()
         count = await self._pool.fetchval("SELECT COUNT(*) FROM futures_markets")
         if count:
             return
@@ -544,6 +604,84 @@ class Database:
                 ("uruguay", "乌拉圭", "21.00"),
             ],
         )
+
+    async def _upsert_worldcup_champion_market(self) -> None:
+        legacy_id = await self._pool.fetchval(
+            "SELECT id FROM futures_markets WHERE market_key = $1",
+            WORLD_CUP_CHAMPION_LEGACY_KEY,
+        )
+        market_key = WORLD_CUP_CHAMPION_MARKET_KEY
+        current_id = await self._pool.fetchval(
+            "SELECT id FROM futures_markets WHERE market_key = $1",
+            market_key,
+        )
+        if legacy_id and current_id and int(legacy_id) != int(current_id):
+            await self._pool.execute("DELETE FROM futures_markets WHERE id = $1", legacy_id)
+            legacy_id = None
+        if legacy_id:
+            await self._pool.execute(
+                """
+                UPDATE futures_markets
+                SET market_key = $2,
+                    title = $3,
+                    description = '静态冠军赔率，管理员可后续手动更新。',
+                    category = 'world_cup',
+                    settlement_rule = '球队获得 2026 FIFA World Cup 冠军。',
+                    source = 'manual',
+                    display_order = 10,
+                    status = 'open',
+                    updated_at = NOW()
+                WHERE id = $1
+                """,
+                legacy_id,
+                market_key,
+                WORLD_CUP_CHAMPION_TITLE,
+            )
+        else:
+            await self._pool.execute(
+                """
+                INSERT INTO futures_markets (
+                    market_key, title, description, category, settlement_rule, source, display_order, status, updated_at
+                )
+                VALUES ($1, $2, '静态冠军赔率，管理员可后续手动更新。', 'world_cup',
+                        '球队获得 2026 FIFA World Cup 冠军。', 'manual', 10, 'open', NOW())
+                ON CONFLICT (market_key) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    description = EXCLUDED.description,
+                    category = EXCLUDED.category,
+                    settlement_rule = EXCLUDED.settlement_rule,
+                    source = EXCLUDED.source,
+                    display_order = EXCLUDED.display_order,
+                    status = EXCLUDED.status,
+                    updated_at = NOW()
+                """,
+                market_key,
+                WORLD_CUP_CHAMPION_TITLE,
+            )
+        market_id = await self._pool.fetchval("SELECT id FROM futures_markets WHERE market_key = $1", market_key)
+        for index, item in enumerate(WORLD_CUP_CHAMPION_ODDS, start=1):
+            team = str(item["team"])
+            await self._pool.execute(
+                """
+                INSERT INTO futures_options (
+                    market_id, option_key, label, odds, status, display_order, metadata_json, updated_at
+                )
+                VALUES ($1, $2, $3, $4, 'active', $5, $6::jsonb, NOW())
+                ON CONFLICT (market_id, option_key) DO UPDATE SET
+                    label = EXCLUDED.label,
+                    odds = EXCLUDED.odds,
+                    status = 'active',
+                    display_order = EXCLUDED.display_order,
+                    metadata_json = EXCLUDED.metadata_json,
+                    updated_at = NOW()
+                """,
+                market_id,
+                team.lower().replace(" ", "_").replace("-", "_"),
+                champion_option_label(team),
+                item["odds"],
+                index,
+                json.dumps(champion_option_metadata(item), ensure_ascii=False),
+            )
         await self._insert_futures_market(
             market_key="golden_boot",
             title="金靴奖预测",
@@ -576,6 +714,13 @@ class Database:
                 market_key, title, description, category, settlement_rule, source, display_order, updated_at
             )
             VALUES ($1, $2, $3, $4, $5, 'manual', $6, NOW())
+            ON CONFLICT (market_key) DO UPDATE SET
+                title = EXCLUDED.title,
+                description = EXCLUDED.description,
+                category = EXCLUDED.category,
+                settlement_rule = EXCLUDED.settlement_rule,
+                display_order = EXCLUDED.display_order,
+                updated_at = NOW()
             RETURNING id
             """,
             market_key,
@@ -592,6 +737,12 @@ class Database:
                     market_id, option_key, label, odds, status, display_order, metadata_json, updated_at
                 )
                 VALUES ($1, $2, $3, $4, 'active', $5, '{}'::jsonb, NOW())
+                ON CONFLICT (market_id, option_key) DO UPDATE SET
+                    label = EXCLUDED.label,
+                    odds = EXCLUDED.odds,
+                    status = 'active',
+                    display_order = EXCLUDED.display_order,
+                    updated_at = NOW()
                 """,
                 market_id,
                 option_key,
@@ -699,7 +850,8 @@ class Database:
                 o.label,
                 o.odds::TEXT AS odds,
                 o.status,
-                o.display_order
+                o.display_order,
+                o.metadata_json
             FROM futures_markets m
             JOIN futures_options o ON o.market_id = m.id
             WHERE m.market_key = $1 AND m.status = 'open' AND o.status = 'active'
@@ -719,7 +871,8 @@ class Database:
                 o.id AS option_id,
                 o.option_key,
                 o.label,
-                o.odds::TEXT AS odds
+                o.odds::TEXT AS odds,
+                o.metadata_json
             FROM futures_markets m
             JOIN futures_options o ON o.market_id = m.id
             WHERE o.id = $1 AND m.status = 'open' AND o.status = 'active'
@@ -896,7 +1049,25 @@ class Database:
         if isinstance(bet_id, str) and not bet_id.isdigit():
             return await self.get_bet_by_no(bet_id)
         row = await self._pool.fetchrow(
-            "SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout FROM bets WHERE id = $1",
+            """
+            SELECT b.*, b.odds::TEXT AS odds, b.stake::TEXT AS stake,
+                   b.potential_payout::TEXT AS potential_payout, b.payout::TEXT AS payout,
+                   pf.id AS payout_freeze_id,
+                   pf.amount::TEXT AS payout_freeze_amount,
+                   pf.status AS payout_freeze_status,
+                   pf.unlock_at AS payout_freeze_unlock_at,
+                   pf.unlocked_at AS payout_freeze_unlocked_at,
+                   pf.note AS payout_freeze_note
+            FROM bets b
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM payout_freezes
+                WHERE bet_id = b.id
+                ORDER BY CASE WHEN status = 'frozen' THEN 0 ELSE 1 END, id DESC
+                LIMIT 1
+            ) pf ON TRUE
+            WHERE b.id = $1
+            """,
             int(bet_id),
         )
         if not row and isinstance(bet_id, str):
@@ -907,10 +1078,23 @@ class Database:
         bet_no = _clean_lookup_token(bet_no)
         row = await self._pool.fetchrow(
             """
-            SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout,
-                   payout::TEXT AS payout
-            FROM bets
-            WHERE upper(bet_no) = upper($1)
+            SELECT b.*, b.odds::TEXT AS odds, b.stake::TEXT AS stake,
+                   b.potential_payout::TEXT AS potential_payout, b.payout::TEXT AS payout,
+                   pf.id AS payout_freeze_id,
+                   pf.amount::TEXT AS payout_freeze_amount,
+                   pf.status AS payout_freeze_status,
+                   pf.unlock_at AS payout_freeze_unlock_at,
+                   pf.unlocked_at AS payout_freeze_unlocked_at,
+                   pf.note AS payout_freeze_note
+            FROM bets b
+            LEFT JOIN LATERAL (
+                SELECT *
+                FROM payout_freezes
+                WHERE bet_id = b.id
+                ORDER BY CASE WHEN status = 'frozen' THEN 0 ELSE 1 END, id DESC
+                LIMIT 1
+            ) pf ON TRUE
+            WHERE upper(b.bet_no) = upper($1)
             """,
             bet_no,
         )
@@ -957,7 +1141,8 @@ class Database:
         statuses = ("pending", "manual_required") if status == "pending" else (status,)
         rows = await self._pool.fetch(
             """
-            SELECT *, odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout
+            SELECT id, bet_no, user_id, telegram_user_id, fixture_label, selection, status,
+                   odds::TEXT AS odds, stake::TEXT AS stake, potential_payout::TEXT AS potential_payout
             FROM bets
             WHERE status = ANY($1::TEXT[])
             ORDER BY created_at DESC
@@ -1061,6 +1246,109 @@ class Database:
     async def get_withdraw_request(self, withdraw_id: int) -> dict | None:
         row = await self._pool.fetchrow("SELECT * FROM withdraw_requests WHERE id = $1", withdraw_id)
         return dict(row) if row else None
+
+    async def list_pending_withdrawals(self, limit: int = 10) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT id, user_id, amount, network, address, status, created_at
+            FROM withdraw_requests
+            WHERE status = 'pending'
+            ORDER BY created_at DESC
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_withdraw_review_context(self, withdraw_id: int) -> dict | None:
+        withdraw = await self._pool.fetchrow(
+            """
+            SELECT id, user_id, amount, network, address, status, admin_id, admin_note,
+                   created_at, reviewed_at, paid_at
+            FROM withdraw_requests
+            WHERE id = $1
+            """,
+            withdraw_id,
+        )
+        if not withdraw:
+            return None
+        user_id = int(withdraw["user_id"])
+        user = await self._pool.fetchrow(
+            """
+            SELECT telegram_user_id, username, first_name, last_name, created_at, status,
+                   bet_restricted, withdraw_restricted, risk_note
+            FROM users
+            WHERE telegram_user_id = $1
+            """,
+            user_id,
+        )
+        wallet = await self._pool.fetchrow(
+            """
+            SELECT user_id, telegram_user_id, currency, balance, frozen_balance,
+                   total_deposit, total_withdraw, created_at, updated_at
+            FROM wallets
+            WHERE user_id = $1
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+        ledger_summary = await self._pool.fetchrow(
+            """
+            SELECT
+                COALESCE(SUM(amount) FILTER (WHERE type IN ('deposit', 'deposit_manual')), 0) AS total_deposit,
+                COALESCE((SELECT SUM(amount) FROM withdraw_requests WHERE user_id = $1), 0) AS total_withdraw_request,
+                COALESCE(SUM(amount) FILTER (WHERE type = 'manual_adjust'), 0) AS total_manual_adjust,
+                COUNT(*) AS ledger_count
+            FROM wallet_ledger
+            WHERE user_id = $1
+            """,
+            user_id,
+        )
+        bet_summary = await self._pool.fetchrow(
+            """
+            SELECT
+                COALESCE(SUM(stake), 0) AS total_stake,
+                COUNT(*) AS bet_count,
+                COUNT(*) FILTER (WHERE status = 'won') AS won_count,
+                COUNT(*) FILTER (WHERE status = 'lost') AS lost_count,
+                COUNT(*) FILTER (WHERE status IN ('void', 'cancelled')) AS void_count,
+                COALESCE(SUM(payout), 0) AS total_payout
+            FROM bets
+            WHERE COALESCE(user_id, telegram_user_id) = $1
+            """,
+            user_id,
+        )
+        recent_ledgers = await self._pool.fetch(
+            """
+            SELECT type, amount, balance_before, balance_after, frozen_before, frozen_after,
+                   ref_type, ref_id, created_at
+            FROM wallet_ledger
+            WHERE user_id = $1
+            ORDER BY created_at DESC, id DESC
+            LIMIT 5
+            """,
+            user_id,
+        )
+        recent_bets = await self._pool.fetch(
+            """
+            SELECT id, bet_no, status, stake, potential_payout, payout, created_at
+            FROM bets
+            WHERE COALESCE(user_id, telegram_user_id) = $1
+            ORDER BY created_at DESC, id DESC
+            LIMIT 5
+            """,
+            user_id,
+        )
+        return {
+            "withdraw": dict(withdraw),
+            "user": dict(user) if user else {},
+            "wallet": dict(wallet) if wallet else {},
+            "ledger_summary": dict(ledger_summary) if ledger_summary else {},
+            "bet_summary": dict(bet_summary) if bet_summary else {},
+            "recent_ledgers": [dict(row) for row in recent_ledgers],
+            "recent_bets": [dict(row) for row in recent_bets],
+        }
 
     async def list_rebate_rules(self) -> list[dict]:
         rows = await self._pool.fetch("SELECT * FROM rebate_rules ORDER BY mode, min_turnover, min_active_referrals, id")
@@ -1418,6 +1706,178 @@ class Database:
         )
         return dict(row)
 
+    async def check_referral_reward_after_bet(
+        self,
+        referee_user_id: int,
+        threshold_amount: Decimal = Decimal("50"),
+        reward_amount: Decimal = Decimal("8"),
+    ) -> dict | None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                referrer_user_id = await conn.fetchval(
+                    "SELECT parent_user_id FROM referral_relations WHERE user_id = $1",
+                    referee_user_id,
+                )
+                if not referrer_user_id:
+                    logger.info(
+                        "referral_reward_check referrer_user_id=%s referee_user_id=%s valid_stake=%s threshold=%s result=no_referrer",
+                        None,
+                        referee_user_id,
+                        0,
+                        threshold_amount,
+                    )
+                    return None
+                referrer_user_id = int(referrer_user_id)
+                reward = await conn.fetchrow(
+                    """
+                    INSERT INTO referral_rewards (
+                        referrer_user_id, referee_user_id, threshold_amount, reward_amount
+                    )
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (referrer_user_id, referee_user_id) DO UPDATE SET
+                        referrer_user_id = EXCLUDED.referrer_user_id
+                    RETURNING *
+                    """,
+                    referrer_user_id,
+                    referee_user_id,
+                    threshold_amount,
+                    reward_amount,
+                )
+                if not reward or str(reward["status"]) == "rewarded":
+                    logger.info(
+                        "referral_reward_check referrer_user_id=%s referee_user_id=%s valid_stake=%s threshold=%s result=already_rewarded",
+                        referrer_user_id,
+                        referee_user_id,
+                        reward["referee_valid_stake"] if reward else 0,
+                        threshold_amount,
+                    )
+                    return None
+                valid_stake = Decimal(
+                    str(
+                        await conn.fetchval(
+                            """
+                            SELECT COALESCE(SUM(stake), 0)
+                            FROM bets
+                            WHERE COALESCE(user_id, telegram_user_id) = $1
+                              AND COALESCE(is_simulated, TRUE) = FALSE
+                              AND status NOT IN ('void', 'cancelled', 'refunded')
+                            """,
+                            referee_user_id,
+                        )
+                        or 0
+                    )
+                )
+                await conn.execute(
+                    """
+                    UPDATE referral_rewards
+                    SET referee_valid_stake = $3
+                    WHERE referrer_user_id = $1 AND referee_user_id = $2
+                    """,
+                    referrer_user_id,
+                    referee_user_id,
+                    valid_stake,
+                )
+                if valid_stake < Decimal(str(reward["threshold_amount"])):
+                    logger.info(
+                        "referral_reward_check referrer_user_id=%s referee_user_id=%s valid_stake=%s threshold=%s result=pending",
+                        referrer_user_id,
+                        referee_user_id,
+                        valid_stake,
+                        reward["threshold_amount"],
+                    )
+                    return None
+                wallet = await conn.fetchrow(
+                    """
+                    INSERT INTO wallets (user_id, telegram_user_id, currency, balance, frozen_balance, updated_at)
+                    VALUES ($1, $1, 'USDT', 0, 0, NOW())
+                    ON CONFLICT (user_id, currency) DO UPDATE SET updated_at = NOW()
+                    RETURNING *
+                    """,
+                    referrer_user_id,
+                )
+                balance_before = Decimal(str(wallet["balance"]))
+                frozen_before = Decimal(str(wallet["frozen_balance"]))
+                amount = Decimal(str(reward["reward_amount"]))
+                balance_after = balance_before + amount
+                ref_id = f"{referrer_user_id}:{referee_user_id}:{Decimal(str(reward['threshold_amount'])).normalize()}"
+                ledger = await conn.fetchrow(
+                    """
+                    INSERT INTO wallet_ledger (
+                        user_id, currency, type, amount, balance_before, balance_after,
+                        frozen_before, frozen_after, ref_type, ref_id, description
+                    )
+                    VALUES ($1, 'USDT', 'referral_reward', $2, $3, $4, $5, $5,
+                            'referral_threshold', $6, 'Referral threshold reward')
+                    ON CONFLICT (ref_type, ref_id, type)
+                    WHERE ref_type IS NOT NULL AND ref_id IS NOT NULL
+                    DO NOTHING
+                    RETURNING *
+                    """,
+                    referrer_user_id,
+                    amount,
+                    balance_before,
+                    balance_after,
+                    frozen_before,
+                    ref_id,
+                )
+                if not ledger:
+                    logger.info(
+                        "referral_reward_check referrer_user_id=%s referee_user_id=%s valid_stake=%s threshold=%s result=duplicate_ledger",
+                        referrer_user_id,
+                        referee_user_id,
+                        valid_stake,
+                        reward["threshold_amount"],
+                    )
+                    return None
+                await conn.execute(
+                    """
+                    UPDATE wallets
+                    SET balance = $3, updated_at = NOW()
+                    WHERE user_id = $1 AND currency = $2
+                    """,
+                    referrer_user_id,
+                    "USDT",
+                    balance_after,
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE referral_rewards
+                    SET status = 'rewarded',
+                        rewarded_ledger_id = $3,
+                        rewarded_at = NOW(),
+                        referee_valid_stake = $4
+                    WHERE referrer_user_id = $1
+                      AND referee_user_id = $2
+                      AND status <> 'rewarded'
+                    RETURNING *
+                    """,
+                    referrer_user_id,
+                    referee_user_id,
+                    int(ledger["id"]),
+                    valid_stake,
+                )
+                logger.info(
+                    "referral_reward_paid referrer_user_id=%s referee_user_id=%s reward_amount=%s ledger_id=%s",
+                    referrer_user_id,
+                    referee_user_id,
+                    amount,
+                    ledger["id"],
+                )
+                return dict(row) if row else None
+
+    async def get_referral_reward_summary(self, user_id: int) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            SELECT
+                COUNT(*) FILTER (WHERE status = 'rewarded') AS rewarded_count,
+                COALESCE(SUM(reward_amount) FILTER (WHERE status = 'rewarded'), 0) AS rewarded_amount
+            FROM referral_rewards
+            WHERE referrer_user_id = $1
+            """,
+            user_id,
+        )
+        return dict(row) if row else {"rewarded_count": 0, "rewarded_amount": 0}
+
     async def list_commissions(self, user_id: int | None = None, limit: int = 20) -> list[dict]:
         if user_id is None:
             rows = await self._pool.fetch(
@@ -1698,16 +2158,29 @@ class Database:
         )
         return dict(row)
 
-    async def list_rebate_requests(self, user_id: int | None = None, limit: int = 50) -> list[dict]:
-        if user_id is None:
+    async def list_rebate_requests(self, user_id: int | None = None, limit: int = 50, status: str | None = None) -> list[dict]:
+        if user_id is None and status is None:
             rows = await self._pool.fetch(
                 "SELECT * FROM rebate_requests ORDER BY created_at DESC LIMIT $1",
                 limit,
             )
-        else:
+        elif user_id is None:
+            rows = await self._pool.fetch(
+                "SELECT * FROM rebate_requests WHERE status = $1 ORDER BY created_at DESC LIMIT $2",
+                status,
+                limit,
+            )
+        elif status is None:
             rows = await self._pool.fetch(
                 "SELECT * FROM rebate_requests WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2",
                 user_id,
+                limit,
+            )
+        else:
+            rows = await self._pool.fetch(
+                "SELECT * FROM rebate_requests WHERE user_id = $1 AND status = $2 ORDER BY created_at DESC LIMIT $3",
+                user_id,
+                status,
                 limit,
             )
         return [dict(row) for row in rows]
@@ -1753,6 +2226,299 @@ class Database:
             """,
             request_id,
         )
+        return dict(row) if row else None
+
+    async def get_or_create_admin_profile(self, user_id: int, role: str = "agent") -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO admin_profiles (user_id, role)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW()
+            RETURNING *
+            """,
+            user_id,
+            role,
+        )
+        return dict(row)
+
+    async def set_admin_rebate_rate(self, user_id: int, rate: Decimal, operator_id: int | None = None) -> dict:
+        old = await self.get_or_create_admin_profile(user_id)
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO admin_profiles (user_id, role, rebate_rate, updated_at)
+            VALUES ($1, 'agent', $2, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET rebate_rate = EXCLUDED.rebate_rate, updated_at = NOW()
+            RETURNING *
+            """,
+            user_id,
+            rate,
+        )
+        logger.info(
+            "admin_set_rebate_rate operator_id=%s target_user_id=%s old_rate=%s new_rate=%s",
+            operator_id,
+            user_id,
+            old.get("rebate_rate"),
+            rate,
+        )
+        return dict(row)
+
+    async def toggle_admin_rebate(self, user_id: int) -> dict:
+        await self.get_or_create_admin_profile(user_id)
+        row = await self._pool.fetchrow(
+            """
+            UPDATE admin_profiles
+            SET rebate_enabled = NOT rebate_enabled,
+                updated_at = NOW()
+            WHERE user_id = $1
+            RETURNING *
+            """,
+            user_id,
+        )
+        return dict(row)
+
+    async def list_admin_agent_profiles(self, limit: int = 50) -> list[dict]:
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                p.user_id,
+                p.role,
+                p.rebate_enabled,
+                p.rebate_rate::TEXT AS rebate_rate,
+                p.settled_rebate_stake::TEXT AS settled_rebate_stake,
+                COALESCE(w.balance, 0)::TEXT AS balance,
+                COALESCE(w.total_deposit, 0)::TEXT AS total_deposit,
+                COALESCE(b.total_stake, 0)::TEXT AS total_stake,
+                u.username,
+                u.first_name
+            FROM admin_profiles p
+            LEFT JOIN wallets w ON w.user_id = p.user_id AND w.currency = 'USDT'
+            LEFT JOIN users u ON u.telegram_user_id = p.user_id
+            LEFT JOIN (
+                SELECT COALESCE(user_id, telegram_user_id) AS user_id, SUM(stake) AS total_stake
+                FROM bets
+                WHERE COALESCE(is_simulated, TRUE) = FALSE
+                  AND status IN ('won', 'lost', 'settled', 'settled_win', 'settled_loss')
+                GROUP BY COALESCE(user_id, telegram_user_id)
+            ) b ON b.user_id = p.user_id
+            WHERE p.role IN ('admin', 'agent')
+            ORDER BY p.updated_at DESC, p.user_id
+            LIMIT $1
+            """,
+            limit,
+        )
+        return [dict(row) for row in rows]
+
+    async def get_agent_rebate_snapshot(self, user_id: int) -> dict:
+        profile = await self.get_or_create_admin_profile(user_id)
+        row = await self._pool.fetchrow(
+            """
+            SELECT COALESCE(SUM(stake), 0) AS valid_stake
+            FROM bets
+            WHERE COALESCE(user_id, telegram_user_id) = $1
+              AND COALESCE(is_simulated, TRUE) = FALSE
+              AND status IN ('won', 'lost', 'settled', 'settled_win', 'settled_loss')
+            """,
+            user_id,
+        )
+        data = dict(profile)
+        data["valid_stake"] = Decimal(str((row or {}).get("valid_stake") or 0))
+        settled_stake = Decimal(str(profile.get("settled_rebate_stake") or 0))
+        rebate_rate = Decimal(str(profile.get("rebate_rate") or 0))
+        claimable_stake = max(data["valid_stake"] - settled_stake, Decimal("0"))
+        data["claimable_stake"] = claimable_stake
+        data["claimable_rebate"] = (claimable_stake * rebate_rate).quantize(Decimal("0.000001"))
+        data["total_valid_stake"] = data["valid_stake"]
+        data["settled_rebate_stake"] = settled_stake
+        data["available_rebate_stake"] = claimable_stake
+        data["estimated_rebate_amount"] = data["claimable_rebate"]
+        return data
+
+    async def get_agent_rebate_summary(self, user_id: int) -> dict:
+        return await self.get_agent_rebate_snapshot(user_id)
+
+    async def create_agent_rebate_request(self, user_id: int, note: str = "agent rebate request") -> dict | None:
+        snapshot = await self.get_agent_rebate_snapshot(user_id)
+        if not bool(snapshot.get("rebate_enabled")):
+            return None
+        stake_amount = Decimal(str(snapshot.get("claimable_stake") or 0))
+        rebate_amount = Decimal(str(snapshot.get("claimable_rebate") or 0))
+        if stake_amount <= 0 or rebate_amount <= 0:
+            return None
+        existing = await self._pool.fetchrow(
+            """
+            SELECT *
+            FROM rebate_requests
+            WHERE user_id = $1 AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            user_id,
+        )
+        if existing:
+            return dict(existing)
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO rebate_requests (
+                user_id, turnover, requested_amount, stake_amount, rebate_rate, rebate_amount, status, note
+            )
+            VALUES ($1, $2, $3, $2, $4, $3, 'pending', $5)
+            RETURNING *
+            """,
+            user_id,
+            stake_amount,
+            rebate_amount,
+            Decimal(str(snapshot.get("rebate_rate") or 0)),
+            note,
+        )
+        if row:
+            logger.info(
+                "rebate_request_created request_id=%s user_id=%s stake_amount=%s rebate_rate=%s rebate_amount=%s",
+                row["id"],
+                user_id,
+                stake_amount,
+                snapshot.get("rebate_rate"),
+                rebate_amount,
+            )
+        return dict(row) if row else None
+
+    async def approve_agent_rebate_request(self, request_id: int, reviewer_id: int) -> dict | None:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                request = await conn.fetchrow("SELECT * FROM rebate_requests WHERE id = $1 FOR UPDATE", request_id)
+                if not request or str(request["status"]) != "pending":
+                    return None
+                user_id = int(request["user_id"])
+                amount = Decimal(str(request["rebate_amount"] or request["requested_amount"] or 0))
+                stake_amount = Decimal(str(request["stake_amount"] or request["turnover"] or 0))
+                profile = await conn.fetchrow(
+                    """
+                    INSERT INTO admin_profiles (user_id)
+                    VALUES ($1)
+                    ON CONFLICT (user_id) DO UPDATE SET updated_at = NOW()
+                    RETURNING settled_rebate_stake
+                    """,
+                    user_id,
+                )
+                total_valid_stake = Decimal(
+                    str(
+                        await conn.fetchval(
+                            """
+                            SELECT COALESCE(SUM(stake), 0)
+                            FROM bets
+                            WHERE COALESCE(user_id, telegram_user_id) = $1
+                              AND COALESCE(is_simulated, TRUE) = FALSE
+                              AND status IN ('won', 'lost', 'settled', 'settled_win', 'settled_loss')
+                            """,
+                            user_id,
+                        )
+                        or 0
+                    )
+                )
+                settled_stake = Decimal(str(profile["settled_rebate_stake"] or 0)) if profile else Decimal("0")
+                if stake_amount <= 0 or total_valid_stake - settled_stake < stake_amount:
+                    return None
+                wallet = await conn.fetchrow(
+                    """
+                    INSERT INTO wallets (user_id, telegram_user_id, currency, balance, frozen_balance, updated_at)
+                    VALUES ($1, $1, 'USDT', 0, 0, NOW())
+                    ON CONFLICT (user_id, currency) DO UPDATE SET updated_at = NOW()
+                    RETURNING *
+                    """,
+                    user_id,
+                )
+                balance_before = Decimal(str(wallet["balance"]))
+                frozen_before = Decimal(str(wallet["frozen_balance"]))
+                balance_after = balance_before + amount
+                ledger = await conn.fetchrow(
+                    """
+                    INSERT INTO wallet_ledger (
+                        user_id, currency, type, amount, balance_before, balance_after,
+                        frozen_before, frozen_after, ref_type, ref_id, description
+                    )
+                    VALUES ($1, 'USDT', 'agent_rebate', $2, $3, $4, $5, $5,
+                            'rebate_request', $6, 'Agent rebate request payout')
+                    ON CONFLICT (ref_type, ref_id, type)
+                    WHERE ref_type IS NOT NULL AND ref_id IS NOT NULL
+                    DO NOTHING
+                    RETURNING *
+                    """,
+                    user_id,
+                    amount,
+                    balance_before,
+                    balance_after,
+                    frozen_before,
+                    str(request_id),
+                )
+                if not ledger:
+                    return None
+                await conn.execute(
+                    "UPDATE wallets SET balance = $3, updated_at = NOW() WHERE user_id = $1 AND currency = $2",
+                    user_id,
+                    "USDT",
+                    balance_after,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO admin_profiles (user_id, settled_rebate_stake)
+                    VALUES ($1, $2)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                        settled_rebate_stake = admin_profiles.settled_rebate_stake + EXCLUDED.settled_rebate_stake,
+                        updated_at = NOW()
+                    """,
+                    user_id,
+                    stake_amount,
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE rebate_requests
+                    SET status = 'approved',
+                        reviewed_by = $2,
+                        reviewed_at = NOW(),
+                        approved_amount = $3,
+                        ledger_id = $4,
+                        paid_at = NOW()
+                    WHERE id = $1 AND status = 'pending'
+                    RETURNING *
+                    """,
+                    request_id,
+                    reviewer_id,
+                    amount,
+                    int(ledger["id"]),
+                )
+                logger.info(
+                    "admin_approve_rebate operator_id=%s request_id=%s user_id=%s amount=%s ledger_id=%s result=approved",
+                    reviewer_id,
+                    request_id,
+                    user_id,
+                    amount,
+                    ledger["id"],
+                )
+                return dict(row) if row else None
+
+    async def reject_agent_rebate_request(self, request_id: int, reviewer_id: int, reason: str = "") -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            UPDATE rebate_requests
+            SET status = 'rejected',
+                reviewed_by = $2,
+                reviewed_at = NOW(),
+                review_reason = $3,
+                note = COALESCE(NULLIF($3, ''), note)
+            WHERE id = $1 AND status = 'pending'
+            RETURNING *
+            """,
+            request_id,
+            reviewer_id,
+            reason,
+        )
+        if row:
+            logger.info(
+                "admin_reject_rebate operator_id=%s request_id=%s user_id=%s reason=%s result=rejected",
+                reviewer_id,
+                request_id,
+                row["user_id"],
+                reason,
+            )
         return dict(row) if row else None
 
     async def update_user_risk_status(

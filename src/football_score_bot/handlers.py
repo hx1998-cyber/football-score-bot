@@ -82,19 +82,18 @@ from football_score_bot.keyboards import (
     match_detail_keyboard,
     my_bets_keyboard,
     odds_market_keyboard,
-    worldcup_betting_keyboard,
     worldcup_schedule_keyboard,
+    worldcup_betting_keyboard,
     worldcup_zone_keyboard,
 )
 from football_score_bot.i18n_football import (
     fixture_beijing_datetime,
-    format_match_title,
-    team_flag,
     worldcup_match_line,
     worldcup_stage_label,
     zh_league_name,
     zh_team_name,
 )
+from football_score_bot.worldcup_futures import WORLD_CUP_CHAMPION_MARKET_KEY
 from football_score_bot.odds import build_odds_first_matches
 from football_score_bot.odds_normalizer import normalized_from_dict, normalize_fixture_odds as normalize_fixture_odds_full
 from football_score_bot.time_utils import now_hhmm
@@ -129,12 +128,13 @@ class SlashCommandStateMiddleware(BaseMiddleware):
             return None
         return await handler(event, data)
 
-MENU_BETTABLE_TEXTS = {"🎯 可投注赛事", "可投注赛事"}
-MENU_BETS_TEXTS = {"📊 我的注单", "我的注单"}
-MENU_WALLET_TEXTS = {"💰 钱包", "钱包", "充值 USDT", "充值与钱包"}
-MENU_REFERRALS_TEXTS = {"👥 推广", "推广", "推广邀请", "邀请返佣"}
-MENU_WORLDCUP_TEXTS = {"🏆 世界杯", "世界杯", "World Cup"}
-MENU_LANGUAGE_TEXTS = {"🌐 语言", "语言", "Language"}
+MENU_BETTABLE_TEXTS = {"🎯 可投注赛事", "可投注赛事", "🎯 Bettable Matches", "Bettable Matches", "🔥 今日热门", "今日热门", "🔥 Featured Matches", "Featured Matches"}
+MENU_ALL_FIXTURES_TEXTS = {"📋 全部赛程", "📅 全部赛程", "全部赛程", "📅 All Fixtures", "All Fixtures"}
+MENU_BETS_TEXTS = {"📊 我的注单", "🎫 我的注单", "我的注单", "📊 My Bets", "🎫 My Bets", "My Bets"}
+MENU_WALLET_TEXTS = {"💰 钱包", "钱包", "充值 USDT", "充值与钱包", "💰 Wallet", "Wallet", "Deposit USDT"}
+MENU_REFERRALS_TEXTS = {"👥 推广", "推广", "推广邀请", "邀请返佣", "👥 Referral", "Referral"}
+MENU_WORLDCUP_TEXTS = {"🏆 世界杯", "世界杯", "🏆 世界杯 2026", "世界杯 2026", "🏆 World Cup", "World Cup", "🏆 World Cup 2026", "World Cup 2026"}
+MENU_LANGUAGE_TEXTS = {"🌐 语言", "语言", "🌐 Language", "Language"}
 MENU_SETTINGS_TEXTS = {"设置", "⚙️ 设置", "Settings"}
 MENU_HELP_TEXTS = {"帮助", "❓ 帮助", "Help"}
 
@@ -145,14 +145,27 @@ def format_bet_confirm(
     selection: str,
     odds: str,
     stake: str = "10",
+    lang: str = "zh",
 ) -> str:
     teams = fixture.get("teams", {})
-    home = zh_team_name(teams.get("home", {}).get("name"))
-    away = zh_team_name(teams.get("away", {}).get("name"))
+    home = teams.get("home", {}).get("name", "Home" if lang == "en" else "主队")
+    away = teams.get("away", {}).get("name", "Away" if lang == "en" else "客队")
+    if lang == "en":
+        return "\n".join(
+            [
+                "🎯 Confirm Bet",
+                f"Match: {home} vs {away}",
+                f"Market: {market_title}",
+                f"Selection: {selection}",
+                f"Amount: {stake} USDT",
+                f"Odds: {odds}",
+                f"Estimated Payout: {_potential_payout_text(stake, odds)} USDT",
+            ]
+        )
     return "\n".join(
         [
             "🎯 确认下注",
-            f"比赛：{format_match_title(fixture) if fixture.get('league') else f'{home} vs {away}'}",
+            f"比赛：{home} vs {away}",
             f"玩法：{market_title}",
             f"选择：{selection}",
             f"赔率：{odds}",
@@ -229,7 +242,7 @@ def build_router(
         lang = await _remember_user_and_lang(message, database, settings)
         await _maybe_bind_referral(message, command, database)
         await message.answer(
-            await _start_text(cache, api_client, database, settings, message.from_user.id if message.from_user else None),
+            await _start_text(cache, api_client, database, settings, message.from_user.id if message.from_user else None, lang),
             reply_markup=main_menu_keyboard(lang),
         )
 
@@ -238,7 +251,7 @@ def build_router(
         await _safe_callback_answer(callback, "加载中...")
         lang = await _callback_lang(callback, database, settings)
         await callback.message.answer(
-            await _start_text(cache, api_client, database, settings, callback.from_user.id if callback.from_user else None),
+            await _start_text(cache, api_client, database, settings, callback.from_user.id if callback.from_user else None, lang),
             reply_markup=main_menu_keyboard(lang),
         )
 
@@ -325,53 +338,73 @@ def build_router(
 
     @router.message(Command("worldcup"))
     @router.message(F.text.in_(_translated_texts("worldcup") | MENU_WORLDCUP_TEXTS))
-    @router.callback_query(F.data.in_({"worldcup", "menu:worldcup"}))
+    @router.callback_query(F.data.in_({"worldcup", "worldcup:home", "menu:worldcup"}))
     async def worldcup(event: Message | CallbackQuery) -> None:
         await _answer_callback(event, "加载中...")
         message = _message(event)
         lang = await _event_lang(event, database, settings)
         await _remember_chat(message, database)
-        await message.answer("🏆 世界杯 2026\n\n请选择查看：", reply_markup=worldcup_zone_keyboard(lang))
+        await message.answer(t(lang, "worldcup_home_title"), reply_markup=_worldcup_home_keyboard(lang))
 
     @router.callback_query(F.data == "worldcup_schedule")
+    @router.callback_query(F.data.in_({"worldcup:schedule", "worldcup:schedule:0"}))
+    @router.callback_query(F.data.startswith("worldcup:schedule:"))
     async def worldcup_schedule(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback, "加载中...")
-        fixtures = await _get_worldcup_fixtures(cache, api_client)
-        text, total_pages = await _format_worldcup_schedule_page(fixtures, 0, cache, api_client)
-        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(0, total_pages))
+        lang = await _callback_lang(callback, database, settings)
+        page = 0
+        if callback.data and callback.data.startswith("worldcup:schedule:"):
+            try:
+                page = int(callback.data.rsplit(":", 1)[1])
+            except ValueError:
+                page = 0
+        fixtures = _fallback_worldcup_fixtures()
+        text, total_pages = _format_worldcup_schedule_page(fixtures, lang=lang)
+        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(page, total_pages, lang))
 
-    @router.callback_query(F.data.startswith("worldcup:schedule:"))
-    async def worldcup_schedule_page(callback: CallbackQuery) -> None:
+    @router.callback_query(F.data.in_({"worldcup:futures", "worldcup:futures:0"}))
+    @router.callback_query(F.data.startswith("worldcup:futures:"))
+    async def worldcup_futures(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback, "加载中...")
-        page = _safe_int(callback.data.rsplit(":", 1)[1], 0)
-        fixtures = await _get_worldcup_fixtures(cache, api_client)
-        text, total_pages = await _format_worldcup_schedule_page(fixtures, page, cache, api_client)
+        lang = await _callback_lang(callback, database, settings)
+        page = 0
+        if callback.data and callback.data.startswith("worldcup:futures:"):
+            try:
+                page = int(callback.data.rsplit(":", 1)[1])
+            except ValueError:
+                page = 0
+        options = await database.list_futures_options(WORLD_CUP_CHAMPION_MARKET_KEY)
+        per_page = 8
+        total_pages = max((len(options) - 1) // per_page + 1, 1)
         page = max(0, min(page, total_pages - 1))
-        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(page, total_pages))
+        page_options = options[page * per_page : (page + 1) * per_page]
+        await callback.message.answer(
+            _format_worldcup_futures(options, page=page, per_page=per_page, lang=lang),
+            reply_markup=futures_market_keyboard(WORLD_CUP_CHAMPION_MARKET_KEY, page_options, page, total_pages)
+            if options
+            else futures_back_keyboard(lang),
+        )
 
-    @router.callback_query(F.data == "worldcup:today")
-    async def worldcup_today(callback: CallbackQuery) -> None:
-        await _safe_callback_answer(callback, "加载中...")
-        fixtures = [item for item in await _get_worldcup_fixtures(cache, api_client) if _fixture_date(item) == date.today()]
-        text, total_pages = await _format_worldcup_schedule_page(fixtures, 0, cache, api_client, title="🔥 世界杯今日赛事")
-        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(0, total_pages))
-
-    @router.callback_query(F.data == "worldcup:groups")
-    async def worldcup_groups(callback: CallbackQuery) -> None:
-        await _safe_callback_answer(callback, "加载中...")
-        fixtures = [item for item in await _get_worldcup_fixtures(cache, api_client) if "group" in str((item.get("league") or {}).get("round") or "").lower() or "组" in str((item.get("league") or {}).get("round") or "")]
-        text, total_pages = await _format_worldcup_schedule_page(fixtures, 0, cache, api_client, title="🏟 世界杯 2026 小组赛")
-        await callback.message.answer(text, reply_markup=worldcup_schedule_keyboard(0, total_pages))
-
+    @router.callback_query(F.data.in_({"worldcup:betting", "worldcup:betting:0"}))
     @router.callback_query(F.data.startswith("worldcup:betting:"))
     async def worldcup_betting(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback, "加载中...")
-        page = _safe_int(callback.data.rsplit(":", 1)[1], 0)
-        effective_settings = await _effective_settings(cache, settings)
-        fixtures = await _get_worldcup_bettable_fixtures(cache, api_client, database, effective_settings)
-        text, page_fixtures, total_pages = await _format_worldcup_betting_page(fixtures, page, cache, api_client)
+        lang = await _callback_lang(callback, database, settings)
+        page = 0
+        if callback.data and callback.data.startswith("worldcup:betting:"):
+            try:
+                page = int(callback.data.rsplit(":", 1)[1])
+            except ValueError:
+                page = 0
+        fixtures = _fallback_worldcup_fixtures()
+        per_page = 8
+        total_pages = max((len(fixtures) - 1) // per_page + 1, 1)
         page = max(0, min(page, total_pages - 1))
-        await callback.message.answer(text, reply_markup=worldcup_betting_keyboard(page_fixtures, page, total_pages))
+        visible = _localized_fixtures(fixtures[page * per_page : (page + 1) * per_page], lang)
+        await callback.message.answer(
+            t(lang, "worldcup_betting_title"),
+            reply_markup=worldcup_betting_keyboard(visible, page, total_pages, lang),
+        )
 
     @router.callback_query(F.data == "worldcup_standings")
     async def worldcup_standings(callback: CallbackQuery) -> None:
@@ -459,6 +492,66 @@ def build_router(
             reply_markup=futures_back_keyboard(await _callback_lang(callback, database, settings)),
         )
 
+    @router.callback_query(F.data.startswith("futures:bet:"))
+    async def futures_bet(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback, "加载中...")
+        if not callback.from_user:
+            return
+        lang = await _callback_lang(callback, database, settings)
+        parts = callback.data.split(":")
+        if len(parts) < 4:
+            await callback.message.answer(t(lang, "cancel"))
+            return
+        option = await database.get_futures_option(int(parts[2]))
+        if not option or option.get("market_key") != WORLD_CUP_CHAMPION_MARKET_KEY:
+            await callback.message.answer("该预测选项暂不可用。" if lang != "en" else "This futures option is unavailable.")
+            return
+        stake_decimal = _validated_amount(parts[3], settings.min_bet_amount, settings.max_bet_amount)
+        risk = await database.get_user_risk_status(callback.from_user.id)
+        if _risk_blocks(risk, "bet"):
+            await callback.message.answer("账户当前被限制下注，请联系管理员。" if lang != "en" else "Betting is restricted on this account.")
+            return
+        if settings.real_betting_enabled or settings.bet_require_balance_for_simulation:
+            wallet_row = await wallet_service.get_balance(callback.from_user.id)
+            balance = Decimal(str(wallet_row.get("balance") or 0))
+            if balance < stake_decimal:
+                await callback.message.answer(
+                    _format_insufficient_balance(stake_decimal, balance, settings.wallet_currency, lang),
+                    reply_markup=_insufficient_balance_keyboard(None, lang),
+                )
+                return
+        odds = str(option["odds"])
+        payout = (stake_decimal * Decimal(odds)).quantize(Decimal("0.01"))
+        bet_id = await wallet_service.submit_bet(
+            user_id=callback.from_user.id,
+            fixture_id=None,
+            fixture_label=t(lang, "worldcup_futures_title"),
+            market_key=WORLD_CUP_CHAMPION_MARKET_KEY,
+            market_title=t(lang, "worldcup_futures_title"),
+            selection=_worldcup_option_label(option, lang),
+            odds=odds,
+            stake=stake_decimal,
+            potential_payout=payout,
+            bettable_status_at_submit="futures",
+            real_betting_enabled=settings.real_betting_enabled,
+            league_name="World Cup",
+            home_team=str(option.get("label") or "-"),
+            away_team="Champion",
+            fixture_start_time=None,
+        )
+        if bet_id is None:
+            wallet_row = await wallet_service.get_balance(callback.from_user.id)
+            await callback.message.answer(
+                _format_insufficient_balance(stake_decimal, Decimal(str(wallet_row.get("balance") or 0)), settings.wallet_currency, lang),
+                reply_markup=_insufficient_balance_keyboard(None, lang),
+            )
+            return
+        bet = await database.get_bet(bet_id)
+        await callback.message.answer(
+            _format_bet_created(bet or {"id": bet_id}, settings.wallet_currency, lang),
+            reply_markup=bet_created_keyboard(str((bet or {}).get("bet_no") or bet_id), lang=lang),
+        )
+
     @router.callback_query(F.data == "futures:my")
     async def futures_my(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback, "加载中...")
@@ -471,6 +564,7 @@ def build_router(
 
     @router.callback_query(F.data == "today_all")
     @router.message(F.text == "📋 全部赛程")
+    @router.message(F.text.in_(MENU_ALL_FIXTURES_TEXTS))
     async def today_all(callback: CallbackQuery) -> None:
         await _answer_callback(callback, "加载中...")
         message = _message(callback)
@@ -589,6 +683,7 @@ def build_router(
         if not bet_status.is_bettable:
             await callback.message.answer(f"当前不可投注：{reason_label(bet_status.reason)}")
             return
+        lang = await _callback_lang(callback, database, settings)
         await callback.message.answer(
             format_bet_confirm(
                 fixture,
@@ -596,6 +691,7 @@ def build_router(
                 _outcome_button_label(outcome),
                 outcome.odds,
                 stake=str(settings.default_bet_amount),
+                lang=lang,
             )
             + "\n\n"
             + _bet_mode_notice(settings),
@@ -651,9 +747,10 @@ def build_router(
             wallet_row = await wallet_service.get_balance(callback.from_user.id)
             balance = Decimal(str(wallet_row.get("balance") or 0))
             if balance < stake_decimal:
+                lang = await _callback_lang(callback, database, settings)
                 await callback.message.answer(
-                    _format_insufficient_balance(stake_decimal, balance, settings.wallet_currency),
-                    reply_markup=_insufficient_balance_keyboard(fixture_id),
+                    _format_insufficient_balance(stake_decimal, balance, settings.wallet_currency, lang),
+                    reply_markup=_insufficient_balance_keyboard(fixture_id, lang),
                 )
                 return
         stake = str(stake_decimal)
@@ -663,7 +760,7 @@ def build_router(
         except Exception:
             potential_payout_decimal = Decimal("0.00")
         teams = fixture.get("teams", {})
-        fixture_label = format_match_title(fixture)
+        fixture_label = f"{teams.get('home', {}).get('name', '主队')} vs {teams.get('away', {}).get('name', '客队')}"
         bet_id = await wallet_service.submit_bet(
             user_id=callback.from_user.id,
             fixture_id=fixture_id,
@@ -683,14 +780,16 @@ def build_router(
         )
         if bet_id is None:
             wallet_row = await wallet_service.get_balance(callback.from_user.id)
+            lang = await _callback_lang(callback, database, settings)
             await callback.message.answer(
-                _format_insufficient_balance(stake_decimal, Decimal(str(wallet_row.get("balance") or 0)), settings.wallet_currency),
-                reply_markup=_insufficient_balance_keyboard(fixture_id),
+                _format_insufficient_balance(stake_decimal, Decimal(str(wallet_row.get("balance") or 0)), settings.wallet_currency, lang),
+                reply_markup=_insufficient_balance_keyboard(fixture_id, lang),
             )
             return
         bet = await database.get_bet(bet_id)
+        lang = await _callback_lang(callback, database, settings)
         await callback.message.answer(
-            _format_bet_created(bet or {"id": bet_id}, settings.wallet_currency),
+            _format_bet_created(bet or {"id": bet_id}, settings.wallet_currency, lang),
             reply_markup=_bet_action_keyboard(
                 str((bet or {}).get("bet_no") or bet_id),
                 str((bet or {}).get("status") or "pending"),
@@ -737,7 +836,18 @@ def build_router(
                 reply_markup=_cancel_keyboard("bets"),
             )
             return
-        await _send_bet_confirm_for_amount(callback.message, fixture_id, market_key, page, outcome_index, amount, cache, api_client, settings)
+        await _send_bet_confirm_for_amount(
+            callback.message,
+            fixture_id,
+            market_key,
+            page,
+            outcome_index,
+            amount,
+            cache,
+            api_client,
+            settings,
+            await _callback_lang(callback, database, settings),
+        )
 
     @router.message(BetStates.waiting_custom_stake, ~F.text.startswith("/"))
     async def bet_custom_stake_input(message: Message, state: FSMContext) -> None:
@@ -761,6 +871,7 @@ def build_router(
             cache,
             api_client,
             settings,
+            await _event_lang(message, database, settings),
         )
 
     @router.callback_query(F.data == "bet_placeholder")
@@ -776,7 +887,8 @@ def build_router(
         await _answer_callback(event)
         message = _message(event)
         await _remember_chat(message, database)
-        await message.answer("请选择语言 / Choose language:", reply_markup=language_keyboard())
+        lang = await _event_lang(event, database, settings)
+        await message.answer(t(lang, "language_prompt"), reply_markup=language_keyboard(lang))
 
     @router.callback_query(F.data.startswith("lang:"))
     async def set_language(callback: CallbackQuery) -> None:
@@ -785,6 +897,7 @@ def build_router(
         if lang not in SUPPORTED_LANGUAGES or not callback.from_user:
             return
         await database.set_user_language(callback.from_user.id, lang)
+        await callback.message.answer(t(lang, "language_set_en" if lang == "en" else "language_set_zh"))
         await callback.message.answer(t(lang, "start_title"), reply_markup=main_menu_keyboard(lang))
 
     @router.message(Command("match"))
@@ -837,14 +950,16 @@ def build_router(
         if not user:
             return
         wallet_row = await wallet_service.get_balance(user.id)
-        await message.answer(_format_wallet(wallet_row, settings.wallet_currency), reply_markup=_wallet_keyboard())
+        lang = await _event_lang(event, database, settings)
+        await message.answer(_format_wallet(wallet_row, settings.wallet_currency, lang), reply_markup=_wallet_keyboard(lang))
 
     @router.callback_query(F.data == "wallet:recharge")
     async def wallet_recharge(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
         await state.clear()
         await state.set_state(RechargeStates.choosing_amount)
-        await callback.message.answer("请选择充值金额：", reply_markup=_recharge_amount_keyboard())
+        lang = await _callback_lang(callback, database, settings)
+        await callback.message.answer("Please enter deposit amount" if lang == "en" else "请输入充值金额", reply_markup=_recharge_amount_keyboard())
 
     @router.callback_query(F.data.startswith("wallet:amount:"))
     async def wallet_recharge_amount(callback: CallbackQuery, state: FSMContext) -> None:
@@ -853,15 +968,21 @@ def build_router(
             return
         raw_amount = callback.data.rsplit(":", 1)[1]
         if raw_amount == "custom":
+            lang = await _callback_lang(callback, database, settings)
             await state.set_state(RechargeStates.waiting_custom_amount)
             await callback.message.answer(
-                f"请输入充值金额，最低 {_money(settings.min_recharge_amount)} USDT，最高 {_money(settings.max_recharge_amount)} USDT。",
+                f"Please enter deposit amount. Min {_money(settings.min_recharge_amount)} USDT, max {_money(settings.max_recharge_amount)} USDT."
+                if lang == "en"
+                else f"请输入充值金额，最低 {_money(settings.min_recharge_amount)} USDT，最高 {_money(settings.max_recharge_amount)} USDT。",
                 reply_markup=_cancel_keyboard("wallet"),
             )
             return
         await state.update_data(amount=str(_validated_amount(raw_amount, settings.min_recharge_amount, settings.max_recharge_amount)))
         await state.set_state(RechargeStates.confirming_recharge)
-        await callback.message.answer(_format_recharge_confirm(await state.get_data(), settings), reply_markup=_recharge_confirm_keyboard())
+        await callback.message.answer(
+            _format_recharge_confirm(await state.get_data(), settings, await _callback_lang(callback, database, settings)),
+            reply_markup=_recharge_confirm_keyboard(),
+        )
 
     @router.message(RechargeStates.waiting_custom_amount, ~F.text.startswith("/"))
     async def recharge_custom_amount_input(message: Message, state: FSMContext) -> None:
@@ -875,7 +996,10 @@ def build_router(
             return
         await state.update_data(amount=str(amount))
         await state.set_state(RechargeStates.confirming_recharge)
-        await message.answer(_format_recharge_confirm(await state.get_data(), settings), reply_markup=_recharge_confirm_keyboard())
+        await message.answer(
+            _format_recharge_confirm(await state.get_data(), settings, await _event_lang(message, database, settings)),
+            reply_markup=_recharge_confirm_keyboard(),
+        )
 
     @router.callback_query(F.data == "recharge:confirm")
     async def recharge_confirm(callback: CallbackQuery, state: FSMContext) -> None:
@@ -896,6 +1020,7 @@ def build_router(
             database,
             settings,
             gmpay_client,
+            lang=await _callback_lang(callback, database, settings),
         )
         await state.clear()
 
@@ -915,7 +1040,7 @@ def build_router(
         except Exception:
             await message.answer("用法：/recharge <金额>")
             return
-        await _create_recharge_order(message, message.from_user.id, amount, database, settings, gmpay_client)
+        await _create_recharge_order(message, message.from_user.id, amount, database, settings, gmpay_client, lang=await _event_lang(message, database, settings))
 
     @router.callback_query(F.data == "wallet:records")
     async def wallet_records(callback: CallbackQuery) -> None:
@@ -932,13 +1057,16 @@ def build_router(
     @router.callback_query(F.data == "wallet:withdraw_prompt")
     async def wallet_withdraw_prompt(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
+        lang = await _callback_lang(callback, database, settings)
         if not settings.withdraw_enabled:
-            await callback.message.answer("提现申请功能暂未开放。")
+            await callback.message.answer("Withdrawals are currently unavailable." if lang == "en" else "提现申请功能暂未开放。")
             return
         await state.clear()
         await state.set_state(WithdrawStates.waiting_amount)
         await callback.message.answer(
-            f"请输入提现金额，最低 {_money(settings.min_withdraw_amount)} {settings.wallet_currency}。",
+            f"Please enter withdrawal amount. Min {_money(settings.min_withdraw_amount)} {settings.wallet_currency}."
+            if lang == "en"
+            else f"请输入提现金额，最低 {_money(settings.min_withdraw_amount)} {settings.wallet_currency}。",
             reply_markup=_cancel_keyboard("wallet"),
         )
 
@@ -966,7 +1094,8 @@ def build_router(
             return
         await state.update_data(network=network)
         await state.set_state(WithdrawStates.waiting_address)
-        await callback.message.answer("请输入提现地址：", reply_markup=_cancel_keyboard("wallet"))
+        lang = await _callback_lang(callback, database, settings)
+        await callback.message.answer("Please enter withdrawal address" if lang == "en" else "请输入提现地址", reply_markup=_cancel_keyboard("wallet"))
 
     @router.message(WithdrawStates.waiting_address, ~F.text.startswith("/"))
     async def withdraw_address_input(message: Message, state: FSMContext) -> None:
@@ -979,7 +1108,10 @@ def build_router(
             return
         await state.update_data(address=address)
         await state.set_state(WithdrawStates.confirming_withdraw)
-        await message.answer(_format_withdraw_confirm(await state.get_data(), settings.wallet_currency), reply_markup=_withdraw_confirm_keyboard())
+        await message.answer(
+            _format_withdraw_confirm(await state.get_data(), settings.wallet_currency, await _event_lang(message, database, settings)),
+            reply_markup=_withdraw_confirm_keyboard(),
+        )
 
     @router.callback_query(F.data == "withdraw:confirm")
     async def withdraw_confirm(callback: CallbackQuery, state: FSMContext) -> None:
@@ -995,10 +1127,17 @@ def build_router(
         )
         await state.clear()
         if not request:
-            await callback.message.answer("余额不足，无法提交提现申请。", reply_markup=_wallet_keyboard())
+            lang = await _callback_lang(callback, database, settings)
+            await callback.message.answer(t(lang, "insufficient_balance"), reply_markup=_wallet_keyboard(lang))
             return
         await _notify_admins(callback.bot, settings, f"新的提现申请 #{request['id']}，请进入后台审核。")
-        await callback.message.answer(f"提现申请已提交，等待管理员审核。\n申请号：{request['id']}", reply_markup=_wallet_keyboard())
+        lang = await _callback_lang(callback, database, settings)
+        await callback.message.answer(
+            f"Withdrawal request submitted, waiting for admin review\nRequest ID: {request['id']}"
+            if lang == "en"
+            else f"提现申请已提交，等待管理员审核。\n申请号：{request['id']}",
+            reply_markup=_wallet_keyboard(lang),
+        )
 
     @router.callback_query(F.data == "wallet:withdraw")
     async def wallet_withdraw(callback: CallbackQuery) -> None:
@@ -1039,7 +1178,10 @@ def build_router(
         if not order:
             await callback.message.answer("订单不存在。")
             return
-        await callback.message.answer(_format_deposit_order(order, settings.wallet_currency), reply_markup=_deposit_order_keyboard(order))
+        await callback.message.answer(
+            _format_deposit_order(order, settings.wallet_currency, await _callback_lang(callback, database, settings)),
+            reply_markup=_deposit_order_keyboard(order),
+        )
 
     @router.callback_query(F.data == "menu:bets")
     async def menu_bets(callback: CallbackQuery) -> None:
@@ -1094,8 +1236,50 @@ def build_router(
 
     @router.callback_query(F.data.startswith("bet_cancel:"))
     async def bet_cancel(callback: CallbackQuery) -> None:
-        await callback.answer("下注确认后买定离手，暂不支持退单。", show_alert=True)
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        bet_key = _clean_command_token(callback.data.split(":", 1)[1])
+        bet = await database.get_user_bet(callback.from_user.id, bet_key)
+        if not bet:
+            await callback.message.answer("注单不存在。")
+            return
+        if bet.get("status") != "pending":
+            await callback.message.answer("该注单已开奖或已处理，不能申请退单。")
+            return
+        start_time = bet.get("fixture_start_time")
+        if isinstance(start_time, datetime) and datetime.now(start_time.tzinfo) >= start_time - timedelta(minutes=settings.bet_cancel_before_start_minutes):
+            await callback.message.answer("当前已超过可申请退单时间，如有争议请联系人工客服。")
+            return
+        request = await database.create_cancel_request(callback.from_user.id, int(bet["id"]), "user_request")
+        await database.add_admin_audit_log(
+            callback.from_user.id,
+            "user_cancel_request",
+            "bet",
+            str(bet.get("bet_no") or bet.get("id")),
+            {"cancel_request_id": (request or {}).get("id"), "reason": "user_request"},
+        )
+        await callback.message.answer("已提交退单申请，需超级管理员审核。审核前注单仍然有效。")
         return
+        await _safe_callback_answer(callback)
+        if not callback.from_user:
+            return
+        if not settings.user_cancel_after_confirm_enabled:
+            await callback.message.answer("注单已确认，无法自行取消。如需处理，请联系管理员。")
+            return
+        bet_key = callback.data.split(":", 1)[1]
+        bet = await database.get_user_bet(callback.from_user.id, bet_key)
+        if not bet or bet.get("status") != "pending":
+            await callback.message.answer("本单已进入结算阶段，无法删除。")
+            return
+        start_time = bet.get("fixture_start_time")
+        if isinstance(start_time, datetime) and datetime.now(start_time.tzinfo) >= start_time - timedelta(minutes=settings.bet_cancel_before_start_minutes):
+            await callback.message.answer("本单已进入结算阶段，无法删除。")
+            return
+        row = await wallet_service.cancel_bet(int(bet["id"]), callback.from_user.id, real_betting_enabled=settings.real_betting_enabled)
+        await callback.message.answer(
+            f"注单已取消\n\n注单号：{bet.get('bet_no') or bet.get('id')}\n状态：已取消" if row else "本单已进入结算阶段，无法删除。"
+        )
 
     @router.callback_query(F.data.startswith("bet_settle:"))
     async def bet_settle(callback: CallbackQuery) -> None:
@@ -1200,8 +1384,14 @@ def build_router(
         if len(note) < 2:
             await message.answer("申请说明太短，请重新输入。", reply_markup=_cancel_keyboard("referrals"))
             return
-        summary = await database.get_referral_summary(message.from_user.id)
-        await state.update_data(note=note, turnover=str(summary.get("total_turnover") or "0"), active_referrals=int(summary.get("active_count") or 0))
+        snapshot = await database.get_agent_rebate_snapshot(message.from_user.id)
+        await state.update_data(
+            note=note,
+            turnover=str(snapshot.get("claimable_stake") or "0"),
+            active_referrals=0,
+            rebate_rate=str(snapshot.get("rebate_rate") or "0"),
+            rebate_amount=str(snapshot.get("claimable_rebate") or "0"),
+        )
         await state.set_state(RebateStates.confirming_request)
         await message.answer(_format_rebate_confirm(await state.get_data()), reply_markup=_rebate_confirm_keyboard())
 
@@ -1211,20 +1401,14 @@ def build_router(
         if not callback.from_user:
             return
         data = await state.get_data()
-        parent = await database.pool.fetchval("SELECT parent_user_id FROM referral_relations WHERE user_id = $1", callback.from_user.id)
-        requested_to = int(parent) if parent else (next(iter(settings.super_admin_user_ids), None))
-        row = await database.create_rebate_request(
-            callback.from_user.id,
-            requested_to,
-            Decimal(str(data.get("turnover") or "0")),
-            int(data.get("active_referrals") or 0),
-            Decimal("0"),
-            str(data.get("note") or ""),
-        )
+        row = await database.create_agent_rebate_request(callback.from_user.id, str(data.get("note") or "agent rebate request"))
         await state.clear()
-        if requested_to:
-            await _notify_user(callback.bot, requested_to, f"新的返水申请 #{row['id']}，请审核。")
-        await callback.message.answer(f"返水申请已提交，状态：pending。\n申请号：{row['id']}", reply_markup=_referral_keyboard())
+        lang = await _callback_lang(callback, database, settings)
+        if not row:
+            await callback.message.answer(t(lang, "rebate_no_claimable"), reply_markup=_referral_keyboard())
+            return
+        await _notify_super_admins_rebate(callback.bot, database, settings, row)
+        await callback.message.answer(t(lang, "rebate_submitted", id=row["id"]), reply_markup=_referral_keyboard())
 
     @router.callback_query(F.data == "referrals:agent_apply")
     async def agent_apply(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1339,7 +1523,8 @@ def build_router(
         if role not in {"super_admin", "admin", "agent"}:
             await message.answer("无管理员权限。")
             return
-        await message.answer(_admin_menu_text(role), reply_markup=_admin_panel_keyboard(role))
+        lang = await _event_lang(event, database, settings)
+        await message.answer(_admin_menu_text(role, lang), reply_markup=_admin_panel_keyboard(role, lang))
 
     @router.message(Command("admin"))
     async def admin(message: Message) -> None:
@@ -2374,7 +2559,7 @@ def build_router(
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
-        await message.answer(_format_rebate_requests(await database.list_rebate_requests(None, 50)))
+        await message.answer(_format_rebate_requests(await database.list_rebate_requests(None, 50, "pending"), await _event_lang(message, database, settings)))
 
     @router.message(Command("admin_rebate_request"))
     async def admin_rebate_request(message: Message, command: CommandObject) -> None:
@@ -2412,6 +2597,45 @@ def build_router(
         row = await database.update_rebate_request_status(int(parts[0]), "rejected", reason=parts[1])
         await database.add_admin_audit_log(message.from_user.id, "admin_reject_rebate_request", "rebate_request", parts[0], {"rejected": bool(row), "reason": parts[1]})
         await message.answer("返水申请已拒绝。" if row else "返水申请不存在或状态不允许。")
+
+    @router.message(Command("admin_approve_rebate"))
+    @router.message(Command("admin_approve_agent_rebate"))
+    async def admin_approve_rebate(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
+        request_id = _first_int_arg(command)
+        if request_id is None:
+            await message.answer(t(await _event_lang(message, database, settings), "usage_approve_rebate"))
+            return
+        row = await database.approve_agent_rebate_request(request_id, message.from_user.id)
+        await database.add_admin_audit_log(message.from_user.id, "admin_approve_rebate", "rebate_request", str(request_id), {"approved": bool(row)})
+        await message.answer("返水申请已审核通过并入账。" if row else t(await _event_lang(message, database, settings), "rebate_already_processed"))
+        if row:
+            await _notify_user(
+                message.bot,
+                int(row["user_id"]),
+                t(await database.get_user_language(int(row["user_id"]), settings.default_language), "rebate_approved", amount=_money(row.get("rebate_amount")), currency=settings.wallet_currency),
+            )
+
+    @router.message(Command("admin_reject_rebate"))
+    @router.message(Command("admin_reject_agent_rebate"))
+    async def admin_reject_rebate(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split(maxsplit=1)
+        if not parts:
+            await message.answer(t(await _event_lang(message, database, settings), "usage_reject_rebate"))
+            return
+        reason = parts[1] if len(parts) > 1 else "-"
+        row = await database.reject_agent_rebate_request(int(parts[0]), message.from_user.id, reason)
+        await database.add_admin_audit_log(message.from_user.id, "admin_reject_rebate", "rebate_request", parts[0], {"rejected": bool(row), "reason": reason})
+        await message.answer("返水申请已拒绝。" if row else t(await _event_lang(message, database, settings), "rebate_already_processed"))
+        if row:
+            await _notify_user(
+                message.bot,
+                int(row["user_id"]),
+                t(await database.get_user_language(int(row["user_id"]), settings.default_language), "rebate_rejected", reason=reason),
+            )
 
     @router.message(Command("admin_pay_rebate_request"))
     async def admin_pay_rebate_request(message: Message, command: CommandObject) -> None:
@@ -2706,7 +2930,12 @@ def build_router(
             else:
                 await callback.message.answer(_format_admin_users(await database.list_users(50)))
         elif data == "admin:rebates":
-            await callback.message.answer("🎁 返水管理\n\n待处理返水申请请使用 /admin_rebate_preview <user_id> 查看；结算使用 /admin_settle_rebate <rebate_record_id>。")
+            await callback.message.answer(
+                _format_rebate_requests(
+                    await database.list_rebate_requests(None, 50, "pending"),
+                    await _callback_lang(callback, database, settings),
+                )
+            )
         elif data == "admin:commissions":
             await callback.message.answer(_format_commissions(await database.list_commissions(None if role == "super_admin" else callback.from_user.id, 20)))
         elif data == "admin:settings":
@@ -2720,7 +2949,7 @@ def build_router(
     @router.callback_query(F.data == "support")
     async def support_callback(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
-        await callback.message.answer("下注确认后买定离手，暂不支持退单。如遇系统异常，请联系管理员。")
+        await callback.message.answer("请从注单详情点击“申请退单/联系客服”，系统会按注单状态和开赛时间判断是否可提交退单申请。")
 
     @router.callback_query()
     async def unknown_callback(callback: CallbackQuery) -> None:
@@ -2737,6 +2966,7 @@ async def _start_text(
     database: Database,
     settings: Settings,
     telegram_user_id: int | None,
+    lang: str = "zh",
 ) -> str:
     today_matches, _ = await get_bettable_matches_range(cache, api_client, database, settings)
     tomorrow = date.today() + timedelta(days=1)
@@ -2750,6 +2980,15 @@ async def _start_text(
         mode_lines.append("当前为模拟下注模式，不扣真实余额。")
         if settings.bet_require_balance_for_simulation:
             mode_lines.append("模拟下注仍需钱包余额覆盖下注金额。")
+    if lang == "en":
+        return (
+            "WorldCupTop Bot\n\n"
+            f"Featured Matches: {_count_by_date(today_matches, date.today())}\n"
+            f"Tomorrow Fixtures: {len(tomorrow_matches)}\n"
+            f"Live Matches: {len(live)}\n"
+            f"My Pending Bets: {pending}\n"
+            f"Test Bets: {simulated_pending}"
+        )
     return (
         "WorldCupTop Bot\n\n"
         f"今日可投注：{_count_by_date(today_matches, date.today())} 场\n"
@@ -3051,191 +3290,6 @@ async def _get_fixture_odds(
         return normalized_from_dict(cached) if cached else None
 
 
-async def _get_worldcup_fixtures(cache: RedisCache, api_client: ApiFootballClient) -> list[dict[str, Any]]:
-    key = "football:worldcup:fixtures:2026"
-    cached = await cache.get_json(key, [])
-    if cached:
-        return cached
-    try:
-        fixtures = await api_client.get_fixtures_by_league_season(1, 2026)
-    except Exception as exc:
-        _log_api_failure("worldcup-fixtures", "worldcup fixtures fetch failed; using fallback: %s", exc)
-        fixtures = []
-    if not fixtures:
-        fixtures = _fallback_worldcup_fixtures()
-    fixtures.sort(key=lambda item: int((item.get("fixture") or {}).get("timestamp") or 0))
-    await cache.set_json(key, fixtures, ttl_seconds=3600)
-    return fixtures
-
-
-async def _get_worldcup_bettable_fixtures(
-    cache: RedisCache,
-    api_client: ApiFootballClient,
-    database: Database,
-    settings: Settings,
-) -> list[dict[str, Any]]:
-    fixtures = await _get_worldcup_fixtures(cache, api_client)
-    fixture_ids = [int((item.get("fixture") or {}).get("id")) for item in fixtures if (item.get("fixture") or {}).get("id")]
-    overrides = await database.get_market_overrides(fixture_ids)
-    bettable: list[dict[str, Any]] = []
-    for item in fixtures:
-        fixture_id = (item.get("fixture") or {}).get("id")
-        if fixture_id is None:
-            continue
-        odds = await _get_fixture_odds(cache, api_client, int(fixture_id))
-        override = overrides.get(int(fixture_id))
-        status = is_bettable_fixture(
-            item,
-            odds,
-            settings,
-            is_suspended_by_admin=bool(override and override.get("is_suspended")),
-        )
-        if status.is_bettable:
-            bettable.append(item)
-    return bettable
-
-
-async def _format_worldcup_schedule_page(
-    fixtures: list[dict[str, Any]],
-    page: int,
-    cache: RedisCache,
-    api_client: ApiFootballClient,
-    *,
-    title: str = "🏆 世界杯 2026 赛程",
-) -> tuple[str, int]:
-    per_page = 5
-    total_pages = max((len(fixtures) - 1) // per_page + 1, 1)
-    page = max(0, min(page, total_pages - 1))
-    page_items = fixtures[page * per_page : (page + 1) * per_page]
-    if not page_items:
-        return f"{title}\n\n暂无世界杯赛程。", total_pages
-    lines = [title, ""]
-    current_day = None
-    for item in page_items:
-        dt = fixture_beijing_datetime(item)
-        day_label = _worldcup_day_label(dt)
-        if day_label != current_day:
-            lines.append(f"📅 {day_label}")
-            current_day = day_label
-        fixture_id = (item.get("fixture") or {}).get("id")
-        odds = await _get_fixture_odds(cache, api_client, int(fixture_id)) if fixture_id is not None else None
-        lines.extend(
-            [
-                "",
-                f"【{worldcup_stage_label(item)}】",
-                worldcup_match_line(item),
-                f" {dt.strftime('%H:%M') if dt else '--:--'}",
-                f"🎲 预测赔率：{_match_winner_odds_text(odds)}",
-            ]
-        )
-    lines.append(f"\n第 {page + 1}/{total_pages} 页")
-    return "\n".join(lines), total_pages
-
-
-async def _format_worldcup_betting_page(
-    fixtures: list[dict[str, Any]],
-    page: int,
-    cache: RedisCache,
-    api_client: ApiFootballClient,
-) -> tuple[str, list[dict[str, Any]], int]:
-    per_page = 6
-    total_pages = max((len(fixtures) - 1) // per_page + 1, 1)
-    page = max(0, min(page, total_pages - 1))
-    page_items = fixtures[page * per_page : (page + 1) * per_page]
-    if not page_items:
-        return "🎲 世界杯可投注赛事\n\n当前暂无可投注世界杯赛事。", [], total_pages
-    lines = ["🎲 世界杯可投注赛事", ""]
-    localized_items: list[dict[str, Any]] = []
-    for index, item in enumerate(page_items, start=1):
-        fixture_id = (item.get("fixture") or {}).get("id")
-        odds = await _get_fixture_odds(cache, api_client, int(fixture_id)) if fixture_id is not None else None
-        dt = fixture_beijing_datetime(item)
-        teams = item.get("teams") or {}
-        home_raw = (teams.get("home") or {}).get("name")
-        away_raw = (teams.get("away") or {}).get("name")
-        localized = deepcopy(item)
-        localized_teams = localized.get("teams") or {}
-        if isinstance(localized_teams.get("home"), dict):
-            localized_teams["home"]["name"] = zh_team_name(home_raw)
-        if isinstance(localized_teams.get("away"), dict):
-            localized_teams["away"]["name"] = zh_team_name(away_raw)
-        localized_items.append(localized)
-        lines.extend(
-            [
-                f"{index}. 【{worldcup_stage_label(item)}】",
-                f"{team_flag(home_raw)} {zh_team_name(home_raw)} vs {team_flag(away_raw)} {zh_team_name(away_raw)}",
-                f" {dt.strftime('%m月%d日 %H:%M') if dt else '--:--'}",
-                f"赔率：{_match_winner_odds_text(odds)}",
-                "",
-            ]
-        )
-    lines.append(f"第 {page + 1}/{total_pages} 页")
-    return "\n".join(lines).rstrip(), localized_items, total_pages
-
-
-def _match_winner_odds_text(normalized_odds: Any) -> str:
-    market = normalized_odds.markets.get("match_winner") if normalized_odds else None
-    if not market:
-        return "暂无"
-    home = _market_group_value(market, "home")
-    draw = _market_group_value(market, "draw")
-    away = _market_group_value(market, "away")
-    if home == draw == away == "-":
-        return "暂无"
-    return f"主胜 {home}｜平 {draw}｜客胜 {away}"
-
-
-def _market_group_value(market: Any, group: str) -> str:
-    for outcome in getattr(market, "outcomes", []):
-        if getattr(outcome, "group", None) == group:
-            return str(getattr(outcome, "odds", "-") or "-")
-    return "-"
-
-
-def _worldcup_day_label(value: datetime | None) -> str:
-    if not value:
-        return "--"
-    weekdays = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
-    return f"{value.month}月{value.day}日 {weekdays[value.weekday()]}"
-
-
-def _fixture_date(item: dict[str, Any]) -> date | None:
-    value = fixture_beijing_datetime(item)
-    return value.date() if value else None
-
-
-def _safe_int(value: str, default: int = 0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _fallback_worldcup_fixtures() -> list[dict[str, Any]]:
-    matches = [
-        (1, "2026-06-12T03:00:00+08:00", "A组", "Mexico", "South Africa"),
-        (2, "2026-06-12T10:00:00+08:00", "A组", "South Korea", "Czech Republic"),
-        (3, "2026-06-13T03:00:00+08:00", "B组", "Canada", "Bosnia and Herzegovina"),
-        (4, "2026-06-13T10:00:00+08:00", "B组", "United States", "Paraguay"),
-        (5, "2026-06-14T03:00:00+08:00", "C组", "Brazil", "Morocco"),
-        (6, "2026-06-14T10:00:00+08:00", "C组", "Qatar", "Haiti"),
-        (7, "2026-06-15T03:00:00+08:00", "D组", "Germany", "Australia"),
-        (8, "2026-06-15T10:00:00+08:00", "D组", "Netherlands", "Japan"),
-    ]
-    fixtures: list[dict[str, Any]] = []
-    for fixture_id, raw_time, group, home, away in matches:
-        dt = datetime.fromisoformat(raw_time)
-        fixtures.append(
-            {
-                "fixture": {"id": 20260000 + fixture_id, "date": raw_time, "timestamp": int(dt.timestamp()), "status": {"short": "NS", "long": "Not Started"}},
-                "league": {"id": 1, "name": "World Cup", "season": 2026, "round": group},
-                "teams": {"home": {"name": home}, "away": {"name": away}},
-                "goals": {"home": None, "away": None},
-            }
-        )
-    return fixtures
-
-
 async def _ensure_odds_markets(cache: RedisCache, api_client: ApiFootballClient) -> list[dict[str, Any]]:
     cached = await cache.get_json("football:odds:markets")
     if cached:
@@ -3453,6 +3507,7 @@ async def _create_recharge_order(
     settings: Settings,
     gmpay_client: GMPayClient,
     network: str | None = None,
+    lang: str = "zh",
 ) -> None:
     deposit_network = network or settings.gmpay_default_network
     if amount < settings.min_recharge_amount:
@@ -3528,7 +3583,8 @@ async def _create_recharge_order(
         expires_at=transaction.expires_at,
         raw_response=transaction.raw_json,
     ) or order
-    await message.answer(_format_deposit_order(order, settings.wallet_currency), reply_markup=_deposit_order_keyboard(order))
+    prefix = "Deposit request created\nPlease wait for admin review\n\n" if lang == "en" else "充值申请已创建\n请等待管理员审核\n\n"
+    await message.answer(prefix + _format_deposit_order(order, settings.wallet_currency, lang), reply_markup=_deposit_order_keyboard(order))
 
 
 def _gmpay_create_failure_response(exc: Exception) -> dict[str, Any]:
@@ -3586,16 +3642,16 @@ def _risk_blocks(risk: dict | None, action: str) -> bool:
     return False
 
 
-def _wallet_keyboard() -> InlineKeyboardMarkup:
+def _wallet_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="充值 USDT", callback_data="wallet:recharge")],
+            [InlineKeyboardButton(text=t(lang, "deposit_usdt"), callback_data="wallet:recharge")],
             [
-                InlineKeyboardButton(text="充值记录", callback_data="wallet:records"),
-                InlineKeyboardButton(text="账变记录", callback_data="wallet:ledger"),
+                InlineKeyboardButton(text="Deposit Records" if lang == "en" else "充值记录", callback_data="wallet:records"),
+                InlineKeyboardButton(text=t(lang, "ledger"), callback_data="wallet:ledger"),
             ],
-            [InlineKeyboardButton(text="提现申请", callback_data="wallet:withdraw_prompt")],
-            [InlineKeyboardButton(text="返回首页", callback_data="home")],
+            [InlineKeyboardButton(text=t(lang, "withdraw"), callback_data="wallet:withdraw_prompt")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
         ]
     )
 
@@ -3750,7 +3806,13 @@ def _referral_keyboard(role: str = "user", application: dict | None = None) -> I
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _format_wallet(wallet: dict, currency: str) -> str:
+def _format_wallet(wallet: dict, currency: str, lang: str = "zh") -> str:
+    if lang == "en":
+        return (
+            "💰 Wallet\n"
+            f"Balance: {_money(wallet.get('balance'))} {currency}\n"
+            f"Frozen: {_money(wallet.get('frozen_balance'))} {currency}"
+        )
     return (
         "💰 钱包\n"
         f"余额：{_money(wallet.get('balance'))} {currency}\n"
@@ -3759,7 +3821,15 @@ def _format_wallet(wallet: dict, currency: str) -> str:
     )
 
 
-def _format_recharge_confirm(data: dict[str, Any], settings: Settings) -> str:
+def _format_recharge_confirm(data: dict[str, Any], settings: Settings, lang: str = "zh") -> str:
+    if lang == "en":
+        return (
+            "Confirm Deposit\n\n"
+            f"Amount: {_money(data.get('amount'))} {settings.wallet_currency}\n"
+            "Payment: GMPay cashier\n"
+            "Network/Token: select on cashier page\n"
+            f"Expires: {settings.gmpay_order_expire_minutes} minutes"
+        )
     return (
         "确认充值\n\n"
         f"金额：{_money(data.get('amount'))} {settings.wallet_currency}\n"
@@ -3769,7 +3839,15 @@ def _format_recharge_confirm(data: dict[str, Any], settings: Settings) -> str:
     )
 
 
-def _format_withdraw_confirm(data: dict[str, Any], currency: str) -> str:
+def _format_withdraw_confirm(data: dict[str, Any], currency: str, lang: str = "zh") -> str:
+    if lang == "en":
+        return (
+            "🏧 Confirm Withdrawal\n\n"
+            f"Amount: {_money(data.get('amount'))} {currency}\n"
+            f"Network: {_network_label(str(data.get('network') or ''))}\n"
+            f"Address: {data.get('address') or '-'}\n\n"
+            "Withdrawals require admin review."
+        )
     return (
         "🏧 确认提现申请\n\n"
         f"金额：{_money(data.get('amount'))} {currency}\n"
@@ -3782,8 +3860,9 @@ def _format_withdraw_confirm(data: dict[str, Any], currency: str) -> str:
 def _format_rebate_confirm(data: dict[str, Any]) -> str:
     return (
         "🎁 返水申请\n\n"
-        f"当前累计投注：{_money(data.get('turnover'))}\n"
-        f"有效下级：{data.get('active_referrals') or 0}\n"
+        f"本次申请投注额：{_money(data.get('turnover'))} USDT\n"
+        f"返水比例：{_percent_text(data.get('rebate_rate'))}\n"
+        f"预计返水：{_money(data.get('rebate_amount'))} USDT\n"
         f"申请说明：{data.get('note') or '-'}"
     )
 
@@ -3816,8 +3895,18 @@ def _network_label(network: str) -> str:
     }.get(network, network or "-")
 
 
-def _format_deposit_order(order: dict, currency: str) -> str:
+def _format_deposit_order(order: dict, currency: str, lang: str = "zh") -> str:
     status = str(order.get("status") or "")
+    if lang == "en":
+        return (
+            "Deposit request created\n\n"
+            f"Order ID: {order.get('order_id')}\n"
+            f"Status: {status}\n"
+            f"Amount: {_money(order.get('amount_requested'))} {currency}\n"
+            f"Payment Amount: {_money(order.get('actual_amount') or order.get('amount_requested'))} {currency}\n\n"
+            "Open the cashier below to complete payment.\n"
+            "Please wait for admin review."
+        )
     return (
         "充值订单已创建\n\n"
         f"订单号：{order.get('order_id')}\n"
@@ -3837,17 +3926,49 @@ def _format_deposit_order(order: dict, currency: str) -> str:
     )
 
 
-def _format_rebate_requests(rows: list[dict | None]) -> str:
+def _format_rebate_requests(rows: list[dict | None], lang: str = "zh") -> str:
     clean = [row for row in rows if row]
     if not clean:
-        return "暂无返水申请。"
-    lines = ["待处理返水申请"]
+        return "🎁 Rebate Management\n\nNo pending rebate requests." if lang == "en" else "🎁 返水管理\n\n暂无待审核返水申请。"
+    lines = ["🎁 Rebate Management", "", "Pending rebate requests:"] if lang == "en" else ["🎁 返水管理", "", "待审核返水申请："]
     for row in clean:
-        lines.append(
-            f"#{row.get('id')} user={row.get('user_id')} turnover={_money(row.get('turnover'))} "
-            f"active_referrals={row.get('active_referrals') or 0} requested={_money(row.get('requested_amount'))} "
-            f"status={row.get('status')} note={row.get('note') or '-'} created_at={row.get('created_at')}"
-        )
+        stake = _money(row.get("stake_amount") or row.get("turnover"))
+        amount = _money(row.get("rebate_amount") or row.get("requested_amount"))
+        rate = _percent_text(row.get("rebate_rate"))
+        if lang == "en":
+            lines.extend(
+                [
+                    "",
+                    f"#{row.get('id')}",
+                    f"User: {row.get('user_id')}",
+                    f"Stake Amount: {stake} USDT",
+                    f"Rebate Rate: {rate}",
+                    f"Rebate Amount: {amount} USDT",
+                    f"Status: {row.get('status')}",
+                    f"Created At: {row.get('created_at')}",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    f"#{row.get('id')}",
+                    f"用户：{row.get('user_id')}",
+                    f"申请投注额：{stake} USDT",
+                    f"返水比例：{rate}",
+                    f"预计返水：{amount} USDT",
+                    f"状态：{row.get('status')}",
+                    f"申请时间：{row.get('created_at')}",
+                ]
+            )
+    lines.extend(
+        [
+            "",
+            "Commands:" if lang == "en" else "命令：",
+            "/admin_approve_rebate <request_id>",
+            "/admin_reject_rebate <request_id> reason",
+        ]
+    )
     return "\n".join(lines)
 
 
@@ -4257,6 +4378,7 @@ async def _send_bet_confirm_for_amount(
     cache: RedisCache,
     api_client: ApiFootballClient,
     settings: Settings,
+    lang: str = "zh",
 ) -> None:
     fixture = await _find_cached_fixture(cache, api_client, settings, fixture_id)
     normalized_odds = await _get_fixture_odds(cache, api_client, fixture_id)
@@ -4273,6 +4395,7 @@ async def _send_bet_confirm_for_amount(
             _outcome_button_label(outcome),
             outcome.odds,
             stake=amount,
+            lang=lang,
         )
         + "\n\n"
         + _bet_mode_notice(settings),
@@ -4298,6 +4421,38 @@ async def _notify_user(bot: Any, user_id: int | None, text: str) -> None:
         await bot.send_message(int(user_id), text)
     except Exception:
         logger.info("failed to send notification user_id=%s", user_id, exc_info=True)
+
+
+async def _notify_super_admins_rebate(bot: Any, database: Database, settings: Settings, row: dict) -> None:
+    for user_id in settings.super_admin_user_ids:
+        lang = normalize_language(await database.get_user_language(int(user_id), settings.default_language), settings.default_language)
+        if lang == "en":
+            text = (
+                "🎁 New Rebate Request\n\n"
+                f"Request ID: {row.get('id')}\n"
+                f"User: {row.get('user_id')}\n"
+                f"Stake Amount: {_money(row.get('stake_amount') or row.get('turnover'))} {settings.wallet_currency}\n"
+                f"Rebate Rate: {_percent_text(row.get('rebate_rate'))}\n"
+                f"Rebate Amount: {_money(row.get('rebate_amount') or row.get('requested_amount'))} {settings.wallet_currency}\n"
+                f"Status: {row.get('status')}\n\n"
+                "Commands:\n"
+                f"/admin_approve_rebate {row.get('id')}\n"
+                f"/admin_reject_rebate {row.get('id')} reason"
+            )
+        else:
+            text = (
+                "🎁 新的返水申请\n\n"
+                f"申请ID：{row.get('id')}\n"
+                f"用户：{row.get('user_id')}\n"
+                f"本次申请投注额：{_money(row.get('stake_amount') or row.get('turnover'))} {settings.wallet_currency}\n"
+                f"返水比例：{_percent_text(row.get('rebate_rate'))}\n"
+                f"预计返水：{_money(row.get('rebate_amount') or row.get('requested_amount'))} {settings.wallet_currency}\n"
+                f"状态：{row.get('status')}\n\n"
+                "命令：\n"
+                f"/admin_approve_rebate {row.get('id')}\n"
+                f"/admin_reject_rebate {row.get('id')} reason"
+            )
+        await _notify_user(bot, int(user_id), text)
 
 
 def _format_bets_page(rows: list[dict], stats: dict, status_group: str, settings: Settings) -> str:
@@ -4372,6 +4527,7 @@ def _bet_action_keyboard(
     rows = []
     if status in {"pending", "manual_required"}:
         rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
+        rows.append([InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")])
     if fixture_id is not None:
         rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
     else:
@@ -4480,6 +4636,15 @@ def _money(value: Any) -> str:
         return "0.00"
 
 
+def _percent_text(value: Any) -> str:
+    try:
+        percent = (Decimal(str(value or 0)) * Decimal("100")).quantize(Decimal("0.01"))
+        text = f"{percent:.2f}".rstrip("0").rstrip(".")
+        return f"{text}%"
+    except Exception:
+        return "0%"
+
+
 def _localized_fixtures(fixtures: list[dict[str, Any]], lang: str) -> list[dict[str, Any]]:
     return [_localized_fixture(item, lang) for item in fixtures]
 
@@ -4488,15 +4653,11 @@ def _localized_fixture(item: dict[str, Any], lang: str) -> dict[str, Any]:
     copied = deepcopy(item)
     league = copied.get("league") or {}
     if "name" in league:
-        original = league.get("name")
-        zh = zh_league_name(original)
-        league["name"] = zh if zh != original else translate_league_name(original, lang)
+        league["name"] = league.get("name") if lang == "en" else zh_league_name(league.get("name"))
     teams = copied.get("teams") or {}
     for side in ("home", "away"):
         if isinstance(teams.get(side), dict) and "name" in teams[side]:
-            original = teams[side].get("name")
-            zh = zh_team_name(original)
-            teams[side]["name"] = zh if zh != original else translate_team_name(original, lang)
+            teams[side]["name"] = teams[side].get("name") if lang == "en" else zh_team_name(teams[side].get("name"))
     return copied
 
 
@@ -4520,6 +4681,92 @@ def _translated_texts(key: str) -> set[str]:
     return {t(lang, key) for lang in SUPPORTED_LANGUAGES}
 
 
+def _worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "worldcup_betting"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def _format_worldcup_schedule_page(fixtures: list[dict[str, Any]], lang: str = "zh") -> tuple[str, int]:
+    lines = [t(lang, "worldcup_schedule_title"), ""]
+    weekdays_zh = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+    for item in fixtures:
+        dt = fixture_beijing_datetime(item)
+        if dt:
+            if lang == "en":
+                date_line = f"{dt.strftime('%b')} {dt.day} {dt.strftime('%a')}"
+            else:
+                date_line = f"{dt.month}月{dt.day}日 {weekdays_zh[dt.weekday()]}"
+            time_line = dt.strftime("%H:%M")
+        else:
+            date_line = "--"
+            time_line = "--:--"
+        lines.extend(
+            [
+                f"📅 {date_line}",
+                "",
+                f"【{worldcup_stage_label(item, lang)}】",
+                worldcup_match_line(item, lang),
+                f" {time_line}",
+                f"🎲 {'Odds' if lang == 'en' else '预测赔率'}: {t(lang, 'odds_na')}" if lang == "en" else f"🎲 预测赔率：{t(lang, 'odds_na')}",
+                "",
+            ]
+        )
+    return "\n".join(lines).rstrip(), 1
+
+
+def _format_worldcup_futures(options: list[dict[str, Any]], page: int = 0, per_page: int = 8, lang: str = "zh") -> str:
+    visible = options[page * per_page : (page + 1) * per_page]
+    lines = [f"🏆 {t(lang, 'worldcup_futures_title')}", ""]
+    for option in visible:
+        lines.append(f"{_worldcup_option_label(option, lang)} @ {_money(option.get('odds'))}")
+    total_pages = max((len(options) - 1) // per_page + 1, 1)
+    if total_pages > 1:
+        lines.append("")
+        lines.append(t(lang, "page", page=page + 1, total=total_pages))
+    return "\n".join(lines)
+
+
+def _worldcup_option_label(option: dict[str, Any], lang: str = "zh") -> str:
+    if lang != "en":
+        return str(option.get("label") or "-")
+    metadata = option.get("metadata_json") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except json.JSONDecodeError:
+            metadata = {}
+    team = str((metadata or {}).get("team") or option.get("option_key") or option.get("label") or "-")
+    team = team.replace("_", " ").title() if "_" in team else team
+    flag = str((metadata or {}).get("flag") or "").strip()
+    return f"{flag} {team}".strip()
+
+
+def _fallback_worldcup_fixtures() -> list[dict[str, Any]]:
+    matches = [
+        (1, "2026-06-13T03:00:00+08:00", "Group B", "Canada", "Bosnia and Herzegovina"),
+        (2, "2026-06-14T03:00:00+08:00", "Group C", "Spain", "Cape Verde Islands"),
+        (3, "2026-06-14T10:00:00+08:00", "Group C", "Haiti", "Scotland"),
+        (4, "2026-06-15T03:00:00+08:00", "Group D", "Switzerland", "Bosnia & Herzegovina"),
+    ]
+    fixtures = []
+    for fixture_id, raw_time, group, home, away in matches:
+        dt = datetime.fromisoformat(raw_time)
+        fixtures.append(
+            {
+                "fixture": {"id": 20260000 + fixture_id, "date": raw_time, "timestamp": int(dt.timestamp())},
+                "league": {"id": 1, "name": "World Cup", "season": 2026, "round": group},
+                "teams": {"home": {"name": home}, "away": {"name": away}},
+            }
+        )
+    return fixtures
+
+
 def _role_label(role: str) -> str:
     return {
         "super_admin": "超级管理员",
@@ -4535,7 +4782,13 @@ def _potential_payout_text(stake: str, odds: str) -> str:
         return "0.00"
 
 
-def _bet_mode_notice(settings: Settings) -> str:
+def _bet_mode_notice(settings: Settings, lang: str = "zh") -> str:
+    if lang == "en":
+        if settings.real_betting_enabled:
+            return "Real betting mode: stake is frozen and payouts are settled after result."
+        if settings.bet_require_balance_for_simulation:
+            return "Test betting mode: wallet balance must cover the stake, but no real debit is made."
+        return "Simulation mode: no balance check and no real debit."
     if settings.real_betting_enabled:
         return "真实下注模式：下注将冻结余额，开奖后自动派彩。"
     if settings.bet_require_balance_for_simulation:
@@ -4543,7 +4796,19 @@ def _bet_mode_notice(settings: Settings) -> str:
     return "当前为模拟下注模式，不校验余额，不扣真实余额。"
 
 
-def _admin_menu_text(role: str) -> str:
+def _admin_menu_text(role: str, lang: str = "zh") -> str:
+    if lang == "en":
+        if role == "super_admin":
+            return "🛡 Super Admin Panel\n\nFull risk control, settlement, deposit/withdrawal, wallet and agent management."
+        if role in {"admin", "agent"}:
+            return (
+                "Agent Panel\n\n"
+                f"Current Role: {'Agent' if role == 'agent' else 'Admin'}\n"
+                "Settled Valid Stake:\n"
+                "Current Rebate Rate:\n"
+                "Available Rebate:"
+            )
+        return "Admin Panel"
     if role == "super_admin":
         return (
             "超级管理员面板\n\n"
@@ -4579,18 +4844,18 @@ def _admin_menu_text(role: str) -> str:
     )
 
 
-def _admin_panel_keyboard(role: str) -> InlineKeyboardMarkup:
+def _admin_panel_keyboard(role: str, lang: str = "zh") -> InlineKeyboardMarkup:
     if role == "super_admin":
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="🎫 注单开奖 仅超管", callback_data="admin:bets")],
-                [InlineKeyboardButton(text="🏧 提现审核 仅超管", callback_data="admin:withdrawals")],
-                [InlineKeyboardButton(text="💳 充值订单 仅超管", callback_data="admin:deposits")],
-                [InlineKeyboardButton(text="💰 用户钱包/调账 仅超管", callback_data="admin:wallets")],
-                [InlineKeyboardButton(text="🚫 用户风控 仅超管", callback_data="admin:users")],
-                [InlineKeyboardButton(text="🎁 返水管理", callback_data="admin:rebates")],
-                [InlineKeyboardButton(text="💸 佣金管理", callback_data="admin:commissions")],
-                [InlineKeyboardButton(text="返回首页", callback_data="home")],
+                [InlineKeyboardButton(text=t(lang, "bet_settlement"), callback_data="admin:bets")],
+                [InlineKeyboardButton(text=t(lang, "withdrawal_review"), callback_data="admin:withdrawals")],
+                [InlineKeyboardButton(text=t(lang, "deposit_orders"), callback_data="admin:deposits")],
+                [InlineKeyboardButton(text=t(lang, "user_wallet_adjust"), callback_data="admin:wallets")],
+                [InlineKeyboardButton(text=t(lang, "user_risk"), callback_data="admin:users")],
+                [InlineKeyboardButton(text=t(lang, "rebate_management"), callback_data="admin:rebates")],
+                [InlineKeyboardButton(text=t(lang, "commission_management"), callback_data="admin:commissions")],
+                [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
             ]
         )
     if role == "admin":
@@ -4716,8 +4981,22 @@ def _format_bets_page(rows: list[dict], stats: dict, status_group: str, settings
     return "\n".join(lines)
 
 
-def _format_bet_created(bet: dict, currency: str) -> str:
+def _format_bet_created(bet: dict, currency: str, lang: str = "zh") -> str:
     tag = "\n类型：测试单" if bet.get("is_simulated") else ""
+    if lang == "en":
+        tag = "\nType: Test Bet" if bet.get("is_simulated") else ""
+        return (
+            "🎫 Bet Created\n\n"
+            f"Bet No: {bet.get('bet_no') or bet.get('id')}\n"
+            f"Match: {bet.get('fixture_label') or '-'}\n"
+            f"Market: {bet.get('market_title') or bet.get('market_key') or '-'}\n"
+            f"Selection: {bet.get('selection') or '-'}\n"
+            f"Amount: {_money(bet.get('stake'))} {currency}\n"
+            f"Odds: {bet.get('odds') or '-'}\n"
+            f"Estimated Payout: {_money(bet.get('potential_payout'))} {currency}\n"
+            "Status: Pending"
+            f"{tag}"
+        )
     return (
         "🎫 注单已创建\n\n"
         f"注单号：{bet.get('bet_no') or bet.get('id')}\n"
@@ -4732,7 +5011,14 @@ def _format_bet_created(bet: dict, currency: str) -> str:
     )
 
 
-def _format_insufficient_balance(stake: Decimal, balance: Decimal, currency: str) -> str:
+def _format_insufficient_balance(stake: Decimal, balance: Decimal, currency: str, lang: str = "zh") -> str:
+    if lang == "en":
+        return (
+            "💰 Insufficient balance\n\n"
+            f"Amount: {_money(stake)} {currency}\n"
+            f"Balance: {_money(balance)} {currency}\n\n"
+            "Please deposit before betting."
+        )
     return (
         "💰 钱包余额不足\n\n"
         f"本次下注：{_money(stake)} {currency}\n"
@@ -4741,11 +5027,11 @@ def _format_insufficient_balance(stake: Decimal, balance: Decimal, currency: str
     )
 
 
-def _insufficient_balance_keyboard(fixture_id: int | None = None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton(text="充值 USDT", callback_data="wallet:recharge")]]
+def _insufficient_balance_keyboard(fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton(text=t(lang, "deposit_usdt"), callback_data="wallet:recharge")]]
     if fixture_id is not None:
-        rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
-    rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+        rows.append([InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -4795,6 +5081,7 @@ async def _start_text(
     database: Database,
     settings: Settings,
     telegram_user_id: int | None,
+    lang: str = "zh",
 ) -> str:
     today_matches, _ = await get_bettable_matches_range(cache, api_client, database, settings)
     tomorrow = date.today() + timedelta(days=1)
@@ -4803,6 +5090,16 @@ async def _start_text(
     stats = await database.get_user_bet_stats(telegram_user_id) if telegram_user_id else {}
     pending = int(stats.get("pending_count") or 0) + int(stats.get("manual_required_count") or 0)
     simulated_pending = int(stats.get("simulated_pending_count") or 0)
+    if lang == "en":
+        return (
+            "WorldCupTop Bot\n\n"
+            f"Featured Matches: {_count_by_date(today_matches, date.today())}\n"
+            f"Tomorrow Fixtures: {len(tomorrow_matches)}\n"
+            f"Live Matches: {len(live)}\n"
+            f"My Pending Bets: {pending}\n"
+            f"Test Bets: {simulated_pending}\n"
+            f"{_bet_mode_notice(settings, lang)}"
+        )
     return (
         "WorldCupTop Bot\n\n"
         f"今日可投注：{_count_by_date(today_matches, date.today())} 场\n"

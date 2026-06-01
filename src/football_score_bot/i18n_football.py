@@ -5,6 +5,9 @@ from typing import Any
 
 
 LEAGUE_ZH_NAMES = {
+    "FIFA World Cup": "世界杯",
+    "World Cup": "世界杯",
+    "Club World Cup": "世俱杯",
     "UEFA Champions League": "欧冠",
     "Champions League": "欧冠",
     "UEFA Europa League": "欧联杯",
@@ -14,27 +17,9 @@ LEAGUE_ZH_NAMES = {
     "Bundesliga": "德甲",
     "Serie A": "意甲",
     "Ligue 1": "法甲",
-    "FIFA World Cup": "世界杯",
-    "World Cup": "世界杯",
-    "Club World Cup": "世俱杯",
-    "Friendlies": "友谊赛",
-    "Friendlies Women": "女子友谊赛",
-    "UEFA Nations League": "欧国联",
-    "FA Cup": "英足总杯",
-    "EFL Cup": "英联杯",
-    "Copa del Rey": "国王杯",
-    "DFB Pokal": "德国杯",
-    "Coppa Italia": "意大利杯",
-    "Major League Soccer": "美职联",
-    "AFC Champions League": "亚冠",
-    "Copa America": "美洲杯",
-    "Africa Cup of Nations": "非洲杯",
 }
 
 TEAM_ZH_NAMES = {
-    "Paris Saint Germain": "巴黎圣日耳曼",
-    "Paris Saint-Germain": "巴黎圣日耳曼",
-    "PSG": "巴黎圣日耳曼",
     "Arsenal": "阿森纳",
     "Real Madrid": "皇家马德里",
     "Barcelona": "巴塞罗那",
@@ -45,155 +30,188 @@ TEAM_ZH_NAMES = {
     "Tottenham": "热刺",
     "Tottenham Hotspur": "热刺",
     "Bayern Munich": "拜仁慕尼黑",
-    "Borussia Dortmund": "多特蒙德",
-    "Inter": "国际米兰",
-    "Inter Milan": "国际米兰",
-    "AC Milan": "AC米兰",
-    "Juventus": "尤文图斯",
-    "Atletico Madrid": "马德里竞技",
-    "Athletic Club": "毕尔巴鄂竞技",
-    "Granada CF": "格拉纳达",
-    "Granada": "格拉纳达",
-    "Sporting Gijon": "希洪竞技",
-    "Athletic Club W": "毕尔巴鄂竞技女足",
-    "Alabama W": "阿拉巴马女足",
-    "Real Sociedad": "皇家社会",
-    "Sevilla": "塞维利亚",
-    "Valencia": "瓦伦西亚",
-    "Villarreal": "比利亚雷亚尔",
-    "Napoli": "那不勒斯",
-    "AS Roma": "罗马",
-    "Lazio": "拉齐奥",
-    "Fiorentina": "佛罗伦萨",
-    "Bayer Leverkusen": "勒沃库森",
-    "RB Leipzig": "莱比锡",
-    "Ajax": "阿贾克斯",
-    "Benfica": "本菲卡",
-    "FC Porto": "波尔图",
+    "Paris Saint Germain": "巴黎圣日耳曼",
+    "Paris Saint-Germain": "巴黎圣日耳曼",
+    "PSG": "巴黎圣日耳曼",
 }
 
 COUNTRY_TEAM_ZH_NAMES = {
-    "Mexico": "墨西哥",
-    "South Africa": "南非",
-    "South Korea": "韩国",
-    "Korea Republic": "韩国",
-    "Czech Republic": "捷克",
-    "Czechia": "捷克",
-    "Canada": "加拿大",
-    "Bosnia and Herzegovina": "波黑",
-    "United States": "美国",
-    "USA": "美国",
-    "Paraguay": "巴拉圭",
-    "Qatar": "卡塔尔",
-    "Brazil": "巴西",
-    "Morocco": "摩洛哥",
-    "Haiti": "海地",
-    "Scotland": "苏格兰",
-    "Australia": "澳大利亚",
-    "Turkey": "土耳其",
-    "Türkiye": "土耳其",
-    "Germany": "德国",
-    "Curacao": "库拉索",
-    "Curaçao": "库拉索",
-    "Netherlands": "荷兰",
-    "Japan": "日本",
-    "Ivory Coast": "科特迪瓦",
-    "Cote d'Ivoire": "科特迪瓦",
-    "Ecuador": "厄瓜多尔",
-    "Sweden": "瑞典",
-    "Tunisia": "突尼斯",
+    "Spain": "西班牙",
     "France": "法国",
     "England": "英格兰",
+    "Brazil": "巴西",
     "Argentina": "阿根廷",
-    "Spain": "西班牙",
     "Portugal": "葡萄牙",
-    "Belgium": "比利时",
-    "Italy": "意大利",
-    "Uruguay": "乌拉圭",
-    "Colombia": "哥伦比亚",
-    "Chile": "智利",
-    "Poland": "波兰",
-    "Croatia": "克罗地亚",
-    "Serbia": "塞尔维亚",
-    "Denmark": "丹麦",
-    "Switzerland": "瑞士",
-    "Austria": "奥地利",
+    "Germany": "德国",
+    "Netherlands": "荷兰",
     "Norway": "挪威",
-    "Wales": "威尔士",
-    "Ireland": "爱尔兰",
-    "Ukraine": "乌克兰",
-    "Ghana": "加纳",
+    "Belgium": "比利时",
+    "United States": "美国",
+    "USA": "美国",
+    "Colombia": "哥伦比亚",
+    "Uruguay": "乌拉圭",
+    "Switzerland": "瑞士",
+    "Mexico": "墨西哥",
+    "Morocco": "摩洛哥",
+    "Japan": "日本",
+    "Turkey": "土耳其",
+    "Türkiye": "土耳其",
+    "Croatia": "克罗地亚",
+    "Ecuador": "厄瓜多尔",
+    "Sweden": "瑞典",
     "Senegal": "塞内加尔",
-    "Nigeria": "尼日利亚",
-    "Cameroon": "喀麦隆",
+    "Canada": "加拿大",
+    "Paraguay": "巴拉圭",
+    "Austria": "奥地利",
+    "Czech Republic": "捷克",
+    "Czechia": "捷克",
+    "Bosnia & Herzegovina": "波黑",
+    "Bosnia and Herzegovina": "波黑",
+    "Bosnia-Herzegovina": "波黑",
+    "Scotland": "苏格兰",
+    "South Korea": "韩国",
+    "Korea Republic": "韩国",
+    "Republic of Korea": "韩国",
+    "Ivory Coast": "科特迪瓦",
+    "Cote d'Ivoire": "科特迪瓦",
     "Egypt": "埃及",
     "Algeria": "阿尔及利亚",
+    "Ghana": "加纳",
+    "Australia": "澳大利亚",
+    "Tunisia": "突尼斯",
     "Iran": "伊朗",
-    "Saudi Arabia": "沙特阿拉伯",
-    "Costa Rica": "哥斯达黎加",
+    "Congo DR": "民主刚果",
+    "DR Congo": "民主刚果",
     "Panama": "巴拿马",
+    "South Africa": "南非",
+    "Uzbekistan": "乌兹别克斯坦",
+    "Saudi Arabia": "沙特阿拉伯",
+    "Qatar": "卡塔尔",
     "New Zealand": "新西兰",
+    "Jordan": "约旦",
+    "Cape Verde": "佛得角",
+    "Cape Verde Islands": "佛得角",
+    "Iraq": "伊拉克",
+    "Haiti": "海地",
+    "Curacao": "库拉索",
+    "Curaçao": "库拉索",
+    "Jamaica": "牙买加",
+    "Costa Rica": "哥斯达黎加",
+    "Wales": "威尔士",
+    "Ukraine": "乌克兰",
+    "Poland": "波兰",
+    "Serbia": "塞尔维亚",
+    "Hungary": "匈牙利",
+    "Romania": "罗马尼亚",
+    "Slovakia": "斯洛伐克",
+    "Slovenia": "斯洛文尼亚",
+    "Greece": "希腊",
+    "Denmark": "丹麦",
+    "Chile": "智利",
+    "Peru": "秘鲁",
+    "Venezuela": "委内瑞拉",
+    "Bolivia": "玻利维亚",
+    "Nigeria": "尼日利亚",
+    "Cameroon": "喀麦隆",
+    "Mali": "马里",
+    "Italy": "意大利",
+    "Ireland": "爱尔兰",
 }
 
 WORLD_CUP_FLAGS = {
-    "Mexico": "🇲🇽",
-    "South Africa": "🇿🇦",
-    "South Korea": "🇰🇷",
-    "Korea Republic": "🇰🇷",
-    "Czech Republic": "🇨🇿",
-    "Czechia": "🇨🇿",
-    "Canada": "🇨🇦",
-    "Bosnia and Herzegovina": "🇧🇦",
-    "United States": "🇺🇸",
-    "USA": "🇺🇸",
-    "Paraguay": "🇵🇾",
-    "Qatar": "🇶🇦",
-    "Brazil": "🇧🇷",
-    "Morocco": "🇲🇦",
-    "Haiti": "🇭🇹",
-    "Scotland": "🏴",
-    "Australia": "🇦🇺",
-    "Turkey": "🇹🇷",
-    "Türkiye": "🇹🇷",
-    "Germany": "🇩🇪",
-    "Curacao": "🇨🇼",
-    "Curaçao": "🇨🇼",
-    "Netherlands": "🇳🇱",
-    "Japan": "🇯🇵",
-    "Ivory Coast": "🇨🇮",
-    "Cote d'Ivoire": "🇨🇮",
-    "Ecuador": "🇪🇨",
-    "Sweden": "🇸🇪",
-    "Tunisia": "🇹🇳",
+    "Spain": "🇪🇸",
     "France": "🇫🇷",
     "England": "🏴",
+    "Brazil": "🇧🇷",
     "Argentina": "🇦🇷",
-    "Spain": "🇪🇸",
     "Portugal": "🇵🇹",
-    "Belgium": "🇧🇪",
-    "Italy": "🇮🇹",
-    "Uruguay": "🇺🇾",
-    "Colombia": "🇨🇴",
-    "Poland": "🇵🇱",
-    "Croatia": "🇭🇷",
-    "Serbia": "🇷🇸",
-    "Denmark": "🇩🇰",
-    "Switzerland": "🇨🇭",
-    "Austria": "🇦🇹",
+    "Germany": "🇩🇪",
+    "Netherlands": "🇳🇱",
     "Norway": "🇳🇴",
+    "Belgium": "🇧🇪",
+    "United States": "🇺🇸",
+    "USA": "🇺🇸",
+    "Colombia": "🇨🇴",
+    "Uruguay": "🇺🇾",
+    "Switzerland": "🇨🇭",
+    "Mexico": "🇲🇽",
+    "Morocco": "🇲🇦",
+    "Japan": "🇯🇵",
+    "Turkey": "🇹🇷",
+    "Türkiye": "🇹🇷",
+    "Croatia": "🇭🇷",
+    "Ecuador": "🇪🇨",
+    "Sweden": "🇸🇪",
+    "Senegal": "🇸🇳",
+    "Canada": "🇨🇦",
+    "Paraguay": "🇵🇾",
+    "Austria": "🇦🇹",
+    "Czech Republic": "🇨🇿",
+    "Czechia": "🇨🇿",
+    "Bosnia & Herzegovina": "🇧🇦",
+    "Bosnia and Herzegovina": "🇧🇦",
+    "Bosnia-Herzegovina": "🇧🇦",
+    "Scotland": "🏴",
+    "South Korea": "🇰🇷",
+    "Korea Republic": "🇰🇷",
+    "Republic of Korea": "🇰🇷",
+    "Ivory Coast": "🇨🇮",
+    "Cote d'Ivoire": "🇨🇮",
+    "Egypt": "🇪🇬",
+    "Algeria": "🇩🇿",
+    "Ghana": "🇬🇭",
+    "Australia": "🇦🇺",
+    "Tunisia": "🇹🇳",
+    "Iran": "🇮🇷",
+    "Congo DR": "🇨🇩",
+    "DR Congo": "🇨🇩",
+    "Panama": "🇵🇦",
+    "South Africa": "🇿🇦",
+    "Uzbekistan": "🇺🇿",
+    "Saudi Arabia": "🇸🇦",
+    "Qatar": "🇶🇦",
+    "New Zealand": "🇳🇿",
+    "Jordan": "🇯🇴",
+    "Cape Verde": "🇨🇻",
+    "Cape Verde Islands": "🇨🇻",
+    "Iraq": "🇮🇶",
+    "Haiti": "🇭🇹",
+    "Curacao": "🇨🇼",
+    "Curaçao": "🇨🇼",
+    "Jamaica": "🇯🇲",
+    "Costa Rica": "🇨🇷",
     "Wales": "🏴",
     "Ukraine": "🇺🇦",
-    "Ghana": "🇬🇭",
-    "Senegal": "🇸🇳",
+    "Poland": "🇵🇱",
+    "Serbia": "🇷🇸",
+    "Hungary": "🇭🇺",
+    "Romania": "🇷🇴",
+    "Slovakia": "🇸🇰",
+    "Slovenia": "🇸🇮",
+    "Greece": "🇬🇷",
+    "Denmark": "🇩🇰",
+    "Chile": "🇨🇱",
+    "Peru": "🇵🇪",
+    "Venezuela": "🇻🇪",
+    "Bolivia": "🇧🇴",
     "Nigeria": "🇳🇬",
     "Cameroon": "🇨🇲",
-    "Egypt": "🇪🇬",
-    "Iran": "🇮🇷",
-    "Saudi Arabia": "🇸🇦",
-    "Costa Rica": "🇨🇷",
-    "Panama": "🇵🇦",
-    "New Zealand": "🇳🇿",
+    "Mali": "🇲🇱",
+    "Italy": "🇮🇹",
+    "Ireland": "🇮🇪",
 }
+
+TEAM_ALIASES = {
+    "Bosnia": "Bosnia and Herzegovina",
+    "Bosnia & Herzegovina": "Bosnia and Herzegovina",
+    "Bosnia-Herzegovina": "Bosnia and Herzegovina",
+    "Cape Verde Islands": "Cape Verde",
+}
+
+
+def normalize_team_name(name: str | None) -> str:
+    raw = str(name or "").strip()
+    return TEAM_ALIASES.get(raw, raw)
 
 
 def zh_league_name(name: str | None) -> str:
@@ -205,17 +223,30 @@ def zh_league_name(name: str | None) -> str:
 def zh_team_name(name: str | None) -> str:
     if not name:
         return "-"
-    return TEAM_ZH_NAMES.get(name) or COUNTRY_TEAM_ZH_NAMES.get(name) or name
+    normalized = normalize_team_name(name)
+    return TEAM_ZH_NAMES.get(normalized) or COUNTRY_TEAM_ZH_NAMES.get(normalized) or name
 
 
 def zh_country_team(name: str | None) -> str:
     if not name:
         return "-"
-    return COUNTRY_TEAM_ZH_NAMES.get(name, name)
+    normalized = normalize_team_name(name)
+    return COUNTRY_TEAM_ZH_NAMES.get(normalized, name)
 
 
 def team_flag(name: str | None) -> str:
-    return WORLD_CUP_FLAGS.get(name or "", "🏳")
+    if not name:
+        return "🏳"
+    normalized = normalize_team_name(name)
+    return WORLD_CUP_FLAGS.get(normalized, "🏳")
+
+
+def format_flag_team(name: str | None, lang: str = "zh") -> str:
+    if str(lang or "").lower().startswith("en"):
+        label = normalize_team_name(name) or "-"
+    else:
+        label = zh_country_team(name)
+    return f"{team_flag(name)} {label}"
 
 
 def format_match_title(fixture: dict[str, Any]) -> str:
@@ -227,35 +258,38 @@ def format_match_title(fixture: dict[str, Any]) -> str:
     away = zh_team_name((teams.get("away") or {}).get("name"))
     if league_name == "-":
         return f"{home} vs {away}"
-    suffix = f"  {round_label}" if round_label and league_name == "世界杯" else ""
+    suffix = f" {round_label}" if round_label and league_name == "世界杯" else ""
     return f"【{league_name}{suffix}】{home} vs {away}"
 
 
-def worldcup_stage_label(fixture: dict[str, Any]) -> str:
+def worldcup_stage_label(fixture: dict[str, Any], lang: str = "zh") -> str:
     league = fixture.get("league") or {}
-    return _short_round_label(league.get("round")) or zh_league_name(league.get("name"))
+    raw = league.get("round") or league.get("name")
+    if str(lang or "").lower().startswith("en"):
+        return str(raw or "-")
+    return _short_round_label(raw) or zh_league_name(league.get("name"))
 
 
-def worldcup_match_line(fixture: dict[str, Any]) -> str:
+def worldcup_match_line(fixture: dict[str, Any], lang: str = "zh") -> str:
     teams = fixture.get("teams") or {}
     home_raw = (teams.get("home") or {}).get("name")
     away_raw = (teams.get("away") or {}).get("name")
-    return f"{team_flag(home_raw)} {zh_country_team(home_raw)}  vs  {team_flag(away_raw)} {zh_country_team(away_raw)}"
+    return f"{format_flag_team(home_raw, lang)} vs {format_flag_team(away_raw, lang)}"
 
 
 def fixture_beijing_datetime(fixture: dict[str, Any]) -> datetime | None:
     info = fixture.get("fixture") or {}
+    raw = info.get("date")
+    if isinstance(raw, str):
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return None
     timestamp = info.get("timestamp")
     if timestamp:
         try:
             return datetime.fromtimestamp(int(timestamp))
         except (TypeError, ValueError, OSError):
-            return None
-    raw = info.get("date")
-    if isinstance(raw, str):
-        try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone().replace(tzinfo=None)
-        except ValueError:
             return None
     return None
 
@@ -269,7 +303,6 @@ def _short_round_label(round_name: str | None) -> str:
         "Group ": "",
         "Regular Season - ": "",
         "Round of 16": "16强",
-        "Quarter-finals": "1/4决赛",
         "Quarter-finals": "1/4决赛",
         "Semi-finals": "半决赛",
         "3rd Place Final": "三四名决赛",

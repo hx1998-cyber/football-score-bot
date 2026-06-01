@@ -22,6 +22,11 @@ class PermissionService:
             return "agent"
         row = await self._database.get_user_role_row(user_id)
         if not row:
+            row = await self._database.pool.fetchrow(
+                "SELECT role FROM admin_profiles WHERE user_id = $1",
+                user_id,
+            )
+        if not row:
             return "user"
         role = str(row.get("role") or "user")
         if role in {"super_admin", "admin", "agent"}:

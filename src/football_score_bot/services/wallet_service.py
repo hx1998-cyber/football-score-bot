@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import string
 import time
-from datetime import timedelta
+from datetime import timedelta, datetime
 from decimal import Decimal
 from typing import Any
 
 from football_score_bot.database import Database
+
+
+logger = logging.getLogger(__name__)
 
 
 class WalletService:
@@ -325,13 +329,22 @@ class WalletService:
                     ref_id,
                 )
 
-    async def manual_adjust(self, user_id: int, amount: Decimal, reason: str, admin_user_id: int) -> dict:
+    async def manual_adjust(
+        self,
+        user_id: int,
+        amount: Decimal,
+        reason: str,
+        admin_user_id: int,
+        ref_id: str | None = None,
+    ) -> dict:
+        adjust_ref_id = ref_id or str(admin_user_id)
+
         return await self.add_ledger_entry(
             user_id,
             "manual_adjust",
             amount,
-            ref_type="admin",
-            ref_id=str(admin_user_id),
+            ref_type="admin_manual_adjust",
+            ref_id=adjust_ref_id,
             description=reason,
         )
 
@@ -339,7 +352,7 @@ class WalletService:
         self,
         *,
         user_id: int,
-        fixture_id: int,
+        fixture_id: int | None,
         fixture_label: str,
         market_key: str,
         market_title: str,
@@ -595,7 +608,7 @@ class WalletService:
                         user_id,
                         bet_id,
                         payout_to_frozen,
-                        f"{self._payout_freeze_hours} hours",
+                        timedelta(hours=int(self._payout_freeze_hours)),
                         "Bet win payout freeze",
                     )
                 await conn.execute(
@@ -711,6 +724,295 @@ class WalletService:
             reason,
         )
         return dict(row) if row else None
+
+    async def super_rejudge_frozen_win(
+        self,
+        bet_id: int,
+        admin_user_id: int,
+        outcome: str,
+        *,
+        note: str | None = None,
+    ) -> dict:
+        if outcome not in {"lost", "void"}:
+            raise ValueError("invalid frozen win rejudge outcome")
+        reason = (note or f"Admin resettled frozen win to {outcome} by {admin_user_id}").strip()
+        audit_action = "admin_resettle_frozen_win"
+        async with self._database.pool.acquire() as conn:
+            async with conn.transaction():
+                bet = await conn.fetchrow("SELECT * FROM bets WHERE id = $1 FOR UPDATE", bet_id)
+                if not bet:
+                    return {"ok": False, "reason": "bet_not_found"}
+                old_status = str(bet["status"] or "")
+                frozen_freeze = await conn.fetchrow(
+                    """
+                    SELECT *
+                    FROM payout_freezes
+                    WHERE bet_id = $1 AND status = 'frozen'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    bet_id,
+                )
+                if old_status != "won":
+                    return {"ok": False, "reason": "bet_status_not_won", "bet_id": bet_id, "old_status": old_status}
+                if not frozen_freeze:
+                    released_status = await conn.fetchval(
+                        """
+                        SELECT status
+                        FROM payout_freezes
+                        WHERE bet_id = $1
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """,
+                        bet_id,
+                    )
+                    return {
+                        "ok": False,
+                        "reason": "payout_already_released" if released_status else "frozen_payout_not_found",
+                        "bet_id": bet_id,
+                        "old_status": old_status,
+                        "freeze_status": released_status,
+                    }
+                user_id = int(bet["user_id"] or bet["telegram_user_id"])
+                stake = Decimal(str(bet["stake"] or 0))
+                freeze_amount = Decimal(str(frozen_freeze["amount"] or 0))
+                wallet = await self._locked_wallet(conn, user_id)
+                balance_before = Decimal(str(wallet["balance"]))
+                frozen_before = Decimal(str(wallet["frozen_balance"]))
+                if frozen_before < freeze_amount:
+                    raise ValueError("insufficient frozen balance")
+                balance_delta = stake if outcome == "void" else Decimal("0")
+                balance_after = balance_before + balance_delta
+                frozen_after = frozen_before - freeze_amount
+                await conn.execute(
+                    """
+                    UPDATE wallets
+                    SET balance = $3, frozen_balance = $4, updated_at = NOW()
+                    WHERE user_id = $1 AND currency = $2
+                    """,
+                    user_id,
+                    self._currency,
+                    balance_after,
+                    frozen_after,
+                )
+                ledger_type = "bet_void_refund" if outcome == "void" else "bet_frozen_win_cancel"
+                ledger_ref_type = "admin_resettle_frozen_void" if outcome == "void" else "admin_resettle_frozen_loss"
+                ledger_amount = stake if outcome == "void" else Decimal("0")
+                ledger = await conn.fetchrow(
+                    """
+                    INSERT INTO wallet_ledger (
+                        user_id, currency, type, amount, balance_before, balance_after,
+                        frozen_before, frozen_after, ref_type, ref_id, description
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    ON CONFLICT DO NOTHING
+                    RETURNING *
+                    """,
+                    user_id,
+                    self._currency,
+                    ledger_type,
+                    ledger_amount,
+                    balance_before,
+                    balance_after,
+                    frozen_before,
+                    frozen_after,
+                    ledger_ref_type,
+                    str(bet_id),
+                    reason,
+                )
+                freeze_note = f"super_admin={admin_user_id}; rejudge={outcome}; {reason}"
+                freeze = await conn.fetchrow(
+                    """
+                    UPDATE payout_freezes
+                    SET status = 'cancelled',
+                        unlocked_at = NOW(),
+                        note = COALESCE(note || '; ', '') || $2
+                    WHERE id = $1 AND status = 'frozen'
+                    RETURNING *
+                    """,
+                    int(frozen_freeze["id"]),
+                    freeze_note,
+                )
+                payout_value = stake if outcome == "void" else Decimal("0")
+                updated_bet = await conn.fetchrow(
+                    """
+                    UPDATE bets
+                    SET status = $2,
+                        payout = $3,
+                        settlement_source = 'super_admin',
+                        settlement_note = COALESCE(settlement_note || '; ', '') || $4,
+                        settled_by_admin_id = $5,
+                        settled_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = $1 AND status = 'won'
+                    RETURNING *
+                    """,
+                    bet_id,
+                    outcome,
+                    payout_value,
+                    freeze_note,
+                    admin_user_id,
+                )
+                if not updated_bet or not freeze:
+                    return {"ok": False, "reason": "state_changed", "bet_id": bet_id, "old_status": old_status}
+                await conn.execute(
+                    """
+                    INSERT INTO settlement_logs (
+                        bet_id, fixture_id, previous_status, new_status, result_score, payout, source
+                    )
+                    VALUES ($1, $2, $3, $4, $5, $6, 'super_admin')
+                    """,
+                    bet_id,
+                    bet["fixture_id"],
+                    old_status,
+                    outcome,
+                    bet["result_score"],
+                    payout_value,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO admin_audit_logs (admin_user_id, action, target_type, target_id, payload_json)
+                    VALUES ($1, $2, 'bet', $3, $4::jsonb)
+                    """,
+                    admin_user_id,
+                    audit_action,
+                    str(bet["bet_no"] or bet_id),
+                    json.dumps(
+                        {
+                            "command_name": audit_action,
+                            "operator_id": admin_user_id,
+                            "bet_id": bet_id,
+                            "bet_no": bet["bet_no"],
+                            "old_status": old_status,
+                            "new_status": outcome,
+                            "payout_freeze_id": int(frozen_freeze["id"]),
+                            "payout_freeze_amount": str(freeze_amount),
+                            "ledger_id": ledger["id"] if ledger else None,
+                            "result": "success",
+                            "note": reason,
+                        }
+                    ),
+                )
+                logger.info(
+                    "admin_resettle_frozen_win command=%s operator_id=%s bet_id=%s bet_no=%s old_status=%s new_status=%s payout_freeze_id=%s payout_freeze_amount=%s result=success",
+                    audit_action,
+                    admin_user_id,
+                    bet_id,
+                    bet["bet_no"],
+                    old_status,
+                    outcome,
+                    frozen_freeze["id"],
+                    freeze_amount,
+                )
+                return {
+                    "ok": True,
+                    "bet_id": bet_id,
+                    "bet_no": bet["bet_no"],
+                    "old_status": old_status,
+                    "new_status": outcome,
+                    "payout_freeze_id": int(frozen_freeze["id"]),
+                    "ledger_id": ledger["id"] if ledger else None,
+                    "user_id": user_id,
+                }
+
+    async def confirm_frozen_win(
+        self,
+        bet_id: int,
+        admin_user_id: int,
+        *,
+        note: str | None = None,
+    ) -> dict:
+        reason = (note or f"Admin reconfirmed frozen win by {admin_user_id}").strip()
+        async with self._database.pool.acquire() as conn:
+            async with conn.transaction():
+                bet = await conn.fetchrow("SELECT * FROM bets WHERE id = $1 FOR UPDATE", bet_id)
+                if not bet:
+                    return {"ok": False, "reason": "bet_not_found"}
+                old_status = str(bet["status"] or "")
+                if old_status != "won":
+                    return {"ok": False, "reason": "bet_status_not_won", "old_status": old_status, "bet_id": bet_id}
+                freeze = await conn.fetchrow(
+                    """
+                    SELECT *
+                    FROM payout_freezes
+                    WHERE bet_id = $1 AND status = 'frozen'
+                    ORDER BY id DESC
+                    LIMIT 1
+                    FOR UPDATE
+                    """,
+                    bet_id,
+                )
+                if not freeze:
+                    latest_status = await conn.fetchval(
+                        "SELECT status FROM payout_freezes WHERE bet_id = $1 ORDER BY id DESC LIMIT 1",
+                        bet_id,
+                    )
+                    return {
+                        "ok": False,
+                        "reason": "payout_already_released" if latest_status else "frozen_payout_not_found",
+                        "bet_id": bet_id,
+                        "old_status": old_status,
+                        "freeze_status": latest_status,
+                    }
+                freeze_amount = Decimal(str(freeze["amount"] or 0))
+                settlement_note = f"admin={admin_user_id}; reconfirm_frozen_win; {reason}"
+                await conn.execute(
+                    """
+                    UPDATE bets
+                    SET settlement_note = COALESCE(settlement_note || '; ', '') || $2,
+                        settled_by_admin_id = $3,
+                        updated_at = NOW()
+                    WHERE id = $1
+                    """,
+                    bet_id,
+                    settlement_note,
+                    admin_user_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO admin_audit_logs (admin_user_id, action, target_type, target_id, payload_json)
+                    VALUES ($1, 'admin_resettle_frozen_win', 'bet', $2, $3::jsonb)
+                    """,
+                    admin_user_id,
+                    str(bet["bet_no"] or bet_id),
+                    json.dumps(
+                        {
+                            "command_name": "admin_resettle_frozen_win",
+                            "operator_id": admin_user_id,
+                            "bet_id": bet_id,
+                            "bet_no": bet["bet_no"],
+                            "old_status": old_status,
+                            "new_status": "won",
+                            "payout_freeze_id": int(freeze["id"]),
+                            "payout_freeze_amount": str(freeze_amount),
+                            "result": "confirmed",
+                            "note": reason,
+                        }
+                    ),
+                )
+                logger.info(
+                    "admin_resettle_frozen_win command=%s operator_id=%s bet_id=%s bet_no=%s old_status=%s new_status=%s payout_freeze_id=%s payout_freeze_amount=%s result=confirmed",
+                    "admin_settle_win",
+                    admin_user_id,
+                    bet_id,
+                    bet["bet_no"],
+                    old_status,
+                    "won",
+                    freeze["id"],
+                    freeze_amount,
+                )
+                return {
+                    "ok": True,
+                    "reason": "won_frozen_confirm_success",
+                    "bet_id": bet_id,
+                    "bet_no": bet["bet_no"],
+                    "old_status": old_status,
+                    "new_status": "won",
+                    "payout_freeze_id": int(freeze["id"]),
+                    "payout_freeze_amount": str(freeze_amount),
+                    "user_id": int(bet["user_id"] or bet["telegram_user_id"]),
+                }
 
     async def freeze_balance(self, user_id: int, amount: Decimal, reason: str, admin_user_id: int) -> dict | None:
         async with self._database.pool.acquire() as conn:

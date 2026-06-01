@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from datetime import date, datetime
+from decimal import Decimal
 from typing import Any
+
+from football_score_bot.worldcup_futures import WORLD_CUP_CHAMPION_MARKET_KEY
 
 
 WORLD_CUP_START_DATE = date(2026, 6, 11)
@@ -14,28 +17,21 @@ def world_cup_countdown_days(today: date | None = None) -> int:
 
 def format_worldcup_zone(lang_text: dict[str, str] | None = None) -> str:
     days = world_cup_countdown_days()
-    return (
-        "🏆 2026 世界杯专区\n\n"
-        f"开赛倒计时：{days} 天\n"
-        "可查看赛程、小组、积分和预测市场。"
-    )
+    return f"🏆 2026 世界杯专区\n\n开赛倒计时：{days} 天\n可查看赛程、小组、积分和冠军预测投注。"
 
 
-def format_futures_market(market_key: str, options: list[dict[str, Any]], page: int = 0, per_page: int = 5) -> str:
-    title = _market_title(market_key, options)
-    if market_key == "world_cup_winner":
-        header = "🔥 世界杯冠军预测"
-        prompt = "请选择你看好的冠军球队："
+def format_futures_market(market_key: str, options: list[dict[str, Any]], page: int = 0, per_page: int = 8) -> str:
+    if market_key == WORLD_CUP_CHAMPION_MARKET_KEY:
+        header = "🏆 2026 世界杯冠军预测"
     elif market_key == "golden_boot":
         header = "🥇 金靴奖预测"
-        prompt = "请选择你看好的金靴球员："
     else:
-        header = title
-        prompt = "请选择你的预测："
+        header = _market_title(market_key, options)
 
     visible = options[page * per_page : (page + 1) * per_page]
-    lines = [header, "演示赔率，仅供功能测试。", "", prompt, ""]
-    lines.extend(f"{option['label']} {_format_odds(option['odds'])}" for option in visible)
+    lines = [header, ""]
+    for index, option in enumerate(visible, start=page * per_page + 1):
+        lines.append(f"{index}. {option['label']} @ {_format_odds(option['odds'])}")
     total_pages = max((len(options) - 1) // per_page + 1, 1)
     if total_pages > 1:
         lines.append(f"\n第 {page + 1}/{total_pages} 页")
@@ -43,12 +39,31 @@ def format_futures_market(market_key: str, options: list[dict[str, Any]], page: 
 
 
 def format_prediction_confirm(option: dict[str, Any]) -> str:
+    if option.get("market_key") == WORLD_CUP_CHAMPION_MARKET_KEY:
+        return (
+            "🏆 世界杯冠军投注\n\n"
+            f"选择：{option['label']}\n"
+            f"赔率：{_format_odds(option['odds'])}\n\n"
+            "请选择下注金额。"
+        )
     return (
         "🎯 预测确认\n\n"
         f"市场：{option['market_title']}\n"
         f"选择：{option['label']}\n"
         f"赔率：{_format_odds(option['odds'])}\n\n"
-        "当前版本为模拟预测，不扣除余额，不产生真实注单。"
+        "当前版本为模拟预测。"
+    )
+
+
+def format_champion_bet_confirm(option: dict[str, Any], stake: Decimal) -> str:
+    odds = Decimal(str(option["odds"]))
+    payout = (stake * odds).quantize(Decimal("0.01"))
+    return (
+        "🏆 世界杯冠军投注确认\n\n"
+        f"选择：{option['label']}\n"
+        f"赔率：{_format_odds(option['odds'])}\n"
+        f"金额：{stake:.2f} USDT\n"
+        f"预计派彩：{payout:.2f} USDT"
     )
 
 
@@ -58,8 +73,7 @@ def format_prediction_saved(option: dict[str, Any], prediction_id: int) -> str:
         f"编号：{prediction_id}\n"
         f"市场：{option['market_title']}\n"
         f"选择：{option['label']}\n"
-        f"赔率：{_format_odds(option['odds'])}\n\n"
-        "当前仅展示预测记录，不扣余额，不生成真实注单。"
+        f"赔率：{_format_odds(option['odds'])}"
     )
 
 
@@ -69,15 +83,12 @@ def format_my_predictions(predictions: list[dict[str, Any]]) -> str:
     lines = ["🎯 我的预测"]
     for item in predictions:
         created_at = item.get("created_at")
-        if isinstance(created_at, datetime):
-            created_text = created_at.strftime("%m-%d %H:%M")
-        else:
-            created_text = "-"
+        created_text = created_at.strftime("%m-%d %H:%M") if isinstance(created_at, datetime) else "-"
         lines.append(
             "\n"
             f"#{item['id']} {item['market_title']}\n"
-            f"选择：{item['option_label']} ｜ 赔率：{_format_odds(item['odds'])}\n"
-            f"模拟金额：{_format_odds(item['stake_simulated'])} ｜ 状态：{item['status']}\n"
+            f"选择：{item['option_label']} | 赔率：{_format_odds(item['odds'])}\n"
+            f"金额：{_format_odds(item['stake_simulated'])} | 状态：{item['status']}\n"
             f"时间：{created_text}"
         )
     return "\n".join(lines)
@@ -91,13 +102,13 @@ def _market_title(market_key: str, options: list[dict[str, Any]]) -> str:
     if options:
         return str(options[0].get("market_title") or "预测市场")
     return {
-        "world_cup_winner": "世界杯冠军预测",
+        WORLD_CUP_CHAMPION_MARKET_KEY: "世界杯冠军预测",
         "golden_boot": "金靴奖预测",
     }.get(market_key, "预测市场")
 
 
 def _format_odds(value: Any) -> str:
     try:
-        return f"{float(value):.2f}"
-    except (TypeError, ValueError):
+        return f"{Decimal(str(value)):.2f}"
+    except Exception:
         return str(value)

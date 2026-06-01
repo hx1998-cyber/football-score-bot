@@ -9,6 +9,7 @@ from aiogram.types import (
 
 from football_score_bot.i18n import LANGUAGE_LABELS, SUPPORTED_LANGUAGES, t
 from football_score_bot.i18n_football import zh_team_name
+from football_score_bot.worldcup_futures import WORLD_CUP_CHAMPION_MARKET_KEY
 
 
 def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
@@ -89,10 +90,11 @@ def futures_market_keyboard(
     if row:
         rows.append(row)
     nav = []
+    page_prefix = "worldcup:futures" if market_key == WORLD_CUP_CHAMPION_MARKET_KEY else f"futures:market:{market_key}:page"
     if page > 0:
-        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"futures:market:{market_key}:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"{page_prefix}:{page - 1}"))
     if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton(text="更多球队", callback_data=f"futures:market:{market_key}:page:{page + 1}"))
+        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"{page_prefix}:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="返回世界杯专区", callback_data="worldcup")])
@@ -129,6 +131,519 @@ def bet_detail_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+# Launch-ready menu overrides. Keep at EOF so older compatibility definitions above
+# remain available internally while the user-facing entry points stay compact.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🔥 " + t(lang, "featured_matches"))],
+            [KeyboardButton(text="📅 " + t(lang, "all_fixtures")), KeyboardButton(text="🎫 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def language_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=LANGUAGE_LABELS[item], callback_data=f"lang:{item}")]
+            for item in SUPPORTED_LANGUAGES
+        ]
+        + [[InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")]]
+    )
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard(lang)
+
+
+def worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "worldcup_betting"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup:home")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or ("Home" if lang == "en" else "主队")
+        away = (teams.get("away") or {}).get("name") or ("Away" if lang == "en" else "客队")
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup:home")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+# Launch-ready menu overrides. Keep at EOF so older compatibility definitions above
+# remain available internally while the user-facing entry points stay compact.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🔥 " + t(lang, "featured_matches"))],
+            [KeyboardButton(text="📅 " + t(lang, "all_fixtures")), KeyboardButton(text="🎫 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def language_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=LANGUAGE_LABELS[item], callback_data=f"lang:{item}")]
+            for item in SUPPORTED_LANGUAGES
+        ]
+        + [[InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")]]
+    )
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard(lang)
+
+
+def worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "worldcup_betting"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup:home")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or ("Home" if lang == "en" else "主队")
+        away = (teams.get("away") or {}).get("name") or ("Away" if lang == "en" else "客队")
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup:home")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+# Launch-ready menu overrides. Keep at EOF so older compatibility definitions above
+# remain available internally while the user-facing entry points stay compact.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🔥 " + t(lang, "featured_matches"))],
+            [KeyboardButton(text="📅 " + t(lang, "all_fixtures")), KeyboardButton(text="🎫 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def language_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=LANGUAGE_LABELS[item], callback_data=f"lang:{item}")]
+            for item in SUPPORTED_LANGUAGES
+        ]
+        + [[InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")]]
+    )
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard(lang)
+
+
+def worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "worldcup_betting"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup:home")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or ("Home" if lang == "en" else "主队")
+        away = (teams.get("away") or {}).get("name") or ("Away" if lang == "en" else "客队")
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup:home")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+# Final i18n-aware overrides. Keep these at EOF so they are the active definitions.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+            [KeyboardButton(text=t(lang, "settings")), KeyboardButton(text=t(lang, "help"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard(lang)
+
+
+def worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "worldcup_betting"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_pick_bet"), callback_data="worldcup:betting:0")])
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or "Home"
+        away = (teams.get("away") or {}).get("name") or "Away"
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_confirm_keyboard(fixture_id: int, market_key: str, page: int, outcome_index: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "confirm_bet"), callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:2")],
+            [InlineKeyboardButton(text="修改金额" if lang != "en" else "Change Amount", callback_data=f"bet_amount:{fixture_id}:{market_key}:{page}:{outcome_index}")],
+            [InlineKeyboardButton(text=t(lang, "cancel"), callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page}")],
+        ]
+    )
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+# Final i18n-aware overrides. Keep these at EOF so they are the active definitions.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+            [KeyboardButton(text=t(lang, "settings")), KeyboardButton(text=t(lang, "help"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard(lang)
+
+
+def worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "worldcup_betting"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_pick_bet"), callback_data="worldcup:betting:0")])
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or "Home"
+        away = (teams.get("away") or {}).get("name") or "Away"
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_confirm_keyboard(fixture_id: int, market_key: str, page: int, outcome_index: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "confirm_bet"), callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:2")],
+            [InlineKeyboardButton(text="修改金额" if lang != "en" else "Change Amount", callback_data=f"bet_amount:{fixture_id}:{market_key}:{page}:{outcome_index}")],
+            [InlineKeyboardButton(text=t(lang, "cancel"), callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page}")],
+        ]
+    )
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+# Final i18n-aware overrides. Keep these at EOF so they are the active definitions.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+            [KeyboardButton(text=t(lang, "settings")), KeyboardButton(text=t(lang, "help"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard(lang)
+
+
+def worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🔥 " + t(lang, "featured_matches"), callback_data="worldcup:today")],
+            [InlineKeyboardButton(text="🏟 " + t(lang, "group_stage"), callback_data="worldcup:groups")],
+            [InlineKeyboardButton(text="📊 " + t(lang, "standings"), callback_data="worldcup_standings")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "bettable_matches"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_pick_bet"), callback_data="worldcup:betting:0")])
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or "Home"
+        away = (teams.get("away") or {}).get("name") or "Away"
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_confirm_keyboard(fixture_id: int, market_key: str, page: int, outcome_index: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "confirm_bet"), callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:2")],
+            [InlineKeyboardButton(text="修改金额" if lang != "en" else "Change Amount", callback_data=f"bet_amount:{fixture_id}:{market_key}:{page}:{outcome_index}")],
+            [InlineKeyboardButton(text=t(lang, "cancel"), callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page}")],
+        ]
+    )
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
 def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
     return worldcup_home_keyboard()
 
@@ -137,6 +652,7 @@ def worldcup_home_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📅 赛程", callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 冠军预测投注", callback_data="worldcup:futures:0")],
             [InlineKeyboardButton(text="🔥 今日赛事", callback_data="worldcup:today")],
             [InlineKeyboardButton(text="🏟 小组赛", callback_data="worldcup:groups")],
             [InlineKeyboardButton(text="📊 排名", callback_data="worldcup_standings")],
@@ -183,6 +699,20 @@ def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int)
 
 
 def futures_confirm_keyboard(option_id: int, market_key: str) -> InlineKeyboardMarkup:
+    if market_key == WORLD_CUP_CHAMPION_MARKET_KEY:
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="10 USDT", callback_data=f"futures:bet:{option_id}:10"),
+                    InlineKeyboardButton(text="20 USDT", callback_data=f"futures:bet:{option_id}:20"),
+                ],
+                [
+                    InlineKeyboardButton(text="50 USDT", callback_data=f"futures:bet:{option_id}:50"),
+                    InlineKeyboardButton(text="100 USDT", callback_data=f"futures:bet:{option_id}:100"),
+                ],
+                [InlineKeyboardButton(text="返回冠军列表", callback_data="worldcup:futures:0")],
+            ]
+        )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="确认模拟预测", callback_data=f"futures:confirm:{option_id}")],
@@ -383,12 +913,13 @@ def _outcome_button_label(outcome: object) -> str:
     return str(label)
 
 
-def language_keyboard() -> InlineKeyboardMarkup:
+def language_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=LANGUAGE_LABELS[lang], callback_data=f"lang:{lang}")]
             for lang in SUPPORTED_LANGUAGES
         ]
+        + [[InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")]]
     )
 
 
@@ -493,6 +1024,95 @@ def bet_detail_keyboard(
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+
+# Final i18n-aware overrides. Earlier definitions are retained for compatibility,
+# but these are the versions imported by handlers at runtime.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+            [KeyboardButton(text=t(lang, "settings")), KeyboardButton(text=t(lang, "help"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def worldcup_zone_keyboard(lang: str) -> InlineKeyboardMarkup:
+    return worldcup_home_keyboard(lang)
+
+
+def worldcup_home_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📅 " + t(lang, "worldcup_schedule"), callback_data="worldcup:schedule:0")],
+            [InlineKeyboardButton(text="🏆 " + t(lang, "winner_prediction"), callback_data="worldcup:futures:0")],
+            [InlineKeyboardButton(text="🔥 " + t(lang, "featured_matches"), callback_data="worldcup:today")],
+            [InlineKeyboardButton(text="🏟 " + t(lang, "group_stage"), callback_data="worldcup:groups")],
+            [InlineKeyboardButton(text="📊 " + t(lang, "standings"), callback_data="worldcup_standings")],
+            [InlineKeyboardButton(text="🎲 " + t(lang, "bettable_matches"), callback_data="worldcup:betting:0")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
+
+def worldcup_schedule_keyboard(page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_pick_bet"), callback_data="worldcup:betting:0")])
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for index, item in enumerate(fixtures, start=1):
+        fixture_id = (item.get("fixture") or {}).get("id")
+        teams = item.get("teams") or {}
+        home = (teams.get("home") or {}).get("name") or "Home"
+        away = (teams.get("away") or {}).get("name") or "Away"
+        if fixture_id is not None:
+            rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
+    if page + 1 < total_pages:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_confirm_keyboard(fixture_id: int, market_key: str, page: int, outcome_index: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "confirm_bet"), callback_data=f"bet_confirm:{fixture_id}:{market_key}:{page}:{outcome_index}:2")],
+            [InlineKeyboardButton(text="修改金额" if lang != "en" else "Change Amount", callback_data=f"bet_amount:{fixture_id}:{market_key}:{page}:{outcome_index}")],
+            [InlineKeyboardButton(text=t(lang, "cancel"), callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page}")],
+        ]
+    )
+
+
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+
 # M11-Fix-2 override: expose stable ReplyKeyboard labels that match handlers.
 def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -510,10 +1130,10 @@ def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
 def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="🎯 可投注赛事"), KeyboardButton(text="📊 我的注单")],
-            [KeyboardButton(text="💰 钱包"), KeyboardButton(text="👥 推广")],
-            [KeyboardButton(text="🏆 世界杯"), KeyboardButton(text="🌐 语言")],
-            [KeyboardButton(text="设置"), KeyboardButton(text="帮助")],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🔥 " + t(lang, "featured_matches"))],
+            [KeyboardButton(text="📅 " + t(lang, "all_fixtures")), KeyboardButton(text="🎫 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
         ],
         resize_keyboard=True,
         input_field_placeholder=t(lang, "start_title"),
@@ -566,12 +1186,12 @@ def bet_detail_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None) -> InlineKeyboardMarkup:
+def bet_created_keyboard(bet_id_or_no: str, fixture_id: int | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="查看开奖", callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
-            [InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
-            [InlineKeyboardButton(text="返回首页", callback_data="home")],
+            [InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_detail:{bet_id_or_no}:pending:0")],
+            [InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}" if fixture_id else "today_featured")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
         ]
     )
 
