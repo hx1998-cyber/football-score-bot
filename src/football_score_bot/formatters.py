@@ -48,35 +48,49 @@ def format_bettable_matches(
     last_update: str,
     cutoff_minutes: int,
     limit: int = 30,
+    lang: str = "zh",
 ) -> str:
     if not fixtures:
+        if lang == "en":
+            return "No bettable matches right now.\nYou can view all fixtures or try again later."
         return "当前暂无可投注赛事。\n你可以查看全部赛程或稍后再试。"
 
-    lines = ["🎯 可投注赛事", f"更新：{last_update}", f"显示：{min(len(fixtures), limit)} 场"]
+    if lang == "en":
+        lines = ["🎯 Bettable Matches", f"Updated: {last_update}", f"Showing: {min(len(fixtures), limit)} matches"]
+    else:
+        lines = ["🎯 可投注赛事", f"更新：{last_update}", f"显示：{min(len(fixtures), limit)} 场"]
     current_day = None
     current_league = None
     for item in fixtures[:limit]:
-        day_label = _fixture_day_label(item)
+        day_label = format_date_label(_fixture_datetime(item), lang)
         if day_label != current_day:
             lines.append(f"\n【{day_label}】")
             current_day = day_label
             current_league = None
 
-        league_name = zh_league_name((item.get("league") or {}).get("name")) if (item.get("league") or {}).get("name") else "赛事"
+        raw_league = (item.get("league") or {}).get("name")
+        if lang == "en":
+            league_name = raw_league or "League"
+        else:
+            league_name = zh_league_name(raw_league) if raw_league else "赛事"
         if league_name != current_league:
             lines.append(f"【{league_name}】")
             current_league = league_name
 
         fixture_id = _fixture_id(item)
-        teams = item.get("teams", {})
-        home = zh_team_name(teams.get("home", {}).get("name"))
-        away = zh_team_name(teams.get("away", {}).get("name"))
         odds = _odds_for(odds_by_fixture, fixture_id)
-        lines.append(f"{_fixture_time(item)} {format_match_title(item)}")
+        match_title = _match_title_by_lang(item, lang)
+        lines.append(f"{_fixture_time(item)} {match_title}")
+        labels = _odds_labels(lang)
         lines.append(
-            f"主 {_odd_value(odds, 'home_odds')} ｜ 和 {_odd_value(odds, 'draw_odds')} ｜ 客 {_odd_value(odds, 'away_odds')}"
+            f"{labels['home']} {_odd_value(odds, 'home_odds')} | "
+            f"{labels['draw']} {_odd_value(odds, 'draw_odds')} | "
+            f"{labels['away']} {_odd_value(odds, 'away_odds')}"
         )
-        lines.append(f"封盘：开赛前 {cutoff_minutes} 分钟")
+        if lang == "en":
+            lines.append(f"Bet closes: {cutoff_minutes} minutes before kickoff")
+        else:
+            lines.append(f"封盘：开赛前 {cutoff_minutes} 分钟")
     return "\n".join(lines)
 
 
@@ -505,10 +519,32 @@ def _fixture_datetime(item: dict[str, Any]) -> datetime | None:
 
 def _fixture_day_label(item: dict[str, Any]) -> str:
     value = _fixture_datetime(item)
+    return format_date_label(value, "zh")
+
+
+def format_date_label(value: datetime | None, lang: str = "zh") -> str:
     if not value:
         return "--"
+    if lang == "en":
+        return value.strftime("%b %d %a")
     weekdays = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"]
     return f"{value:%m-%d} {weekdays[value.weekday()]}"
+
+
+def _match_title_by_lang(item: dict[str, Any], lang: str = "zh") -> str:
+    if lang != "en":
+        return format_match_title(item)
+    league_name = ((item.get("league") or {}).get("name")) or "League"
+    teams = item.get("teams") or {}
+    home = (teams.get("home") or {}).get("name") or "Home"
+    away = (teams.get("away") or {}).get("name") or "Away"
+    return f"【{league_name}】 {home} vs {away}"
+
+
+def _odds_labels(lang: str = "zh") -> dict[str, str]:
+    if lang == "en":
+        return {"home": "Home", "draw": "Draw", "away": "Away"}
+    return {"home": "主", "draw": "和", "away": "客"}
 
 
 def _fixture_month_day_time(item: dict[str, Any]) -> str:

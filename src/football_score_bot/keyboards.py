@@ -945,10 +945,16 @@ def fixture_list_keyboard(fixtures: list[dict], lang: str, mode: str = "today") 
         fixture_id = fixture.get("id")
         if fixture_id is None:
             continue
-        home = zh_team_name(teams.get("home", {}).get("name"))
-        away = zh_team_name(teams.get("away", {}).get("name"))
+        if lang == "en":
+            home = teams.get("home", {}).get("name") or "Home"
+            away = teams.get("away", {}).get("name") or "Away"
+            prefix = "Details"
+        else:
+            home = zh_team_name(teams.get("home", {}).get("name"))
+            away = zh_team_name(teams.get("away", {}).get("name"))
+            prefix = "详情"
         rows.append(
-            [InlineKeyboardButton(text=f"详情 {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")]
+            [InlineKeyboardButton(text=f"{prefix} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")]
         )
     if mode == "today":
         rows.extend(

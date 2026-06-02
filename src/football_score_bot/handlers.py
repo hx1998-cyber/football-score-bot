@@ -330,6 +330,7 @@ def build_router(
                 last_update,
                 effective_settings.bet_cutoff_minutes,
                 effective_settings.max_bettable_matches,
+                lang,
             ),
             reply_markup=fixture_list_keyboard(localized, lang, mode="today")
             if fixtures
@@ -591,6 +592,7 @@ def build_router(
                 await cache.get_text("football:bettable_matches:last_update") or _now_hhmm(),
                 effective_settings.bet_cutoff_minutes,
                 effective_settings.max_bettable_matches,
+                lang,
             ),
             reply_markup=fixture_list_keyboard(localized, lang, mode="today")
             if matches
@@ -2349,7 +2351,9 @@ def build_router(
         if not _admin_private_allowed(message, settings):
             await message.answer("无管理员权限，或请在私聊中使用。")
             return
-        await message.answer(_format_withdrawals(await database.list_withdraw_requests("pending", 20)))
+        lang = await _event_lang(message, database, settings)
+        rows = await database.list_withdraw_requests("pending", 20)
+        await message.answer(_format_withdrawals(rows, settings.wallet_currency, lang), reply_markup=_withdrawals_keyboard(rows, lang))
 
     @router.message(Command("admin_withdraw"))
     async def admin_withdraw(message: Message, command: CommandObject) -> None:
@@ -2362,7 +2366,28 @@ def build_router(
         if withdraw_id is None:
             await message.answer("用法：/admin_withdraw <withdraw_id>")
             return
-        await message.answer(_format_withdraw(await database.get_withdraw_request(withdraw_id)))
+        lang = await _event_lang(message, database, settings)
+        context = await database.get_withdraw_review_context(withdraw_id)
+        await message.answer(
+            _format_withdraw_review_context(context, settings.wallet_currency, lang),
+            reply_markup=_withdraw_detail_keyboard(withdraw_id, lang) if context else None,
+        )
+
+    @router.message(Command("admin_players"))
+    async def admin_players(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
+        if not _admin_private_allowed(message, settings):
+            await message.answer("无管理员权限，或请在私聊中使用。")
+            return
+        page = max((_first_int_arg(command) or 1) - 1, 0)
+        lang = await _event_lang(message, database, settings)
+        summary = await database.get_registered_players_summary()
+        rows = await database.list_registered_players(page, 10)
+        await message.answer(
+            _format_registered_players(summary, rows, page, settings.wallet_currency, lang),
+            reply_markup=_registered_players_keyboard(page, len(rows) == 10, rows, lang),
+        )
 
     @router.message(Command("admin_approve_withdraw"))
     async def admin_approve_withdraw(message: Message, command: CommandObject) -> None:
@@ -2937,6 +2962,90 @@ def build_router(
     async def admin_unrestrict_withdraw(message: Message, command: CommandObject) -> None:
         await _risk_command(message, command, "admin_unrestrict_withdraw", withdraw_restricted=False)
 
+    @router.callback_query(F.data.startswith("admin_withdraw_detail:"))
+    async def admin_withdraw_detail_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user or not await permission_service.is_super_admin(callback.from_user.id):
+            await callback.message.answer("无管理员权限。")
+            return
+        withdraw_id = int((callback.data or "").rsplit(":", 1)[1])
+        lang = await _callback_lang(callback, database, settings)
+        context = await database.get_withdraw_review_context(withdraw_id)
+        await callback.message.answer(
+            _format_withdraw_review_context(context, settings.wallet_currency, lang),
+            reply_markup=_withdraw_detail_keyboard(withdraw_id, lang) if context else None,
+        )
+
+    @router.callback_query(F.data.startswith("admin_withdraw_approve:"))
+    async def admin_withdraw_approve_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user or not await permission_service.is_super_admin(callback.from_user.id):
+            await callback.message.answer("无管理员权限。")
+            return
+        withdraw_id = int((callback.data or "").rsplit(":", 1)[1])
+        row = await wallet_service.approve_withdraw(withdraw_id, callback.from_user.id)
+        await database.add_admin_audit_log(callback.from_user.id, "admin_approve_withdraw", "withdraw", str(withdraw_id), {"approved": bool(row)})
+        lang = await _callback_lang(callback, database, settings)
+        await callback.message.answer(
+            ("Withdrawal approved. Transfer manually, then mark as paid." if lang == "en" else "提现已审核通过，请人工转账后标记已打款。")
+            if row
+            else ("Withdrawal not found or already processed." if lang == "en" else "提现申请不存在或已处理。")
+        )
+
+    @router.callback_query(F.data.startswith("admin_withdraw_reject:"))
+    async def admin_withdraw_reject_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user or not await permission_service.is_super_admin(callback.from_user.id):
+            await callback.message.answer("无管理员权限。")
+            return
+        withdraw_id = int((callback.data or "").rsplit(":", 1)[1])
+        lang = await _callback_lang(callback, database, settings)
+        await callback.message.answer(
+            f"/admin_reject_withdraw {withdraw_id} reason"
+            if lang == "en"
+            else f"请发送：/admin_reject_withdraw {withdraw_id} 拒绝原因"
+        )
+
+    @router.callback_query(F.data.startswith("admin_withdraw_paid:"))
+    async def admin_withdraw_paid_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user or not await permission_service.is_super_admin(callback.from_user.id):
+            await callback.message.answer("无管理员权限。")
+            return
+        withdraw_id = int((callback.data or "").rsplit(":", 1)[1])
+        lang = await _callback_lang(callback, database, settings)
+        await callback.message.answer(
+            f"/admin_mark_withdraw_paid {withdraw_id} txid"
+            if lang == "en"
+            else f"请发送：/admin_mark_withdraw_paid {withdraw_id} 链上交易号"
+        )
+
+    @router.callback_query(F.data.startswith("admin_players:"))
+    async def admin_players_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user or not await permission_service.is_super_admin(callback.from_user.id):
+            await callback.message.answer("无管理员权限。")
+            return
+        page = max(int((callback.data or "").rsplit(":", 1)[1]), 0)
+        lang = await _callback_lang(callback, database, settings)
+        summary = await database.get_registered_players_summary()
+        rows = await database.list_registered_players(page, 10)
+        await callback.message.answer(
+            _format_registered_players(summary, rows, page, settings.wallet_currency, lang),
+            reply_markup=_registered_players_keyboard(page, len(rows) == 10, rows, lang),
+        )
+
+    @router.callback_query(F.data.startswith("admin_wallet_view:"))
+    async def admin_wallet_view_callback(callback: CallbackQuery) -> None:
+        await _safe_callback_answer(callback)
+        if not callback.from_user or not await permission_service.is_super_admin(callback.from_user.id):
+            await callback.message.answer("无管理员权限。")
+            return
+        user_id = int((callback.data or "").rsplit(":", 1)[1])
+        wallet_row = await wallet_service.get_balance(user_id)
+        summary = await database.get_referral_summary(user_id)
+        await callback.message.answer(_format_wallet(wallet_row, settings.wallet_currency) + "\n\n" + _format_admin_referral_summary(summary, settings.wallet_currency))
+
     @router.callback_query(F.data.in_({
         "admin:stats",
         "admin:markets",
@@ -2978,9 +3087,18 @@ def build_router(
         elif data == "admin:bets":
             await callback.message.answer(_format_admin_bets(await database.list_admin_bets("pending", 20)))
         elif data == "admin:wallets":
-            await callback.message.answer("💰 用户钱包\n\n请输入：/admin_wallet <telegram_user_id>\n手动调账：/admin_adjust_balance <telegram_user_id> <amount> <reason>")
+            lang = await _callback_lang(callback, database, settings)
+            await callback.message.answer(
+                _format_admin_wallets_panel(lang),
+                reply_markup=_admin_wallets_keyboard(lang),
+            )
         elif data == "admin:withdrawals":
-            await callback.message.answer(_format_withdrawals(await database.list_withdraw_requests("pending", 20)))
+            lang = await _callback_lang(callback, database, settings)
+            rows = await database.list_withdraw_requests("pending", 20)
+            await callback.message.answer(
+                _format_withdrawals(rows, settings.wallet_currency, lang),
+                reply_markup=_withdrawals_keyboard(rows, lang),
+            )
         elif data == "admin:deposits":
             await callback.message.answer(_format_deposit_records(await database.list_deposit_orders(20)))
         elif data == "admin:users":
@@ -4319,15 +4437,52 @@ def _format_admin_bet(row: dict | None) -> str:
     )
 
 
-def _format_withdrawals(rows: list[dict]) -> str:
+def _format_withdrawals(rows: list[dict], currency: str = "USDT", lang: str = "zh") -> str:
     if not rows:
-        return "暂无待审核提现。"
-    lines = ["待审核提现"]
+        return "No pending withdrawals." if lang == "en" else "暂无待审核提现。"
+    lines = ["🏧 Pending Withdrawals" if lang == "en" else "🏧 待审核提现", ""]
     for row in rows:
-        lines.append(
-            f"#{row.get('id')} user={row.get('user_id')} amount={_money(row.get('amount'))} "
-            f"{row.get('network') or '-'} {row.get('status')}"
-        )
+        amount, fee, net = _withdraw_amounts(row)
+        if lang == "en":
+            lines.extend(
+                [
+                    f"#{row.get('id')}",
+                    f"User: {row.get('user_id')}",
+                    f"Amount: {_money(amount)} {currency}",
+                    f"Fee: {_money(fee)} {currency}",
+                    f"Estimated Received: {_money(net)} {currency}",
+                    f"Network: {row.get('network') or '-'}",
+                    f"Address: {row.get('address') or '-'}",
+                    f"Status: {row.get('status') or '-'}",
+                    f"Created At: {_dt_text(row.get('created_at'))}",
+                    "",
+                    "Commands:",
+                    f"/admin_withdraw {row.get('id')}",
+                    f"/admin_approve_withdraw {row.get('id')}",
+                    f"/admin_reject_withdraw {row.get('id')} reason",
+                    "",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"#{row.get('id')}",
+                    f"用户：{row.get('user_id')}",
+                    f"金额：{_money(amount)} {currency}",
+                    f"手续费：{_money(fee)} {currency}",
+                    f"预计到账：{_money(net)} {currency}",
+                    f"网络：{row.get('network') or '-'}",
+                    f"地址：{row.get('address') or '-'}",
+                    f"状态：{row.get('status') or '-'}",
+                    f"申请时间：{_dt_text(row.get('created_at'))}",
+                    "",
+                    "命令：",
+                    f"/admin_withdraw {row.get('id')}",
+                    f"/admin_approve_withdraw {row.get('id')}",
+                    f"/admin_reject_withdraw {row.get('id')} reason",
+                    "",
+                ]
+            )
     return "\n".join(lines)
 
 
@@ -4343,6 +4498,313 @@ def _format_withdraw(row: dict | None) -> str:
         f"status={row.get('status')}\n"
         f"admin_note={row.get('admin_note') or '-'}"
     )
+
+
+def _format_withdraw_review_context(context: dict | None, currency: str = "USDT", lang: str = "zh") -> str:
+    if not context:
+        return "Withdrawal not found." if lang == "en" else "提现申请不存在。"
+    withdraw = context.get("withdraw") or {}
+    user = context.get("user") or {}
+    wallet = context.get("wallet") or {}
+    deposits = context.get("deposit_summary") or {}
+    withdrawals = context.get("withdraw_summary") or {}
+    bets = context.get("bet_summary") or {}
+    amount, fee, net = _withdraw_amounts(withdraw)
+    username = _username_text(user)
+    if lang == "en":
+        lines = [
+            f"🏧 Withdrawal Review Detail #{withdraw.get('id')}",
+            "",
+            "【Withdrawal】",
+            f"User: {withdraw.get('user_id')}",
+            f"Username: {username}",
+            f"Amount: {_money(amount)} {currency}",
+            f"Fee: {_money(fee)} {currency}",
+            f"Estimated Received: {_money(net)} {currency}",
+            f"Network: {withdraw.get('network') or '-'}",
+            f"Address: {withdraw.get('address') or '-'}",
+            f"Status: {withdraw.get('status') or '-'}",
+            f"Created At: {_dt_text(withdraw.get('created_at'))}",
+            "",
+            "【User Summary】",
+            f"Registered At: {_dt_text(user.get('created_at'))}",
+            f"Available Balance: {_money(wallet.get('balance'))} {currency}",
+            f"Frozen Balance: {_money(wallet.get('frozen_balance'))} {currency}",
+            f"Total Deposits: {_money(deposits.get('total_deposit'))} {currency}",
+            f"Total Withdrawal Requests: {_money(withdrawals.get('total_withdraw_request'))} {currency}",
+            f"Total Paid Withdrawals: {_money(withdrawals.get('total_paid_withdraw'))} {currency}",
+            "",
+            "【Bet Summary】",
+            f"Total Bets: {bets.get('bet_count') or 0}",
+            f"Pending: {bets.get('pending_count') or 0}",
+            f"Won: {bets.get('won_count') or 0}",
+            f"Lost: {bets.get('lost_count') or 0}",
+            f"Void: {bets.get('void_count') or 0}",
+            f"Settled Valid Stake: {_money(bets.get('settled_valid_stake'))} {currency}",
+            f"Total Payout: {_money(bets.get('total_payout'))} {currency}",
+            "",
+            "【Recent Ledger】",
+        ]
+        lines.extend(_format_recent_ledgers(context.get("recent_ledgers") or [], currency, lang))
+        lines.append("")
+        lines.append("【Recent Bets】")
+        lines.extend(_format_recent_bets(context.get("recent_bets") or [], currency, lang))
+        lines.extend(
+            [
+                "",
+                "Commands:",
+                f"/admin_approve_withdraw {withdraw.get('id')}",
+                f"/admin_reject_withdraw {withdraw.get('id')} reason",
+                f"/admin_mark_withdraw_paid {withdraw.get('id')} txid",
+            ]
+        )
+        return "\n".join(lines)
+
+    lines = [
+        f"🏧 提现审核详情 #{withdraw.get('id')}",
+        "",
+        "【提现信息】",
+        f"用户：{withdraw.get('user_id')}",
+        f"用户名：{username}",
+        f"金额：{_money(amount)} {currency}",
+        f"手续费：{_money(fee)} {currency}",
+        f"预计到账：{_money(net)} {currency}",
+        f"网络：{withdraw.get('network') or '-'}",
+        f"地址：{withdraw.get('address') or '-'}",
+        f"状态：{withdraw.get('status') or '-'}",
+        f"申请时间：{_dt_text(withdraw.get('created_at'))}",
+        "",
+        "【用户概况】",
+        f"注册时间：{_dt_text(user.get('created_at'))}",
+        f"当前可用余额：{_money(wallet.get('balance'))} {currency}",
+        f"当前冻结余额：{_money(wallet.get('frozen_balance'))} {currency}",
+        f"累计充值：{_money(deposits.get('total_deposit'))} {currency}",
+        f"累计提现申请：{_money(withdrawals.get('total_withdraw_request'))} {currency}",
+        f"累计提现成功：{_money(withdrawals.get('total_paid_withdraw'))} {currency}",
+        "",
+        "【投注概况】",
+        f"总注单数：{bets.get('bet_count') or 0}",
+        f"待开奖：{bets.get('pending_count') or 0}",
+        f"中奖：{bets.get('won_count') or 0}",
+        f"未中奖：{bets.get('lost_count') or 0}",
+        f"作废：{bets.get('void_count') or 0}",
+        f"累计已结算有效投注：{_money(bets.get('settled_valid_stake'))} {currency}",
+        f"累计派奖/中奖金额：{_money(bets.get('total_payout'))} {currency}",
+        "",
+        "【最近账变】",
+    ]
+    lines.extend(_format_recent_ledgers(context.get("recent_ledgers") or [], currency, lang))
+    lines.append("")
+    lines.append("【最近注单】")
+    lines.extend(_format_recent_bets(context.get("recent_bets") or [], currency, lang))
+    lines.extend(
+        [
+            "",
+            "命令：",
+            f"/admin_approve_withdraw {withdraw.get('id')}",
+            f"/admin_reject_withdraw {withdraw.get('id')} reason",
+            f"/admin_mark_withdraw_paid {withdraw.get('id')} txid",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _withdrawals_keyboard(rows: list[dict], lang: str = "zh") -> InlineKeyboardMarkup:
+    buttons = []
+    for row in rows[:10]:
+        withdraw_id = row.get("id")
+        if not withdraw_id:
+            continue
+        buttons.append([InlineKeyboardButton(text=(f"View Detail #{withdraw_id}" if lang == "en" else f"查看详情 #{withdraw_id}"), callback_data=f"admin_withdraw_detail:{withdraw_id}")])
+        buttons.append(
+            [
+                InlineKeyboardButton(text=(f"Approve #{withdraw_id}" if lang == "en" else f"批准 #{withdraw_id}"), callback_data=f"admin_withdraw_approve:{withdraw_id}"),
+                InlineKeyboardButton(text=(f"Reject #{withdraw_id}" if lang == "en" else f"拒绝 #{withdraw_id}"), callback_data=f"admin_withdraw_reject:{withdraw_id}"),
+            ]
+        )
+    buttons.append([InlineKeyboardButton(text=t(lang, "back_admin"), callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _withdraw_detail_keyboard(withdraw_id: int, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=("Approve" if lang == "en" else "批准提现"), callback_data=f"admin_withdraw_approve:{withdraw_id}")],
+            [InlineKeyboardButton(text=("Reject" if lang == "en" else "拒绝提现"), callback_data=f"admin_withdraw_reject:{withdraw_id}")],
+            [InlineKeyboardButton(text=("Mark as Paid" if lang == "en" else "标记已打款"), callback_data=f"admin_withdraw_paid:{withdraw_id}")],
+            [InlineKeyboardButton(text=("Back to Withdrawals" if lang == "en" else "返回提现列表"), callback_data="admin:withdrawals")],
+            [InlineKeyboardButton(text=("Back to Admin" if lang == "en" else "返回管理面板"), callback_data="menu:admin")],
+        ]
+    )
+
+
+def _admin_wallets_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=("👥 All Registered Players" if lang == "en" else "👥 全部注册玩家"), callback_data="admin_players:0")],
+            [InlineKeyboardButton(text=t(lang, "back_admin"), callback_data="menu:admin")],
+        ]
+    )
+
+
+def _format_admin_wallets_panel(lang: str = "zh") -> str:
+    if lang == "en":
+        return (
+            "💰 User Wallet / Adjust\n\n"
+            "Use: /admin_wallet <telegram_user_id>\n"
+            "Adjust: /admin_adjust_balance <telegram_user_id> <amount> <reason>\n"
+            "Players: /admin_players"
+        )
+    return (
+        "💰 用户钱包/调账\n\n"
+        "查看钱包：/admin_wallet <telegram_user_id>\n"
+        "手动调账：/admin_adjust_balance <telegram_user_id> <amount> <reason>\n"
+        "全部注册玩家：/admin_players"
+    )
+
+
+def _format_registered_players(summary: dict, rows: list[dict], page: int, currency: str = "USDT", lang: str = "zh") -> str:
+    if lang == "en":
+        lines = [
+            "👥 All Registered Players",
+            "",
+            f"Total Users: {summary.get('total_users') or 0}",
+            f"Users with Deposits: {summary.get('users_with_deposits') or 0}",
+            f"Total Deposits: {_money(summary.get('total_deposit_amount'))} {currency}",
+            "",
+        ]
+        if not rows:
+            lines.append("No registered players on this page.")
+            return "\n".join(lines)
+        for index, row in enumerate(rows, start=page * 10 + 1):
+            lines.extend(
+                [
+                    f"#{index}",
+                    f"User: {row.get('telegram_user_id')}",
+                    f"Username: {_username_text(row)}",
+                    f"Registered At: {_dt_text(row.get('created_at'))}",
+                    f"Balance: {_money(row.get('balance'))} {currency}",
+                    f"Frozen: {_money(row.get('frozen_balance'))} {currency}",
+                    f"Total Deposits: {_money(row.get('total_deposit'))} {currency}",
+                    f"Total Bets: {_money(row.get('total_bets'))} {currency}",
+                    f"Total Withdrawals: {_money(row.get('total_withdrawals'))} {currency}",
+                    "",
+                ]
+            )
+        return "\n".join(lines)
+
+    lines = [
+        "👥 全部注册玩家",
+        "",
+        f"总注册用户：{summary.get('total_users') or 0}",
+        f"累计充值用户：{summary.get('users_with_deposits') or 0}",
+        f"累计充值金额：{_money(summary.get('total_deposit_amount'))} {currency}",
+        "",
+    ]
+    if not rows:
+        lines.append("本页暂无注册玩家。")
+        return "\n".join(lines)
+    for index, row in enumerate(rows, start=page * 10 + 1):
+        lines.extend(
+            [
+                f"#{index}",
+                f"用户：{row.get('telegram_user_id')}",
+                f"用户名：{_username_text(row)}",
+                f"注册时间：{_dt_text(row.get('created_at'))}",
+                f"余额：{_money(row.get('balance'))} {currency}",
+                f"冻结：{_money(row.get('frozen_balance'))} {currency}",
+                f"累计充值：{_money(row.get('total_deposit'))} {currency}",
+                f"累计投注：{_money(row.get('total_bets'))} {currency}",
+                f"累计提现：{_money(row.get('total_withdrawals'))} {currency}",
+                "",
+            ]
+        )
+    return "\n".join(lines)
+
+
+def _registered_players_keyboard(page: int, has_next: bool, players: list[dict] | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    rows = []
+    for player in players or []:
+        user_id = player.get("telegram_user_id")
+        if user_id:
+            label = f"Wallet {user_id}" if lang == "en" else f"查看用户钱包 {user_id}"
+            rows.append([InlineKeyboardButton(text=label[:64], callback_data=f"admin_wallet_view:{user_id}")])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"admin_players:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"admin_players:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=("Back to User Wallet / Adjust" if lang == "en" else "返回用户钱包/调账"), callback_data="admin:wallets")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_admin"), callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _withdraw_amounts(row: dict) -> tuple[Decimal, Decimal, Decimal]:
+    amount = Decimal(str(row.get("amount") or 0))
+    fee = Decimal(str(row.get("fee_amount") or 0))
+    net = Decimal(str(row.get("net_amount") or 0))
+    if fee == 0 and amount:
+        fee = (amount * Decimal("0.10")).quantize(Decimal("0.000001"))
+    if net == 0 and amount:
+        net = amount - fee
+    return amount, fee, net
+
+
+def _dt_text(value: Any) -> str:
+    if not value:
+        return "-"
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M")
+    return str(value)
+
+
+def _username_text(row: dict) -> str:
+    username = row.get("username")
+    if username:
+        return f"@{username}" if not str(username).startswith("@") else str(username)
+    name = " ".join(str(row.get(key) or "").strip() for key in ("first_name", "last_name")).strip()
+    return name or "-"
+
+
+def _format_recent_ledgers(rows: list[dict], currency: str, lang: str) -> list[str]:
+    if not rows:
+        return ["No recent ledger entries." if lang == "en" else "暂无最近账变。"]
+    lines = []
+    for index, row in enumerate(rows, 1):
+        amount = Decimal(str(row.get("amount") or 0))
+        signed = f"{amount:+.2f}"
+        if lang == "en":
+            lines.append(
+                f"{index}. Reason: {row.get('type') or '-'} | Change: {signed} {currency} | "
+                f"Frozen: {_money(row.get('frozen_after'))} | Available: {_money(row.get('balance_after'))}"
+            )
+        else:
+            lines.append(
+                f"{index}. 原因：{row.get('type') or '-'} | 变动：{signed} {currency} | "
+                f"冻结：{_money(row.get('frozen_after'))} | 可用：{_money(row.get('balance_after'))}"
+            )
+    return lines
+
+
+def _format_recent_bets(rows: list[dict], currency: str, lang: str) -> list[str]:
+    if not rows:
+        return ["No recent bets." if lang == "en" else "暂无最近注单。"]
+    lines = []
+    for index, row in enumerate(rows, 1):
+        bet_key = row.get("bet_no") or row.get("id")
+        if lang == "en":
+            lines.append(
+                f"{index}. {bet_key} | {row.get('status') or '-'} | stake {_money(row.get('stake'))} {currency} | "
+                f"payout {_money(row.get('payout') or row.get('potential_payout'))} {currency}"
+            )
+        else:
+            lines.append(
+                f"{index}. {bet_key} | {row.get('status') or '-'} | stake {_money(row.get('stake'))} {currency} | "
+                f"payout {_money(row.get('payout') or row.get('potential_payout'))} {currency}"
+            )
+    return lines
 
 
 def _format_rebate_rules(rows: list[dict]) -> str:

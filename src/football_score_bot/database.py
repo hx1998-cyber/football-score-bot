@@ -1254,7 +1254,7 @@ class Database:
     async def list_pending_withdrawals(self, limit: int = 10) -> list[dict]:
         rows = await self._pool.fetch(
             """
-            SELECT id, user_id, amount, network, address, status, created_at
+            SELECT id, user_id, amount, fee_amount, net_amount, network, address, status, created_at
             FROM withdraw_requests
             WHERE status = 'pending'
             ORDER BY created_at DESC
@@ -1267,7 +1267,7 @@ class Database:
     async def get_withdraw_review_context(self, withdraw_id: int) -> dict | None:
         withdraw = await self._pool.fetchrow(
             """
-            SELECT id, user_id, amount, network, address, status, admin_id, admin_note,
+            SELECT id, user_id, amount, fee_amount, net_amount, network, address, status, admin_id, admin_note,
                    created_at, reviewed_at, paid_at
             FROM withdraw_requests
             WHERE id = $1
@@ -1297,14 +1297,23 @@ class Database:
             """,
             user_id,
         )
-        ledger_summary = await self._pool.fetchrow(
+        deposit_summary = await self._pool.fetchrow(
             """
             SELECT
-                COALESCE(SUM(amount) FILTER (WHERE type IN ('deposit', 'deposit_manual')), 0) AS total_deposit,
-                COALESCE((SELECT SUM(amount) FROM withdraw_requests WHERE user_id = $1), 0) AS total_withdraw_request,
-                COALESCE(SUM(amount) FILTER (WHERE type = 'manual_adjust'), 0) AS total_manual_adjust,
-                COUNT(*) AS ledger_count
-            FROM wallet_ledger
+                COALESCE(SUM(COALESCE(actual_amount, amount_requested)), 0) AS total_deposit,
+                COUNT(*) FILTER (WHERE status = 'paid') AS paid_deposit_count
+            FROM deposit_orders
+            WHERE user_id = $1 AND status = 'paid'
+            """,
+            user_id,
+        )
+        withdraw_summary = await self._pool.fetchrow(
+            """
+            SELECT
+                COALESCE(SUM(amount), 0) AS total_withdraw_request,
+                COALESCE(SUM(amount) FILTER (WHERE status = 'paid'), 0) AS total_paid_withdraw,
+                COUNT(*) AS withdraw_count
+            FROM withdraw_requests
             WHERE user_id = $1
             """,
             user_id,
@@ -1314,9 +1323,11 @@ class Database:
             SELECT
                 COALESCE(SUM(stake), 0) AS total_stake,
                 COUNT(*) AS bet_count,
+                COUNT(*) FILTER (WHERE status IN ('pending', 'manual_required')) AS pending_count,
                 COUNT(*) FILTER (WHERE status = 'won') AS won_count,
                 COUNT(*) FILTER (WHERE status = 'lost') AS lost_count,
                 COUNT(*) FILTER (WHERE status IN ('void', 'cancelled')) AS void_count,
+                COALESCE(SUM(stake) FILTER (WHERE status IN ('won', 'lost')), 0) AS settled_valid_stake,
                 COALESCE(SUM(payout), 0) AS total_payout
             FROM bets
             WHERE COALESCE(user_id, telegram_user_id) = $1
@@ -1348,11 +1359,72 @@ class Database:
             "withdraw": dict(withdraw),
             "user": dict(user) if user else {},
             "wallet": dict(wallet) if wallet else {},
-            "ledger_summary": dict(ledger_summary) if ledger_summary else {},
+            "deposit_summary": dict(deposit_summary) if deposit_summary else {},
+            "withdraw_summary": dict(withdraw_summary) if withdraw_summary else {},
             "bet_summary": dict(bet_summary) if bet_summary else {},
             "recent_ledgers": [dict(row) for row in recent_ledgers],
             "recent_bets": [dict(row) for row in recent_bets],
         }
+
+    async def get_registered_players_summary(self) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            SELECT
+                COUNT(*) AS total_users,
+                COUNT(*) FILTER (
+                    WHERE COALESCE((
+                        SELECT SUM(COALESCE(d.actual_amount, d.amount_requested))
+                        FROM deposit_orders d
+                        WHERE d.user_id = u.telegram_user_id AND d.status = 'paid'
+                    ), 0) > 0
+                ) AS users_with_deposits,
+                COALESCE((
+                    SELECT SUM(COALESCE(actual_amount, amount_requested))
+                    FROM deposit_orders
+                    WHERE status = 'paid'
+                ), 0) AS total_deposit_amount
+            FROM users u
+            """
+        )
+        return dict(row) if row else {"total_users": 0, "users_with_deposits": 0, "total_deposit_amount": Decimal("0")}
+
+    async def list_registered_players(self, page: int = 0, limit: int = 10) -> list[dict]:
+        offset = max(page, 0) * max(limit, 1)
+        rows = await self._pool.fetch(
+            """
+            SELECT
+                u.telegram_user_id,
+                u.username,
+                u.first_name,
+                u.last_name,
+                u.created_at,
+                COALESCE(w.balance, 0) AS balance,
+                COALESCE(w.frozen_balance, 0) AS frozen_balance,
+                COALESCE((
+                    SELECT SUM(COALESCE(d.actual_amount, d.amount_requested))
+                    FROM deposit_orders d
+                    WHERE d.user_id = u.telegram_user_id AND d.status = 'paid'
+                ), 0) AS total_deposit,
+                COALESCE((
+                    SELECT SUM(b.stake)
+                    FROM bets b
+                    WHERE COALESCE(b.user_id, b.telegram_user_id) = u.telegram_user_id
+                      AND b.status IN ('pending', 'manual_required', 'won', 'lost')
+                ), 0) AS total_bets,
+                COALESCE((
+                    SELECT SUM(wr.amount)
+                    FROM withdraw_requests wr
+                    WHERE wr.user_id = u.telegram_user_id
+                ), 0) AS total_withdrawals
+            FROM users u
+            LEFT JOIN wallets w ON w.user_id = u.telegram_user_id AND w.currency = 'USDT'
+            ORDER BY u.created_at DESC, u.telegram_user_id DESC
+            LIMIT $1 OFFSET $2
+            """,
+            limit,
+            offset,
+        )
+        return [dict(row) for row in rows]
 
     async def list_rebate_rules(self) -> list[dict]:
         rows = await self._pool.fetch("SELECT * FROM rebate_rules ORDER BY mode, min_turnover, min_active_referrals, id")
