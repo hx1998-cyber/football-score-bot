@@ -247,6 +247,8 @@ class Database:
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL,
                 amount NUMERIC(18, 6) NOT NULL,
+                fee_amount NUMERIC(18, 6) NOT NULL DEFAULT 0,
+                net_amount NUMERIC(18, 6) NOT NULL DEFAULT 0,
                 address TEXT,
                 network TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
@@ -263,6 +265,8 @@ class Database:
             "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS admin_note TEXT",
             "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS reviewed_at TIMESTAMPTZ",
             "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
+            "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS fee_amount NUMERIC(18, 6) NOT NULL DEFAULT 0",
+            "ALTER TABLE withdraw_requests ADD COLUMN IF NOT EXISTS net_amount NUMERIC(18, 6) NOT NULL DEFAULT 0",
         ):
             await self._pool.execute(statement)
         await self._pool.execute(
