@@ -380,7 +380,7 @@ def build_router(
         page_options = options[page * per_page : (page + 1) * per_page]
         await callback.message.answer(
             _format_worldcup_futures(options, page=page, per_page=per_page, lang=lang),
-            reply_markup=futures_market_keyboard(WORLD_CUP_CHAMPION_MARKET_KEY, page_options, page, total_pages)
+            reply_markup=futures_market_keyboard(WORLD_CUP_CHAMPION_MARKET_KEY, page_options, page, total_pages, lang)
             if options
             else futures_back_keyboard(lang),
         )
@@ -451,7 +451,7 @@ def build_router(
         page_options = options[page * per_page : (page + 1) * per_page]
         await callback.message.answer(
             format_futures_market(market_key, options, page=page, per_page=per_page),
-            reply_markup=futures_market_keyboard(market_key, page_options, page, total_pages)
+            reply_markup=futures_market_keyboard(market_key, page_options, page, total_pages, lang)
             if options
             else futures_back_keyboard(lang),
         )
@@ -796,6 +796,7 @@ def build_router(
                 "pending",
                 0,
                 fixture_id=fixture_id,
+                lang=lang,
             ),
         )
         return
@@ -959,7 +960,7 @@ def build_router(
         await state.clear()
         await state.set_state(RechargeStates.choosing_amount)
         lang = await _callback_lang(callback, database, settings)
-        await callback.message.answer("Please enter deposit amount" if lang == "en" else "请输入充值金额", reply_markup=_recharge_amount_keyboard())
+        await callback.message.answer("Please enter deposit amount" if lang == "en" else "请输入充值金额", reply_markup=_recharge_amount_keyboard(lang))
 
     @router.callback_query(F.data.startswith("wallet:amount:"))
     async def wallet_recharge_amount(callback: CallbackQuery, state: FSMContext) -> None:
@@ -974,14 +975,14 @@ def build_router(
                 f"Please enter deposit amount. Min {_money(settings.min_recharge_amount)} USDT, max {_money(settings.max_recharge_amount)} USDT."
                 if lang == "en"
                 else f"请输入充值金额，最低 {_money(settings.min_recharge_amount)} USDT，最高 {_money(settings.max_recharge_amount)} USDT。",
-                reply_markup=_cancel_keyboard("wallet"),
+                reply_markup=_cancel_keyboard("wallet", lang),
             )
             return
         await state.update_data(amount=str(_validated_amount(raw_amount, settings.min_recharge_amount, settings.max_recharge_amount)))
         await state.set_state(RechargeStates.confirming_recharge)
         await callback.message.answer(
             _format_recharge_confirm(await state.get_data(), settings, await _callback_lang(callback, database, settings)),
-            reply_markup=_recharge_confirm_keyboard(),
+            reply_markup=_recharge_confirm_keyboard(await _callback_lang(callback, database, settings)),
         )
 
     @router.message(RechargeStates.waiting_custom_amount, ~F.text.startswith("/"))
@@ -992,13 +993,13 @@ def build_router(
         try:
             amount = _validated_amount(message.text or "", settings.min_recharge_amount, settings.max_recharge_amount)
         except ValueError as exc:
-            await message.answer(f"{exc}\n请重新输入充值金额，或点击取消。", reply_markup=_cancel_keyboard("wallet"))
+            await message.answer(f"{exc}\n请重新输入充值金额，或点击取消。", reply_markup=_cancel_keyboard("wallet", await _event_lang(message, database, settings)))
             return
         await state.update_data(amount=str(amount))
         await state.set_state(RechargeStates.confirming_recharge)
         await message.answer(
             _format_recharge_confirm(await state.get_data(), settings, await _event_lang(message, database, settings)),
-            reply_markup=_recharge_confirm_keyboard(),
+            reply_markup=_recharge_confirm_keyboard(await _event_lang(message, database, settings)),
         )
 
     @router.callback_query(F.data == "recharge:confirm")
@@ -1011,7 +1012,7 @@ def build_router(
             amount = _validated_amount(str(data.get("amount") or ""), settings.min_recharge_amount, settings.max_recharge_amount)
         except ValueError:
             await state.clear()
-            await callback.message.answer("充值金额已失效，请重新选择。", reply_markup=_wallet_keyboard())
+            await callback.message.answer("充值金额已失效，请重新选择。", reply_markup=_wallet_keyboard(await _callback_lang(callback, database, settings)))
             return
         await _create_recharge_order(
             callback.message,
@@ -1028,7 +1029,7 @@ def build_router(
     async def recharge_reselect_amount(callback: CallbackQuery, state: FSMContext) -> None:
         await _safe_callback_answer(callback)
         await state.set_state(RechargeStates.choosing_amount)
-        await callback.message.answer("请选择充值金额：", reply_markup=_recharge_amount_keyboard())
+        await callback.message.answer("Please enter deposit amount" if await _callback_lang(callback, database, settings) == "en" else "请选择充值金额：", reply_markup=_recharge_amount_keyboard(await _callback_lang(callback, database, settings)))
 
     @router.message(Command("recharge"))
     async def recharge_custom(message: Message, command: CommandObject) -> None:
@@ -1046,13 +1047,13 @@ def build_router(
     async def wallet_records(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
         rows = await database.list_user_deposit_orders(callback.from_user.id, 10)
-        await callback.message.answer(_format_deposit_records(rows), reply_markup=_wallet_keyboard())
+        await callback.message.answer(_format_deposit_records(rows), reply_markup=_wallet_keyboard(await _callback_lang(callback, database, settings)))
 
     @router.callback_query(F.data == "wallet:ledger")
     async def wallet_ledger(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
         rows = await database.list_user_ledger(callback.from_user.id, 10)
-        await callback.message.answer(_format_ledger(rows), reply_markup=_wallet_keyboard())
+        await callback.message.answer(_format_ledger(rows), reply_markup=_wallet_keyboard(await _callback_lang(callback, database, settings)))
 
     @router.callback_query(F.data == "wallet:withdraw_prompt")
     async def wallet_withdraw_prompt(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1067,7 +1068,7 @@ def build_router(
             f"Please enter withdrawal amount. Min {_money(settings.min_withdraw_amount)} {settings.wallet_currency}."
             if lang == "en"
             else f"请输入提现金额，最低 {_money(settings.min_withdraw_amount)} {settings.wallet_currency}。",
-            reply_markup=_cancel_keyboard("wallet"),
+            reply_markup=_cancel_keyboard("wallet", lang),
         )
 
     @router.message(WithdrawStates.waiting_amount, ~F.text.startswith("/"))
@@ -1078,11 +1079,12 @@ def build_router(
         try:
             amount = _validated_amount(message.text or "", settings.min_withdraw_amount, Decimal("999999999"))
         except ValueError as exc:
-            await message.answer(f"{exc}\n请重新输入提现金额，或点击取消。", reply_markup=_cancel_keyboard("wallet"))
+            await message.answer(f"{exc}\n请重新输入提现金额，或点击取消。", reply_markup=_cancel_keyboard("wallet", await _event_lang(message, database, settings)))
             return
         await state.update_data(amount=str(amount))
         await state.set_state(WithdrawStates.waiting_network)
-        await message.answer("请选择提现网络：", reply_markup=_network_keyboard("withdraw_network"))
+        lang = await _event_lang(message, database, settings)
+        await message.answer("Please select withdrawal network" if lang == "en" else "请选择提现网络：", reply_markup=_network_keyboard("withdraw_network", lang))
 
     @router.callback_query(F.data.startswith("withdraw_network:"))
     async def withdraw_network(callback: CallbackQuery, state: FSMContext) -> None:
@@ -1090,12 +1092,12 @@ def build_router(
         network = callback.data.split(":", 1)[1]
         if network == "cancel":
             await state.clear()
-            await callback.message.answer("已取消提现申请。", reply_markup=_wallet_keyboard())
+            await callback.message.answer("已取消提现申请。", reply_markup=_wallet_keyboard(await _callback_lang(callback, database, settings)))
             return
         await state.update_data(network=network)
         await state.set_state(WithdrawStates.waiting_address)
         lang = await _callback_lang(callback, database, settings)
-        await callback.message.answer("Please enter withdrawal address" if lang == "en" else "请输入提现地址", reply_markup=_cancel_keyboard("wallet"))
+        await callback.message.answer("Please enter withdrawal address" if lang == "en" else "请输入提现地址", reply_markup=_cancel_keyboard("wallet", lang))
 
     @router.message(WithdrawStates.waiting_address, ~F.text.startswith("/"))
     async def withdraw_address_input(message: Message, state: FSMContext) -> None:
@@ -1104,13 +1106,13 @@ def build_router(
             return
         address = (message.text or "").strip()
         if len(address) < 10:
-            await message.answer("地址格式看起来不完整，请重新输入。", reply_markup=_cancel_keyboard("wallet"))
+            await message.answer("地址格式看起来不完整，请重新输入。", reply_markup=_cancel_keyboard("wallet", await _event_lang(message, database, settings)))
             return
         await state.update_data(address=address)
         await state.set_state(WithdrawStates.confirming_withdraw)
         await message.answer(
             _format_withdraw_confirm(await state.get_data(), settings.wallet_currency, await _event_lang(message, database, settings)),
-            reply_markup=_withdraw_confirm_keyboard(),
+            reply_markup=_withdraw_confirm_keyboard(await _event_lang(message, database, settings)),
         )
 
     @router.callback_query(F.data == "withdraw:confirm")
@@ -1142,7 +1144,7 @@ def build_router(
     @router.callback_query(F.data == "wallet:withdraw")
     async def wallet_withdraw(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
-        await callback.message.answer("提现功能暂未自动开放。\n如需提现，请联系客服或等待管理员审核系统上线。")
+        await callback.message.answer("提现功能暂未自动开放，请等待管理员审核系统上线。")
 
     @router.message(Command("withdraw"))
     async def withdraw_request(message: Message, command: CommandObject) -> None:
@@ -1223,33 +1225,42 @@ def build_router(
         if not bet:
             await callback.message.answer("注单不存在。")
             return
+        lang = await _callback_lang(callback, database, settings)
         await callback.message.answer(
-            _format_bet_detail(bet, settings.wallet_currency),
+            _format_bet_detail(bet, settings.wallet_currency, lang),
             reply_markup=_bet_action_keyboard(
                 str(bet.get("bet_no") or bet.get("id")),
                 str(bet.get("status")),
                 status_group,
                 page,
                 fixture_id=int(bet["fixture_id"]) if bet.get("fixture_id") else None,
+                lang=lang,
             ),
         )
 
     @router.callback_query(F.data.startswith("bet_cancel:"))
     async def bet_cancel(callback: CallbackQuery) -> None:
-        await _safe_callback_answer(callback)
         if not callback.from_user:
             return
+        lang = await _callback_lang(callback, database, settings)
+        await callback.answer(
+            "Bets are final after confirmation. Cancellation is not supported."
+            if lang == "en"
+            else "下注确认后买定离手，暂不支持退单。",
+            show_alert=True,
+        )
+        return
         bet_key = _clean_command_token(callback.data.split(":", 1)[1])
         bet = await database.get_user_bet(callback.from_user.id, bet_key)
         if not bet:
             await callback.message.answer("注单不存在。")
             return
         if bet.get("status") != "pending":
-            await callback.message.answer("该注单已开奖或已处理，不能申请退单。")
+            await callback.message.answer("下注确认后买定离手，暂不支持取消。")
             return
         start_time = bet.get("fixture_start_time")
         if isinstance(start_time, datetime) and datetime.now(start_time.tzinfo) >= start_time - timedelta(minutes=settings.bet_cancel_before_start_minutes):
-            await callback.message.answer("当前已超过可申请退单时间，如有争议请联系人工客服。")
+            await callback.message.answer("下注确认后买定离手，暂不支持取消。")
             return
         request = await database.create_cancel_request(callback.from_user.id, int(bet["id"]), "user_request")
         await database.add_admin_audit_log(
@@ -1300,12 +1311,14 @@ def build_router(
         if result.get("settled"):
             fresh = await database.get_user_bet(callback.from_user.id, bet_key)
             detail = fresh or bet
+            lang = await _callback_lang(callback, database, settings)
             await callback.message.answer(
-                _format_bet_detail(detail, settings.wallet_currency),
+                _format_bet_detail(detail, settings.wallet_currency, lang),
                 reply_markup=_bet_action_keyboard(
                     str(detail.get("bet_no") or detail.get("id")),
                     str(detail.get("status")),
                     fixture_id=int(detail["fixture_id"]) if detail.get("fixture_id") else None,
+                    lang=lang,
                 ),
             )
         elif result.get("reason") == "not_final":
@@ -1317,7 +1330,7 @@ def build_router(
 
     @router.message(F.text.in_(_translated_texts("referrals") | MENU_REFERRALS_TEXTS))
     @router.message(Command("referrals"))
-    @router.callback_query(F.data.in_({"referrals", "menu:referrals", "nav:referrals"}))
+    @router.callback_query(F.data.in_({"referral", "referrals", "menu:referrals", "nav:referrals"}))
     async def referrals(event: Message | CallbackQuery) -> None:
         await _answer_callback(event)
         message = _message(event)
@@ -1331,9 +1344,10 @@ def build_router(
         summary = await database.get_referral_summary(user.id)
         role = await permission_service.get_user_role(user.id)
         application = await database.get_latest_agent_application(user.id)
+        lang = await _event_lang(event, database, settings)
         await message.answer(
-            _format_referrals(link, summary, settings.wallet_currency, role, application),
-            reply_markup=_referral_keyboard(role, application),
+            _format_referrals(link, summary, settings.wallet_currency, role, application, lang),
+            reply_markup=_referral_keyboard(role, application, lang),
         )
 
     @router.callback_query(F.data == "referrals:children")
@@ -2949,7 +2963,7 @@ def build_router(
     @router.callback_query(F.data == "support")
     async def support_callback(callback: CallbackQuery) -> None:
         await _safe_callback_answer(callback)
-        await callback.message.answer("请从注单详情点击“申请退单/联系客服”，系统会按注单状态和开赛时间判断是否可提交退单申请。")
+        await callback.message.answer("该入口已停用。下注确认后买定离手，暂不支持取消。")
 
     @router.callback_query()
     async def unknown_callback(callback: CallbackQuery) -> None:
@@ -4527,7 +4541,6 @@ def _bet_action_keyboard(
     rows = []
     if status in {"pending", "manual_required"}:
         rows.append([InlineKeyboardButton(text="查看开奖", callback_data=f"bet_settle:{bet_id_or_no}")])
-        rows.append([InlineKeyboardButton(text="申请退单/联系客服", callback_data=f"bet_cancel:{bet_id_or_no}")])
     if fixture_id is not None:
         rows.append([InlineKeyboardButton(text="返回赛事", callback_data=f"fixture:{fixture_id}")])
     else:
@@ -5109,3 +5122,386 @@ async def _start_text(
         f"其中测试单：{simulated_pending} 张\n"
         f"{_bet_mode_notice(settings)}"
     )
+def _localized_bet_value(value: Any, lang: str, kind: str = "generic") -> str:
+    text = str(value or "-")
+    if lang != "en":
+        return text
+    market_map = {
+        "胜平负": "1X2",
+        "冠军": "Champion",
+        "match_winner": "1X2",
+        "world_cup_winner": "Champion",
+    }
+    selection_map = {
+        "主胜": "Home Win",
+        "平局": "Draw",
+        "客胜": "Away Win",
+        "冠军": "Champion",
+        "Home": "Home Win",
+        "Draw": "Draw",
+        "Away": "Away Win",
+    }
+    mapping = market_map if kind == "market" else selection_map if kind == "selection" else {}
+    return mapping.get(text, text)
+
+
+def _bet_status_label(status: str, lang: str = "zh") -> str:
+    if lang == "en":
+        return {
+            "pending": "Pending",
+            "manual_required": "Pending",
+            "won": "Won",
+            "lost": "Lost",
+            "void": "Void",
+            "cancelled": "Void",
+            "approved": "Approved",
+            "rejected": "Rejected",
+        }.get(status, status or "-")
+    return {
+        "pending": "待开奖",
+        "manual_required": "待开奖",
+        "won": "中奖",
+        "lost": "未中奖",
+        "void": "作废",
+        "cancelled": "作废",
+        "approved": "已通过",
+        "rejected": "已拒绝",
+    }.get(status, status or "-")
+
+
+def _format_bets_page(rows: list[dict], stats: dict, status_group: str, settings: Settings, lang: str = "zh") -> str:
+    pending_count = int(stats.get("pending_count") or 0)
+    manual_required_count = int(stats.get("manual_required_count") or 0)
+    settled_count = int(stats.get("settled_count") or 0)
+    if lang == "en":
+        lines = [
+            "📊 My Bets",
+            "",
+            f"Pending: {pending_count + manual_required_count}",
+            f"Settled: {settled_count}",
+            _bet_mode_notice(settings, lang),
+            "",
+        ]
+        if not rows:
+            lines.append("No bets yet.")
+            return "\n".join(lines)
+        for index, bet in enumerate(rows, 1):
+            lines.append(
+                f"{index}. {bet.get('bet_no') or bet.get('id')} | {bet.get('fixture_label') or '-'} | "
+                f"{_money(bet.get('stake'))} {settings.wallet_currency} | {_bet_status_label(str(bet.get('status')), lang)}"
+            )
+        return "\n".join(lines)
+    lines = [
+        "📊 我的注单",
+        "",
+        f"待开奖：{pending_count + manual_required_count} 张",
+        f"已开奖：{settled_count} 张",
+        _bet_mode_notice(settings, lang),
+        "",
+    ]
+    if not rows:
+        lines.append("暂无注单。")
+        return "\n".join(lines)
+    for index, bet in enumerate(rows, 1):
+        lines.append(
+            f"{index}. {bet.get('bet_no') or bet.get('id')} | {bet.get('fixture_label') or '-'} | "
+            f"{_money(bet.get('stake'))} {settings.wallet_currency} | {_bet_status_label(str(bet.get('status')), lang)}"
+        )
+    return "\n".join(lines)
+
+
+def _bet_action_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_settle:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="Back to My Bets" if lang == "en" else "返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_bet_detail(bet: dict, currency: str, lang: str = "zh") -> str:
+    status = str(bet.get("status") or "")
+    opened = status in {"won", "lost", "void", "cancelled"}
+    if lang == "en":
+        lines = [
+            "🧾 Bet Detail",
+            "",
+            f"Bet No: {bet.get('bet_no') or bet.get('id')}",
+            f"Match: {bet.get('fixture_label') or '-'}",
+            f"Market: {_localized_bet_value(bet.get('market_title') or bet.get('market_key') or '-', lang, 'market')}",
+            f"Selection: {_localized_bet_value(bet.get('selection') or '-', lang, 'selection')}",
+        ]
+        if opened and bet.get("result_score"):
+            lines.append(f"Result: {bet.get('result_score')}")
+        lines.extend(
+            [
+                f"Amount: {_money(bet.get('stake'))} {currency}",
+                f"Odds: {bet.get('odds') or '-'}",
+                f"Estimated Payout: {_money(bet.get('potential_payout'))} {currency}",
+            ]
+        )
+        if opened:
+            lines.append(f"Payout: {_money(bet.get('payout'))} {currency}")
+        lines.append(f"Status: {_bet_status_label(status, lang)}")
+        if bet.get("settled_at"):
+            lines.append(f"Settlement Time: {bet.get('settled_at')}")
+        if bet.get("settlement_note"):
+            lines.append(f"Note: {bet.get('settlement_note')}")
+        return "\n".join(lines)
+    lines = [
+        "🧾 注单详情",
+        "",
+        f"注单号：{bet.get('bet_no') or bet.get('id')}",
+        f"比赛：{bet.get('fixture_label') or '-'}",
+        f"玩法：{bet.get('market_title') or bet.get('market_key') or '-'}",
+        f"选择：{bet.get('selection') or '-'}",
+    ]
+    if opened and bet.get("result_score"):
+        lines.append(f"赛果：{bet.get('result_score')}")
+    lines.extend(
+        [
+            f"金额：{_money(bet.get('stake'))} {currency}",
+            f"赔率：{bet.get('odds') or '-'}",
+            f"预计派彩：{_money(bet.get('potential_payout'))} {currency}",
+        ]
+    )
+    if opened:
+        lines.append(f"派彩：{_money(bet.get('payout'))} {currency}")
+    lines.append(f"状态：{_bet_status_label(status, lang)}")
+    return "\n".join(lines)
+
+
+def _referral_keyboard(role: str = "user", application: dict | None = None, lang: str = "zh") -> InlineKeyboardMarkup:
+    if lang == "en":
+        rows = [
+            [
+                InlineKeyboardButton(text="Subordinates", callback_data="referrals:children"),
+                InlineKeyboardButton(text="Reward Records", callback_data="referrals:commissions"),
+            ]
+        ]
+        if role in {"agent", "admin", "super_admin"}:
+            rows.append([InlineKeyboardButton(text="My Consumption", callback_data="referrals:sub_bets")])
+            rows.append([InlineKeyboardButton(text="Apply Rebate", callback_data="referrals:rebate_apply")])
+        rows.extend(
+            [
+                [InlineKeyboardButton(text="Copy Referral Link", callback_data="referrals:copy")],
+                [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+            ]
+        )
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+    rows = [
+        [
+            InlineKeyboardButton(text="下级管理", callback_data="referrals:children"),
+            InlineKeyboardButton(text="返佣记录", callback_data="referrals:commissions"),
+        ],
+        [InlineKeyboardButton(text="返水管理", callback_data="referrals:rebate_apply")],
+    ]
+    if role in {"agent", "admin", "super_admin"}:
+        rows.append([InlineKeyboardButton(text="下级投注", callback_data="referrals:sub_bets")])
+    else:
+        status = str((application or {}).get("status") or "")
+        if status == "pending":
+            rows.append([InlineKeyboardButton(text="代理申请审核中", callback_data="referrals:agent_pending")])
+        else:
+            rows.append([InlineKeyboardButton(text="申请成为代理", callback_data="referrals:agent_apply")])
+    rows.extend(
+        [
+            [InlineKeyboardButton(text="复制邀请链接", callback_data="referrals:copy")],
+            [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _format_referrals(
+    link: str,
+    summary: dict,
+    currency: str,
+    role: str = "user",
+    application: dict | None = None,
+    lang: str = "zh",
+) -> str:
+    if lang == "en":
+        return "\n".join(
+            [
+                "👥 Referral",
+                f"Current Role: {_role_label_en(role)}",
+                "My referral link:",
+                link,
+                "",
+                f"Direct referrals: {summary.get('direct_count') or 0}",
+                f"Qualified referrals: {summary.get('active_count') or 0}",
+                f"Total rewards: {_money(summary.get('settled_commission'))} {currency}",
+                f"Pending rewards: {_money(summary.get('pending_commission'))} {currency}",
+            ]
+        )
+    return "\n".join(
+        [
+            "👥 推广邀请",
+            f"当前身份：{_role_label(role)}",
+            "我的邀请链接：",
+            link,
+            "",
+            f"直属下级：{summary.get('direct_count') or 0}",
+            f"有效下级：{summary.get('active_count') or 0}",
+            f"累计返佣：{_money(summary.get('settled_commission'))} {currency}",
+            f"待结算返佣：{_money(summary.get('pending_commission'))} {currency}",
+        ]
+    )
+
+
+def _role_label_en(role: str) -> str:
+    return {
+        "super_admin": "Super Admin",
+        "admin": "Admin",
+        "agent": "Agent",
+    }.get(role, "User")
+
+
+async def _send_bets_page(
+    message: Message,
+    user_id: int,
+    status_group: str,
+    page: int,
+    database: Database,
+    settings: Settings,
+) -> None:
+    page = max(page, 0)
+    per_page = 5
+    lang = normalize_language(await database.get_user_language(user_id, settings.default_language), settings.default_language)
+    stats = await database.get_user_bet_stats(user_id)
+    rows = await database.list_user_bets(user_id, status_group=status_group, limit=per_page, offset=page * per_page)
+    total = int(stats.get("settled_count") or 0) if status_group == "settled" else (
+        int(stats.get("pending_count") or 0) + int(stats.get("manual_required_count") or 0)
+    )
+    await message.answer(
+        _format_bets_page(rows, stats, status_group, settings, lang),
+        reply_markup=my_bets_keyboard(
+            rows,
+            status_group,
+            page,
+            has_prev=page > 0,
+            has_next=(page + 1) * per_page < total,
+            lang=lang,
+        ),
+    )
+
+
+def _bet_mode_notice(settings: Settings, lang: str = "zh") -> str:
+    if lang == "en":
+        if settings.real_betting_enabled:
+            return "Real betting mode: your stake is frozen after placing a bet, and payouts are released after settlement."
+        if settings.bet_require_balance_for_simulation:
+            return "Test betting mode: wallet balance must cover the stake, but no real debit is made."
+        return "Simulation mode: no balance check and no real debit."
+    if settings.real_betting_enabled:
+        return "真实下注模式：下注将冻结余额，开奖后自动派奖。"
+    if settings.bet_require_balance_for_simulation:
+        return "测试下注模式：钱包余额需覆盖下注金额，但不会真实扣款。"
+    return "模拟下注模式：不校验余额，不扣真实余额。"
+
+
+def _network_keyboard(prefix: str, lang: str = "zh") -> InlineKeyboardMarkup:
+    networks = [
+        ("TRON / TRC20", "tron"),
+        ("Polygon", "polygon"),
+        ("BSC", "bsc"),
+        ("Arbitrum", "arbitrum"),
+        ("Ethereum", "ethereum"),
+    ]
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"{prefix}:{value}")] for label, value in networks]
+    rows.append([InlineKeyboardButton(text=t(lang, "cancel"), callback_data=f"{prefix}:cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _cancel_keyboard(target: str, lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(lang, "cancel"), callback_data=f"fsm_cancel:{target}")]])
+
+
+def _recharge_confirm_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Create Deposit Order" if lang == "en" else "确认创建订单", callback_data="recharge:confirm")],
+            [InlineKeyboardButton(text="Change Amount" if lang == "en" else "重新选择金额", callback_data="recharge:amounts")],
+            [InlineKeyboardButton(text=t(lang, "cancel"), callback_data="fsm_cancel:wallet")],
+        ]
+    )
+
+
+def _withdraw_confirm_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Submit Request" if lang == "en" else "提交申请", callback_data="withdraw:confirm")],
+            [InlineKeyboardButton(text=t(lang, "cancel"), callback_data="fsm_cancel:wallet")],
+        ]
+    )
+
+
+def _recharge_amount_keyboard(lang: str = "zh") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="2 USDT", callback_data="wallet:amount:2"),
+                InlineKeyboardButton(text="5 USDT", callback_data="wallet:amount:5"),
+            ],
+            [
+                InlineKeyboardButton(text="10 USDT", callback_data="wallet:amount:10"),
+                InlineKeyboardButton(text="20 USDT", callback_data="wallet:amount:20"),
+            ],
+            [
+                InlineKeyboardButton(text="50 USDT", callback_data="wallet:amount:50"),
+                InlineKeyboardButton(text="100 USDT", callback_data="wallet:amount:100"),
+            ],
+            [InlineKeyboardButton(text="Custom Amount" if lang == "en" else "自定义金额", callback_data="wallet:amount:custom")],
+            [InlineKeyboardButton(text="Back to Wallet" if lang == "en" else "返回钱包", callback_data="wallet")],
+        ]
+    )
+
+
+def _format_bet_created(bet: dict, currency: str, lang: str = "zh") -> str:
+    if lang == "en":
+        return (
+            "🧾 Bet Created\n\n"
+            f"Bet No: {bet.get('bet_no') or bet.get('id')}\n"
+            f"Match: {bet.get('fixture_label') or '-'}\n"
+            f"Market: {_localized_bet_value(bet.get('market_title') or bet.get('market_key') or '-', lang, 'market')}\n"
+            f"Selection: {_localized_bet_value(bet.get('selection') or '-', lang, 'selection')}\n"
+            f"Amount: {_money(bet.get('stake'))} {currency}\n"
+            f"Odds: {bet.get('odds') or '-'}\n"
+            f"Estimated Payout: {_money(bet.get('potential_payout'))} {currency}\n"
+            "Status: Pending"
+        )
+    return (
+        "🧾 注单已创建\n\n"
+        f"注单号：{bet.get('bet_no') or bet.get('id')}\n"
+        f"比赛：{bet.get('fixture_label') or '-'}\n"
+        f"玩法：{bet.get('market_title') or bet.get('market_key') or '-'}\n"
+        f"选择：{bet.get('selection') or '-'}\n"
+        f"金额：{_money(bet.get('stake'))} {currency}\n"
+        f"赔率：{bet.get('odds') or '-'}\n"
+        f"预计派彩：{_money(bet.get('potential_payout'))} {currency}\n"
+        "状态：待开奖"
+    )
+
+
+def _format_worldcup_futures(options: list[dict[str, Any]], page: int = 0, per_page: int = 8, lang: str = "zh") -> str:
+    visible = options[page * per_page : (page + 1) * per_page]
+    lines = ["🏆 2026 World Cup Champion Futures" if lang == "en" else "🏆 2026 世界杯冠军预测", ""]
+    for option in visible:
+        lines.append(f"{_worldcup_option_label(option, lang)} @ {_money(option.get('odds'))}")
+    total_pages = max((len(options) - 1) // per_page + 1, 1)
+    if total_pages > 1:
+        lines.append("")
+        lines.append(t(lang, "page", page=page + 1, total=total_pages))
+    return "\n".join(lines)

@@ -74,13 +74,22 @@ def futures_market_keyboard(
     options: list[dict],
     page: int,
     total_pages: int,
+    lang: str = "zh",
 ) -> InlineKeyboardMarkup:
     rows = []
     row = []
     for option in options:
+        label = str(option.get("label") or "-")
+        if lang == "en":
+            metadata = option.get("metadata_json") or {}
+            if isinstance(metadata, dict):
+                label = str(metadata.get("team") or option.get("option_key") or label)
+            else:
+                label = str(option.get("option_key") or label)
+            label = label.replace("_", " ").title()
         row.append(
             InlineKeyboardButton(
-                text=f"{option['label']} {float(option['odds']):.2f}"[:32],
+                text=f"{label} {float(option['odds']):.2f}"[:32],
                 callback_data=f"futures:option:{option['option_id']}",
             )
         )
@@ -92,12 +101,12 @@ def futures_market_keyboard(
     nav = []
     page_prefix = "worldcup:futures" if market_key == WORLD_CUP_CHAMPION_MARKET_KEY else f"futures:market:{market_key}:page"
     if page > 0:
-        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"{page_prefix}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"{page_prefix}:{page - 1}"))
     if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"{page_prefix}:{page + 1}"))
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"{page_prefix}:{page + 1}"))
     if nav:
         rows.append(nav)
-    rows.append([InlineKeyboardButton(text="返回世界杯专区", callback_data="worldcup")])
+    rows.append([InlineKeyboardButton(text=t(lang, "worldcup_back_home"), callback_data="worldcup")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -128,6 +137,191 @@ def bet_detail_keyboard(
     else:
         rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# EOF runtime-final public keyboard definitions.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def my_bets_keyboard(
+    bets: list[dict] | None = None,
+    status_group: str = "pending",
+    page: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Pending" if lang == "en" else "待开奖", callback_data="bets:pending:0"),
+            InlineKeyboardButton(text="Settled" if lang == "en" else "已开奖", callback_data="bets:settled:0"),
+        ]
+    ]
+    for bet in bets or []:
+        bet_key = str(bet.get("bet_no") or bet.get("id"))
+        rows.append([InlineKeyboardButton(text=f"{'Bet' if lang == 'en' else '注单'} {bet_key}", callback_data=f"bet_detail:{bet_key}:{status_group}:{page}")])
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"bets:{status_group}:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"bets:{status_group}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_detail_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_settle:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="Back to My Bets" if lang == "en" else "返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Runtime-final public keyboard definitions.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def my_bets_keyboard(
+    bets: list[dict] | None = None,
+    status_group: str = "pending",
+    page: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Pending" if lang == "en" else "待开奖", callback_data="bets:pending:0"),
+            InlineKeyboardButton(text="Settled" if lang == "en" else "已开奖", callback_data="bets:settled:0"),
+        ]
+    ]
+    for bet in bets or []:
+        bet_key = str(bet.get("bet_no") or bet.get("id"))
+        rows.append([InlineKeyboardButton(text=f"{'Bet' if lang == 'en' else '注单'} {bet_key}", callback_data=f"bet_detail:{bet_key}:{status_group}:{page}")])
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"bets:{status_group}:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"bets:{status_group}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_detail_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_settle:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="Back to My Bets" if lang == "en" else "返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# Active public keyboard definitions. Keep at EOF so older compatibility
+# definitions above cannot override the user-facing labels.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def my_bets_keyboard(
+    bets: list[dict] | None = None,
+    status_group: str = "pending",
+    page: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Pending" if lang == "en" else "待开奖", callback_data="bets:pending:0"),
+            InlineKeyboardButton(text="Settled" if lang == "en" else "已开奖", callback_data="bets:settled:0"),
+        ]
+    ]
+    for bet in bets or []:
+        bet_key = str(bet.get("bet_no") or bet.get("id"))
+        prefix = "Bet" if lang == "en" else "注单"
+        rows.append([InlineKeyboardButton(text=f"{prefix} {bet_key}", callback_data=f"bet_detail:{bet_key}:{status_group}:{page}")])
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"bets:{status_group}:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"bets:{status_group}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_detail_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_settle:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="Back to My Bets" if lang == "en" else "返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -666,9 +860,9 @@ def worldcup_schedule_keyboard(page: int, total_pages: int) -> InlineKeyboardMar
     rows = []
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"worldcup:schedule:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "prev_page"), callback_data=f"worldcup:schedule:{page - 1}"))
     if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"worldcup:schedule:{page + 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "next_page"), callback_data=f"worldcup:schedule:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="🎲 选择赛事投注", callback_data="worldcup:betting:0")])
@@ -688,9 +882,9 @@ def worldcup_betting_keyboard(fixtures: list[dict], page: int, total_pages: int)
             rows.append([InlineKeyboardButton(text=f"{index} {home} vs {away}"[:64], callback_data=f"fixture:{fixture_id}")])
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"worldcup:betting:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "prev_page"), callback_data=f"worldcup:betting:{page - 1}"))
     if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"worldcup:betting:{page + 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "next_page"), callback_data=f"worldcup:betting:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="返回世界杯首页", callback_data="worldcup")])
@@ -724,7 +918,7 @@ def futures_confirm_keyboard(option_id: int, market_key: str) -> InlineKeyboardM
 def futures_back_keyboard(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="返回世界杯专区", callback_data="worldcup")],
+            [InlineKeyboardButton(text=t("zh", "worldcup_back_home"), callback_data="worldcup")],
             [InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")],
         ]
     )
@@ -861,9 +1055,9 @@ def odds_market_keyboard(
             rows.append(row)
     nav = []
     if page > 0:
-        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "prev_page"), callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page - 1}"))
     if page + 1 < total_pages:
-        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page + 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "next_page"), callback_data=f"odds:fixture:{fixture_id}:market:{market_key}:page:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="返回比赛详情", callback_data=f"fixture:{fixture_id}")])
@@ -982,9 +1176,9 @@ def my_bets_keyboard(
         rows.append([InlineKeyboardButton(text=f"注单 {bet_key}", callback_data=f"bet_detail:{bet_key}:{status_group}:{page}")])
     nav = []
     if has_prev:
-        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"bets:{status_group}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "prev_page"), callback_data=f"bets:{status_group}:{page - 1}"))
     if has_next:
-        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"bets:{status_group}:{page + 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "next_page"), callback_data=f"bets:{status_group}:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
@@ -1158,9 +1352,9 @@ def my_bets_keyboard(
         rows.append([InlineKeyboardButton(text=f"注单 {bet_key}", callback_data=f"bet_detail:{bet_key}:{status_group}:{page}")])
     nav = []
     if has_prev:
-        nav.append(InlineKeyboardButton(text="上一页", callback_data=f"bets:{status_group}:{page - 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "prev_page"), callback_data=f"bets:{status_group}:{page - 1}"))
     if has_next:
-        nav.append(InlineKeyboardButton(text="下一页", callback_data=f"bets:{status_group}:{page + 1}"))
+        nav.append(InlineKeyboardButton(text=t("zh", "next_page"), callback_data=f"bets:{status_group}:{page + 1}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
@@ -1212,4 +1406,64 @@ def bet_detail_keyboard(
     else:
         rows.append([InlineKeyboardButton(text="返回我的注单", callback_data=f"bets:{status_group}:{page}")])
     rows.append([InlineKeyboardButton(text="返回首页", callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+# Runtime-final public keyboard definitions. Appended last intentionally.
+def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🎯 " + t(lang, "bettable_matches")), KeyboardButton(text="📊 " + t(lang, "my_bets"))],
+            [KeyboardButton(text="💰 " + t(lang, "wallet")), KeyboardButton(text="👥 " + t(lang, "referrals"))],
+            [KeyboardButton(text=t(lang, "worldcup")), KeyboardButton(text="🌐 " + t(lang, "language_settings"))],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder=t(lang, "start_title"),
+    )
+
+
+def my_bets_keyboard(
+    bets: list[dict] | None = None,
+    status_group: str = "pending",
+    page: int = 0,
+    has_prev: bool = False,
+    has_next: bool = False,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Pending" if lang == "en" else "待开奖", callback_data="bets:pending:0"),
+            InlineKeyboardButton(text="Settled" if lang == "en" else "已开奖", callback_data="bets:settled:0"),
+        ]
+    ]
+    for bet in bets or []:
+        bet_key = str(bet.get("bet_no") or bet.get("id"))
+        rows.append([InlineKeyboardButton(text=f"{'Bet' if lang == 'en' else '注单'} {bet_key}", callback_data=f"bet_detail:{bet_key}:{status_group}:{page}")])
+    nav = []
+    if has_prev:
+        nav.append(InlineKeyboardButton(text=t(lang, "prev_page"), callback_data=f"bets:{status_group}:{page - 1}"))
+    if has_next:
+        nav.append(InlineKeyboardButton(text=t(lang, "next_page"), callback_data=f"bets:{status_group}:{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def bet_detail_keyboard(
+    bet_id_or_no: str,
+    status: str,
+    status_group: str = "pending",
+    page: int = 0,
+    *,
+    fixture_id: int | None = None,
+    lang: str = "zh",
+) -> InlineKeyboardMarkup:
+    rows = []
+    if status in {"pending", "manual_required"}:
+        rows.append([InlineKeyboardButton(text=t(lang, "check_result"), callback_data=f"bet_settle:{bet_id_or_no}")])
+    if fixture_id is not None:
+        rows.append([InlineKeyboardButton(text=t(lang, "back_to_match"), callback_data=f"fixture:{fixture_id}")])
+    else:
+        rows.append([InlineKeyboardButton(text="Back to My Bets" if lang == "en" else "返回我的注单", callback_data=f"bets:{status_group}:{page}")])
+    rows.append([InlineKeyboardButton(text=t(lang, "back_home"), callback_data="home")])
     return InlineKeyboardMarkup(inline_keyboard=rows)

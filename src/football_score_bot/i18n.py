@@ -55,6 +55,7 @@ TRANSLATIONS = {
         "page": "第 {page}/{total} 页",
         "prev_page": "上一页",
         "next_page": "下一页",
+        "page": "第 {page}/{total} 页",
         "language_prompt": "🌐 请选择语言",
         "language_set_zh": "语言已切换为中文。",
         "language_set_en": "Language set to English.",
@@ -203,3 +204,40 @@ def t(lang: str | None, key: str, **kwargs: object) -> str:
     if template is None:
         template = TRANSLATIONS["zh"].get(key, key)
     return template.format(**kwargs)
+
+
+LANGUAGE_LABELS.update({"zh": "中文", "en": "English"})
+
+TRANSLATIONS["zh"].update(
+    {
+        "referrals": "推广邀请",
+        "language_settings": "语言",
+        "language_prompt": "🌐 请选择语言",
+        "worldcup_back_home": "返回世界杯专区",
+        "worldcup_pick_bet": "选择赛事投注",
+        "back_home": "返回首页",
+        "back_to_match": "返回赛事",
+        "check_result": "查看开奖",
+        "prev_page": "上一页",
+        "next_page": "下一页",
+    }
+)
+
+TRANSLATIONS["en"].update(
+    {
+        "language_prompt": "🌐 Choose language",
+        "worldcup": "🏆 World Cup 2026",
+        "worldcup_home_title": "🏆 World Cup 2026\n\nChoose an option:",
+        "worldcup_schedule_title": "🏆 World Cup 2026 Fixtures",
+        "worldcup_betting_title": "🏆 World Cup Betting",
+        "worldcup_pick_bet": "Select Match to Bet",
+        "worldcup_back_home": "Back to World Cup",
+        "worldcup_futures_title": "2026 World Cup Champion Futures",
+        "back_home": "Back Home",
+        "back_to_match": "Back to Match",
+        "check_result": "Check Result",
+        "prev_page": "Previous",
+        "next_page": "Next",
+        "page": "Page {page}/{total}",
+    }
+)
