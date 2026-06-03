@@ -53,6 +53,7 @@ class Database:
         await self.ensure_futures_seeded()
         await self._ensure_referral_reward_schema()
         await self._ensure_agent_rebate_schema()
+        await self._ensure_agent_activation_key_schema()
 
     async def _ensure_role_schema(self) -> None:
         await self._pool.execute(
@@ -582,6 +583,27 @@ class Database:
             "ALTER TABLE rebate_requests ADD COLUMN IF NOT EXISTS ledger_id BIGINT",
         ):
             await self._pool.execute(statement)
+
+    async def _ensure_agent_activation_key_schema(self) -> None:
+        await self._pool.execute(
+            """
+            CREATE TABLE IF NOT EXISTS agent_activation_keys (
+                id SERIAL PRIMARY KEY,
+                key TEXT NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'unused',
+                assigned_role TEXT NOT NULL DEFAULT 'agent',
+                rebate_rate NUMERIC(8, 4) NOT NULL DEFAULT 0.20,
+                created_by BIGINT,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                used_by BIGINT,
+                used_at TIMESTAMPTZ,
+                note TEXT
+            )
+            """
+        )
+        await self._pool.execute(
+            "CREATE INDEX IF NOT EXISTS idx_agent_activation_keys_status ON agent_activation_keys (status)"
+        )
 
     async def ensure_futures_seeded(self) -> None:
         await self._upsert_worldcup_champion_market()
@@ -2337,6 +2359,135 @@ class Database:
             rate,
         )
         return dict(row)
+
+    async def upsert_admin_profile(
+        self,
+        user_id: int,
+        *,
+        role: str = "agent",
+        rebate_rate: Decimal = Decimal("0.20"),
+        rebate_enabled: bool = True,
+    ) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO admin_profiles (user_id, role, rebate_enabled, rebate_rate, updated_at)
+            VALUES ($1, $2, $3, $4, NOW())
+            ON CONFLICT (user_id)
+            DO UPDATE SET role = EXCLUDED.role,
+                          rebate_enabled = EXCLUDED.rebate_enabled,
+                          rebate_rate = EXCLUDED.rebate_rate,
+                          updated_at = NOW()
+            RETURNING *
+            """,
+            user_id,
+            role,
+            rebate_enabled,
+            rebate_rate,
+        )
+        return dict(row)
+
+    async def create_agent_activation_key(
+        self,
+        key: str,
+        rebate_rate: Decimal,
+        created_by: int | None,
+        note: str | None = None,
+    ) -> dict:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO agent_activation_keys (key, rebate_rate, created_by, note)
+            VALUES ($1, $2, $3, $4)
+            RETURNING *
+            """,
+            key,
+            rebate_rate,
+            created_by,
+            note,
+        )
+        return dict(row)
+
+    async def import_agent_activation_key(
+        self,
+        key: str,
+        rebate_rate: Decimal,
+        created_by: int | None,
+        note: str | None = None,
+    ) -> dict | None:
+        row = await self._pool.fetchrow(
+            """
+            INSERT INTO agent_activation_keys (key, rebate_rate, created_by, note)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (key) DO NOTHING
+            RETURNING *
+            """,
+            key,
+            rebate_rate,
+            created_by,
+            note,
+        )
+        return dict(row) if row else None
+
+    async def get_agent_activation_key(self, key: str) -> dict | None:
+        row = await self._pool.fetchrow("SELECT * FROM agent_activation_keys WHERE key = $1", key)
+        return dict(row) if row else None
+
+    async def redeem_agent_activation_key(self, key: str, user_id: int) -> tuple[str, dict | None]:
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                existing_profile = await conn.fetchrow(
+                    "SELECT * FROM admin_profiles WHERE user_id = $1 AND role IN ('admin', 'agent')",
+                    user_id,
+                )
+                if existing_profile:
+                    return "already_agent", dict(existing_profile)
+                key_row = await conn.fetchrow(
+                    "SELECT * FROM agent_activation_keys WHERE key = $1 FOR UPDATE",
+                    key,
+                )
+                if not key_row:
+                    return "invalid", None
+                status = str(key_row["status"])
+                if status != "unused":
+                    return status, dict(key_row)
+                role = str(key_row["assigned_role"] or "agent")
+                rebate_rate = Decimal(str(key_row["rebate_rate"] or "0.20"))
+                await conn.execute(
+                    """
+                    INSERT INTO admin_profiles (user_id, role, rebate_enabled, rebate_rate, updated_at)
+                    VALUES ($1, $2, TRUE, $3, NOW())
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET role = EXCLUDED.role,
+                                  rebate_enabled = TRUE,
+                                  rebate_rate = EXCLUDED.rebate_rate,
+                                  updated_at = NOW()
+                    """,
+                    user_id,
+                    role,
+                    rebate_rate,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO user_roles (user_id, role, invited_by_user_id, status, updated_at)
+                    VALUES ($1, $2, NULL, 'active', NOW())
+                    ON CONFLICT (user_id)
+                    DO UPDATE SET role = EXCLUDED.role,
+                                  status = 'active',
+                                  updated_at = NOW()
+                    """,
+                    user_id,
+                    role,
+                )
+                row = await conn.fetchrow(
+                    """
+                    UPDATE agent_activation_keys
+                    SET status = 'used', used_by = $2, used_at = NOW()
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    int(key_row["id"]),
+                    user_id,
+                )
+                return "success", dict(row) if row else None
 
     async def toggle_admin_rebate(self, user_id: int) -> dict:
         await self.get_or_create_admin_profile(user_id)

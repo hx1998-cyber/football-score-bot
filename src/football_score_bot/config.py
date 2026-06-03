@@ -91,6 +91,16 @@ class Settings:
     agent_min_total_turnover: Decimal
     agent_min_valid_referrals: int
     worldcup_demo_markets_enabled: bool
+    announcement_channel_id: int | None
+    announcement_channel_username: str
+    announcement_channel_invite_url: str
+    community_group_cn_id: int | None
+    community_group_en_id: int | None
+    bot_username: str
+    require_announcement_subscription: bool
+    agent_key_redeem_enabled: bool
+    agent_key_prefix: str
+    agent_key_default_rebate_rate: Decimal
     log_level: str = "INFO"
 
 
@@ -203,6 +213,16 @@ def load_settings() -> Settings:
         agent_min_total_turnover=Decimal(os.getenv("AGENT_MIN_TOTAL_TURNOVER", "500")),
         agent_min_valid_referrals=int(os.getenv("AGENT_MIN_VALID_REFERRALS", "5")),
         worldcup_demo_markets_enabled=_parse_bool(os.getenv("WORLDCUP_DEMO_MARKETS_ENABLED", "true")),
+        announcement_channel_id=_parse_optional_int(os.getenv("ANNOUNCEMENT_CHANNEL_ID", "")),
+        announcement_channel_username=os.getenv("ANNOUNCEMENT_CHANNEL_USERNAME", "").strip(),
+        announcement_channel_invite_url=os.getenv("ANNOUNCEMENT_CHANNEL_INVITE_URL", "").strip(),
+        community_group_cn_id=_parse_optional_int(os.getenv("COMMUNITY_GROUP_CN_ID", "")),
+        community_group_en_id=_parse_optional_int(os.getenv("COMMUNITY_GROUP_EN_ID", "")),
+        bot_username=os.getenv("BOT_USERNAME", "worldcuptopBot").strip(),
+        require_announcement_subscription=_parse_bool(os.getenv("REQUIRE_ANNOUNCEMENT_SUBSCRIPTION", "true")),
+        agent_key_redeem_enabled=_parse_bool(os.getenv("AGENT_KEY_REDEEM_ENABLED", "true")),
+        agent_key_prefix=os.getenv("AGENT_KEY_PREFIX", "AGENT-").strip() or "AGENT-",
+        agent_key_default_rebate_rate=Decimal(os.getenv("AGENT_KEY_DEFAULT_REBATE_RATE", "0.20")),
         log_level=os.getenv("LOG_LEVEL", "INFO"),
     )
 

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import json
+import secrets
+import string
 from copy import deepcopy
 from dataclasses import replace
 from decimal import Decimal
@@ -12,6 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 import asyncpg
 from aiogram import BaseMiddleware, F, Router
+from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
@@ -55,6 +58,7 @@ from football_score_bot.localization.sports_names import translate_league_name, 
 from football_score_bot.payments.gmpay import GMPayClient, GMPayCreateOrderError
 from football_score_bot.payments.order_ids import generate_gmpay_order_id
 from football_score_bot.services.wallet_service import WalletService
+from football_score_bot.services.broadcast_service import safe_send_message
 from football_score_bot.services.permission_service import PermissionService
 from football_score_bot.services.settlement_service import SettlementService
 from football_score_bot.states import (
@@ -139,6 +143,102 @@ MENU_SETTINGS_TEXTS = {"设置", "⚙️ 设置", "Settings"}
 MENU_HELP_TEXTS = {"帮助", "❓ 帮助", "Help"}
 
 
+class AnnouncementSubscriptionMiddleware(BaseMiddleware):
+    def __init__(self, database: Database, settings: Settings) -> None:
+        self._database = database
+        self._settings = settings
+
+    async def __call__(self, handler: Any, event: Message | CallbackQuery, data: dict[str, Any]) -> Any:
+        user = event.from_user
+        if not user or self._is_allowed_without_subscription(event):
+            return await handler(event, data)
+        if user.id in self._settings.super_admin_user_ids:
+            return await handler(event, data)
+        subscribed = await is_user_subscribed_to_announcement(event.bot, self._settings, user.id)
+        if subscribed:
+            return await handler(event, data)
+        lang = normalize_language(
+            await self._database.get_user_language(user.id, self._settings.default_language),
+            self._settings.default_language,
+        )
+        if isinstance(event, CallbackQuery):
+            try:
+                await event.answer(
+                    "Subscription not detected. Please join the announcement channel first."
+                    if lang == "en"
+                    else "暂未检测到订阅，请先加入通知频道。",
+                    show_alert=True,
+                )
+            except Exception:
+                pass
+            if event.message:
+                await event.message.answer(_subscription_prompt_text(lang), reply_markup=_subscription_keyboard(self._settings, lang))
+            return None
+        await event.answer(_subscription_prompt_text(lang), reply_markup=_subscription_keyboard(self._settings, lang))
+        return None
+
+    def _is_allowed_without_subscription(self, event: Message | CallbackQuery) -> bool:
+        if isinstance(event, CallbackQuery):
+            data = event.data or ""
+            return data == "subscription:check" or data.startswith("lang:") or data == "menu:language"
+        text = (event.text or "").strip()
+        command = parse_command_name(text)
+        if command in {
+            "language",
+            "chatid",
+            "admin_chatid",
+            "admin",
+            "admin_generate_agent_keys",
+            "admin_import_agent_key",
+            "admin_test_broadcast",
+            "redeem_agent_key",
+        }:
+            return True
+        if command and command.startswith("admin_"):
+            return True
+        if text.startswith(self._settings.agent_key_prefix):
+            return True
+        return False
+
+
+async def is_user_subscribed_to_announcement(bot: Any, settings: Settings, user_id: int) -> bool:
+    if not settings.require_announcement_subscription or not settings.announcement_channel_id:
+        logger.info("subscription_check user_id=%s result=subscribed", user_id)
+        return True
+    try:
+        member = await bot.get_chat_member(settings.announcement_channel_id, user_id)
+    except TelegramAPIError:
+        logger.warning("subscription_check user_id=%s result=error", user_id, exc_info=True)
+        return False
+    raw_status = getattr(member, "status", "")
+    status = str(getattr(raw_status, "value", raw_status)).lower()
+    result = status in {"member", "administrator", "creator"}
+    logger.info("subscription_check user_id=%s result=%s", user_id, "subscribed" if result else "not_subscribed")
+    return result
+
+
+def _subscription_prompt_text(lang: str) -> str:
+    if lang == "en":
+        return (
+            "📢 Please subscribe to our official announcement channel first.\n\n"
+            "To receive match reminders, settlement notices and important updates, please subscribe to our announcement channel, then tap Ive subscribed."
+        )
+    return (
+        "📢 请先订阅官方通知频道\n\n"
+        "为了接收赛事提醒、开奖公告和重要通知，请先订阅我们的官方通知频道，然后点击我已订阅。"
+    )
+
+
+def _subscription_keyboard(settings: Settings, lang: str) -> InlineKeyboardMarkup:
+    username = settings.announcement_channel_username.lstrip("@")
+    url = f"https://t.me/{username}" if username else settings.announcement_channel_invite_url
+    rows = []
+    if url:
+        rows.append([InlineKeyboardButton(text="📢 Subscribe" if lang == "en" else "📢 订阅通知频道", url=url)])
+    rows.append([InlineKeyboardButton(text="Ive subscribed" if lang == "en" else "我已订阅", callback_data="subscription:check")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def format_bet_confirm(
     fixture: dict[str, Any],
     market_title: str,
@@ -183,6 +283,9 @@ def build_router(
 ) -> Router:
     router = Router()
     router.message.outer_middleware(SlashCommandStateMiddleware())
+    subscription_middleware = AnnouncementSubscriptionMiddleware(database, settings)
+    router.message.outer_middleware(subscription_middleware)
+    router.callback_query.outer_middleware(subscription_middleware)
     wallet_service = WalletService(
         database,
         currency=settings.wallet_currency,
@@ -222,6 +325,70 @@ def build_router(
 
     async def _require_super_admin(message: Message) -> bool:
         return await _require_private_role(message, {"super_admin"})
+
+    @router.message(Command("chatid"))
+    async def chatid(message: Message) -> None:
+        logger.info(
+            "chatid_requested chat_id=%s chat_type=%s user_id=%s",
+            message.chat.id,
+            message.chat.type,
+            message.from_user.id if message.from_user else None,
+        )
+        title = message.chat.title or ""
+        await message.answer(f"chat_id={message.chat.id}\nchat_type={message.chat.type}\ntitle={title}")
+        if message.chat.type in {"group", "supergroup"}:
+            logger.info(
+                "chatid_group_hint 请在 BotFather 关闭 Group Privacy；或在群里使用 /chatid@BotUsername；或把机器人设为管理员。"
+            )
+
+    @router.channel_post(Command("chatid"))
+    async def channel_chatid(message: Message) -> None:
+        logger.info(
+            "chatid_requested chat_id=%s chat_type=%s user_id=%s",
+            message.chat.id,
+            message.chat.type,
+            message.from_user.id if message.from_user else None,
+        )
+        await message.answer(f"channel_id={message.chat.id}\nchannel_title={message.chat.title or ''}")
+
+    @router.message(Command("admin_chatid"))
+    async def admin_chatid(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
+        logger.info(
+            "chatid_requested chat_id=%s chat_type=%s user_id=%s",
+            message.chat.id,
+            message.chat.type,
+            message.from_user.id if message.from_user else None,
+        )
+        await message.answer(f"chat_id={message.chat.id}\nchat_type={message.chat.type}\ntitle={message.chat.title or ''}")
+
+    @router.callback_query(F.data == "subscription:check")
+    async def subscription_check(callback: CallbackQuery) -> None:
+        lang = await _callback_lang(callback, database, settings)
+        subscribed = await is_user_subscribed_to_announcement(callback.bot, settings, callback.from_user.id)
+        if not subscribed:
+            await callback.answer(
+                "Subscription not detected. Please join the announcement channel first."
+                if lang == "en"
+                else "暂未检测到订阅，请先加入通知频道。",
+                show_alert=True,
+            )
+            return
+        await _safe_callback_answer(callback, "OK")
+        await callback.message.answer(
+            await _start_text(cache, api_client, database, settings, callback.from_user.id, lang),
+            reply_markup=main_menu_keyboard(lang),
+        )
+
+    @router.message(Command("admin_test_broadcast"))
+    async def admin_test_broadcast(message: Message) -> None:
+        if not await _require_super_admin(message):
+            return
+        await safe_send_message(message.bot, settings.announcement_channel_id, "测试广播 / Test broadcast")
+        await safe_send_message(message.bot, settings.community_group_cn_id, "测试广播：中文社区群")
+        await safe_send_message(message.bot, settings.community_group_en_id, "Test broadcast: English community group")
+        await message.answer("广播测试已发送，空 chat_id 会自动跳过。")
 
     @router.callback_query(F.data.startswith("fsm_cancel:"))
     async def fsm_cancel(callback: CallbackQuery, state: FSMContext) -> None:
@@ -2242,7 +2409,7 @@ def build_router(
         )
         if status == "won" and settings.payout_freeze_enabled:
             try:
-                await message.bot.send_message(int(result["user_id"]), "注单中奖，派彩已冻结，预计 4 小时后解冻。")
+                await message.bot.send_message(int(result["user_id"]), "注单已开奖：中奖。")
             except Exception:
                 logger.info("failed to notify settled win user_id=%s", result.get("user_id"), exc_info=True)
         await message.answer(f"注单已开奖：{status}，ledger_id={result.get('ledger_id')}")
@@ -2274,7 +2441,7 @@ def build_router(
             return
         if status == "won" and settings.payout_freeze_enabled:
             try:
-                await message.bot.send_message(int(result["user_id"]), "注单中奖，派彩已冻结，预计24小时后解冻。")
+                await message.bot.send_message(int(result["user_id"]), "注单已开奖：中奖。")
             except Exception:
                 logger.info("failed to notify settled win user_id=%s", result.get("user_id"), exc_info=True)
         await message.answer(f"注单已开奖：{status}，ledger_id={result.get('ledger_id')}")
@@ -2521,6 +2688,72 @@ def build_router(
             + _format_referral_children(rows)
         )
 
+    @router.message(Command("admin_generate_agent_keys"))
+    async def admin_generate_agent_keys(message: Message, command: CommandObject) -> None:
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split()
+        if not parts:
+            await message.answer("用法：/admin_generate_agent_keys <count> [rebate_rate]")
+            return
+        try:
+            count = int(parts[0])
+        except ValueError:
+            await message.answer("count 必须是数字，范围 1-100。")
+            return
+        if count < 1 or count > 100:
+            await message.answer("count 建议限制 1-100。")
+            return
+        try:
+            rebate_rate = _parse_rebate_rate(parts[1]) if len(parts) > 1 else settings.agent_key_default_rebate_rate
+        except ValueError:
+            await message.answer("rebate_rate 格式错误，例如 0.20 或 20%。")
+            return
+        keys: list[str] = []
+        for _ in range(count):
+            for _attempt in range(10):
+                key = _generate_agent_key(settings.agent_key_prefix)
+                try:
+                    await database.create_agent_activation_key(key, rebate_rate, message.from_user.id)
+                except asyncpg.UniqueViolationError:
+                    continue
+                keys.append(key)
+                break
+        logger.info("agent_key_generated count=%s created_by=%s", len(keys), message.from_user.id if message.from_user else None)
+        await message.answer("已生成代理密钥：\n" + "\n".join(keys))
+
+    @router.message(Command("admin_import_agent_key"))
+    async def admin_import_agent_key(message: Message, command: CommandObject) -> None:
+        # TODO: integrate Dujiao/Faka webhook for automatic key import.
+        if not await _require_super_admin(message):
+            return
+        parts = (command.args or "").strip().split()
+        if not parts:
+            await message.answer("用法：/admin_import_agent_key <key> [rebate_rate]")
+            return
+        key = parts[0].strip()
+        try:
+            rebate_rate = _parse_rebate_rate(parts[1]) if len(parts) > 1 else settings.agent_key_default_rebate_rate
+        except ValueError:
+            await message.answer("rebate_rate 格式错误，例如 0.20 或 20%。")
+            return
+        row = await database.import_agent_activation_key(key, rebate_rate, message.from_user.id)
+        if not row:
+            await message.answer("密钥已存在。")
+            return
+        logger.info("agent_key_imported key=%s created_by=%s", _mask_agent_key(key), message.from_user.id if message.from_user else None)
+        await message.answer(f"密钥已导入：{_mask_agent_key(key)}")
+
+    @router.message(Command("redeem_agent_key"))
+    async def redeem_agent_key_cmd(message: Message, command: CommandObject) -> None:
+        key = (command.args or "").strip().split(maxsplit=1)[0] if (command.args or "").strip() else ""
+        await _redeem_agent_key(message, key)
+
+    @router.message(F.chat.type == "private", F.text.startswith(settings.agent_key_prefix))
+    async def redeem_agent_key_text(message: Message) -> None:
+        key = (message.text or "").strip().split()[0]
+        await _redeem_agent_key(message, key)
+
     @router.message(Command("admin_invite_admin"))
     async def admin_invite_admin(message: Message, command: CommandObject) -> None:
         await _admin_set_role_command(message, command, "admin")
@@ -2612,6 +2845,50 @@ def build_router(
     async def admin_reject_agent(message: Message, command: CommandObject) -> None:
         await _review_agent_application_command(message, command, "rejected")
 
+    async def _redeem_agent_key(message: Message, key: str) -> None:
+        if not message.from_user:
+            return
+        lang = await _event_lang(message, database, settings)
+        if not settings.agent_key_redeem_enabled:
+            await message.answer("Agent key redemption is disabled." if lang == "en" else "代理密钥兑换暂未开启。")
+            return
+        key = key.strip()
+        if not key:
+            await message.answer("Usage: /redeem_agent_key <key>" if lang == "en" else "用法：/redeem_agent_key <key>")
+            return
+        if not key.startswith(settings.agent_key_prefix):
+            await message.answer("Invalid key." if lang == "en" else "密钥无效。")
+            return
+        result, row = await database.redeem_agent_activation_key(key, message.from_user.id)
+        if result == "success" and row:
+            logger.info("agent_key_redeemed key_id=%s user_id=%s result=success", row.get("id"), message.from_user.id)
+            rate = _percent_text(row.get("rebate_rate"))
+            if lang == "en":
+                await message.answer(
+                    "Agent activation succeeded.\n"
+                    "Current role: Agent\n"
+                    f"Rebate rate: {rate}\n"
+                    "You can now use /admin to open the agent panel."
+                )
+            else:
+                await message.answer(
+                    "代理认证成功。\n"
+                    "当前身份：管理员/代理\n"
+                    f"返水比例：{rate}\n"
+                    "你现在可以使用 /admin 打开代理面板。"
+                )
+            return
+        reason = "invalid" if result == "invalid" else result
+        logger.info("agent_key_redeem_failed user_id=%s reason=%s", message.from_user.id, reason)
+        if result == "already_agent":
+            await message.answer("You are already an agent." if lang == "en" else "你已经是代理/管理员，无需重复兑换。")
+        elif result == "used":
+            await message.answer("This key has already been used." if lang == "en" else "密钥已使用。")
+        elif result == "disabled":
+            await message.answer("This key is disabled." if lang == "en" else "密钥已禁用。")
+        else:
+            await message.answer("Invalid key." if lang == "en" else "密钥无效。")
+
     async def _admin_set_role_command(message: Message, command: CommandObject, role: str) -> None:
         if not _admin_private_allowed(message, settings) or not await permission_service.can_invite_admin(message.from_user.id):
             await message.answer("只有超级管理员可以邀请管理员/代理。")
@@ -2621,6 +2898,8 @@ def build_router(
             await message.answer(f"用法：/admin_invite_{role} <telegram_user_id>")
             return
         row = await database.set_user_role(target_user_id, role, message.from_user.id)
+        if role in {"admin", "agent"}:
+            await database.upsert_admin_profile(target_user_id, role=role, rebate_rate=settings.agent_key_default_rebate_rate)
         await database.add_admin_audit_log(message.from_user.id, f"admin_invite_{role}", "user_role", str(target_user_id), {"role": role})
         await message.answer(f"已设置 {target_user_id} 为 {role}。id={row['id']}")
 
@@ -5172,6 +5451,30 @@ def _percent_text(value: Any) -> str:
         return f"{text}%"
     except Exception:
         return "0%"
+
+
+def _parse_rebate_rate(value: str) -> Decimal:
+    text = value.strip()
+    if text.endswith("%"):
+        rate = Decimal(text[:-1].strip()) / Decimal("100")
+    else:
+        rate = Decimal(text)
+    if rate < 0 or rate > 1:
+        raise ValueError("rebate rate out of range")
+    return rate.quantize(Decimal("0.0001"))
+
+
+def _generate_agent_key(prefix: str) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    parts = ["".join(secrets.choice(alphabet) for _ in range(4)) for _ in range(3)]
+    return prefix + "-".join(parts)
+
+
+def _mask_agent_key(key: str) -> str:
+    text = str(key or "")
+    if len(text) <= 8:
+        return "****"
+    return f"{text[:6]}****{text[-4:]}"
 
 
 def _localized_fixtures(fixtures: list[dict[str, Any]], lang: str) -> list[dict[str, Any]]:
